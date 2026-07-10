@@ -1,0 +1,9 @@
+# runtime state
+.bus-state/
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+# tooling caches
+.graphmcp/
