@@ -14,11 +14,15 @@ Task ordering uses two layers:
 
 Commands:
   send     publish a message to a room
-  poll     read new messages addressed to you (non-blocking), advance cursor
-  wait     block until a message for you arrives (XREAD BLOCK), advance cursor
+  poll     read new messages addressed to you (non-blocking); --topic to scope
+  wait     block until a message for you arrives (XREAD BLOCK); --topic to scope
   tail     show recent messages without moving your cursor (observability)
   history  dump the full room log
-  watch    live-follow every message in a room (read-only observer)
+  watch    live-follow every message in a room (read-only observer); --topic to scope
+
+A --topic <t> filter (poll/wait/watch) narrows delivery to that exact topic, but
+never hides a __SHUTDOWN__ in poll/wait — the kill-switch must not be defeated by
+an agent's own scoping.
   join     register presence and set your cursor to "now"
   agents   list agents currently present in a room
   claim    atomically claim a gh issue (Redis lock + status label)
@@ -197,15 +201,23 @@ def fields_to_msg(msg_id, fields):
     }
 
 
-def deliverable(msg, agent):
-    """True if this message should be shown to `agent`."""
+def deliverable(msg, agent, topic=None):
+    """True if this message should be shown to `agent`.
+
+    `topic`, if given, narrows delivery to messages with that exact topic — but
+    NOT the shutdown signal. A topic filter scopes chatter; it must never let an
+    agent's own scoping swallow a `--to all __SHUTDOWN__` kill-switch (which
+    carries an empty topic). So __SHUTDOWN__ always passes the topic filter.
+    """
     addressed = msg["to"] == "all" or msg["to"] == agent
-    if msg["from"] == agent:
-        # normally don't echo your own posts back — but a self-addressed
-        # shutdown is the documented way for an agent to stop itself, so it
-        # must survive the echo filter to reach read_result_code.
-        return addressed and msg["body"].strip() == SHUTDOWN
-    return addressed
+    if not addressed:
+        return False
+    is_shutdown = msg["body"].strip() == SHUTDOWN
+    if msg["from"] == agent and not is_shutdown:
+        return False  # suppress self-echo, except a self-addressed shutdown
+    if topic and msg["topic"] != topic and not is_shutdown:
+        return False  # topic narrows chatter, never the stop signal
+    return True
 
 
 # ---- commands --------------------------------------------------------------
@@ -229,8 +241,13 @@ def cmd_send(r, args):
     return 0
 
 
-def read_from_cursor(r, room, agent, block_ms=None, count=100):
-    """One XREAD from the agent's cursor. Returns (delivered, last_seen_id)."""
+def read_from_cursor(r, room, agent, block_ms=None, count=100, topic=None):
+    """One XREAD from the agent's cursor. Returns (delivered, last_seen_id).
+
+    The cursor advances past EVERY entry seen (last_seen), so a topic filter
+    only narrows what's delivered — non-matching messages are consumed, not
+    re-read on the next poll.
+    """
     cur = r.get(k_cursor(room, agent)) or "0-0"
     kwargs = {"count": count}
     if block_ms is not None:
@@ -242,14 +259,15 @@ def read_from_cursor(r, room, agent, block_ms=None, count=100):
         for msg_id, fields in entries:
             last_seen = msg_id
             msg = fields_to_msg(msg_id, fields)
-            if deliverable(msg, agent):
+            if deliverable(msg, agent, topic):
                 delivered.append(msg)
     return delivered, last_seen
 
 
 def cmd_poll(r, args):
     touch_presence(r, args.room, args.as_agent)
-    delivered, last_seen = read_from_cursor(r, args.room, args.as_agent)
+    delivered, last_seen = read_from_cursor(
+        r, args.room, args.as_agent, topic=args.topic)
     if last_seen:
         r.set(k_cursor(args.room, args.as_agent), last_seen)
     for m in delivered:
@@ -280,7 +298,7 @@ def cmd_wait(r, args):
         # would block forever. The outer loop re-blocks on the remaining budget.
         block_ms = max(1, min(BLOCK_CHUNK_MS, int(remaining * 1000)))
         delivered, last_seen = read_from_cursor(
-            r, args.room, args.as_agent, block_ms=block_ms
+            r, args.room, args.as_agent, block_ms=block_ms, topic=args.topic
         )
         if last_seen:
             r.set(k_cursor(args.room, args.as_agent), last_seen)
@@ -291,12 +309,29 @@ def cmd_wait(r, args):
         # saw only traffic not addressed to us (or nothing) -> keep waiting
 
 
-def emit_recent(r, room, n, as_json):
-    """Print the last n messages (oldest-first) and return the raw entries."""
-    entries = r.xrevrange(k_stream(room), count=n)
-    for msg_id, fields in reversed(entries):
+TOPIC_SCAN_CAP = 1000  # how far `watch --topic` scans back for context matches
+
+
+def emit_recent(r, room, n, as_json, topic=None):
+    """Print up to the last n messages (oldest-first) and return the newest
+    message id in the stream (for follow continuation), or None if empty.
+
+    With `topic`, print the last n messages *matching* that topic — scanning
+    back a bounded window so a filtered follow shows real matches, not "last n
+    raw then filtered to maybe zero" (per the ratified spec). Still returns the
+    newest RAW id so the caller's follow cursor advances correctly.
+    """
+    if not topic:
+        entries = r.xrevrange(k_stream(room), count=n)
+        for msg_id, fields in reversed(entries):
+            emit(fields_to_msg(msg_id, fields), as_json)
+        return entries[0][0] if entries else None
+    window = r.xrevrange(k_stream(room), count=TOPIC_SCAN_CAP)  # newest-first
+    newest = window[0][0] if window else None
+    matches = [(mid, f) for mid, f in window if f.get("topic") == topic]
+    for msg_id, fields in reversed(matches[:n]):  # the n newest matches, oldest-first
         emit(fields_to_msg(msg_id, fields), as_json)
-    return entries
+    return newest
 
 
 def cmd_tail(r, args):
@@ -312,17 +347,19 @@ def cmd_history(r, args):
 
 
 def cmd_watch(r, args):
-    """Live-follow every message in a room as it arrives (tail -f style).
+    """Live-follow messages in a room as they arrive (tail -f style).
 
     Read-only OBSERVER: it never registers presence or moves any agent's cursor,
     so watching a room doesn't perturb the agents working in it. Shows the last
-    -n messages for context, then blocks for new ones until Ctrl-C.
+    -n messages for context, then blocks for new ones until Ctrl-C. With
+    --topic, only messages with that topic are shown (context and live).
     """
+    topic = args.topic
     last = "$"  # "$" = only messages added after we start blocking
     if args.n > 0:
-        entries = emit_recent(r, args.room, args.n, args.json)
-        if entries:
-            last = entries[0][0]  # continue strictly after the newest shown
+        newest = emit_recent(r, args.room, args.n, args.json, topic=topic)
+        if newest:
+            last = newest  # continue strictly after the newest RAW message
     sys.stdout.flush()
     try:
         while True:
@@ -333,7 +370,9 @@ def cmd_watch(r, args):
                 continue
             _, entries = resp[0]
             for msg_id, fields in entries:
-                last = msg_id
+                last = msg_id  # advance past every raw message, matched or not
+                if topic and fields.get("topic") != topic:
+                    continue   # filter live-follow before emitting
                 emit(fields_to_msg(msg_id, fields), args.json)
             # a follow tool must flush per batch or a piped consumer sees nothing
             # until the buffer fills (stdout is block-buffered when not a tty).
@@ -543,6 +582,11 @@ def _as(parser):
                         help="your agent id")
 
 
+def _topic(parser):
+    parser.add_argument("--topic", type=ident, default=None,
+                        help="only deliver messages with this exact topic")
+
+
 def _issue(parser):
     parser.add_argument("--issue", type=positive_int, required=True)
 
@@ -557,15 +601,18 @@ def build_parser():
     s = sub.add_parser("send", help="publish a message")
     s.add_argument("--from", dest="frm", type=ident, required=True, help="your agent id")
     s.add_argument("--to", default="all", type=ident, help="recipient agent id or 'all' (default all)")
-    s.add_argument("--topic", default="", help="optional topic, e.g. issue-42")
+    # default=None (not "") so argparse doesn't run `ident` on the empty default
+    # and reject a plain send with no topic; cmd_send maps None -> "".
+    s.add_argument("--topic", type=ident, default=None, help="optional topic slug, e.g. issue-42 (must be filter-safe: [A-Za-z0-9._-]+)")
     s.add_argument("--reply-to", default="", help="message id you're replying to")
     s.add_argument("--kind", default="msg", help="msg|question|answer|system (default msg)")
     s.add_argument("body", nargs="?", help="message text, or '-' / piped stdin")
 
-    _as(sub.add_parser("poll", help="read new messages (non-blocking)"))
+    p_poll = sub.add_parser("poll", help="read new messages (non-blocking)")
+    _as(p_poll); _topic(p_poll)
 
     w = sub.add_parser("wait", help="block until a message for you arrives")
-    _as(w)
+    _as(w); _topic(w)
     w.add_argument("--timeout", type=float, default=30.0, help="seconds (default 30)")
 
     t = sub.add_parser("tail", help="recent messages, no cursor change")
@@ -575,6 +622,7 @@ def build_parser():
 
     wt = sub.add_parser("watch", help="live-follow all messages in a room (observer, Ctrl-C to stop)")
     wt.add_argument("-n", type=int, default=10, help="show last N for context before following (default 10)")
+    _topic(wt)
 
     _as(sub.add_parser("join", help="register presence, cursor to now"))
     sub.add_parser("agents", help="list present agents")
