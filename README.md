@@ -136,16 +136,21 @@ the real one.
 ```
 bus send     --from A [--to all] [--topic T] [--reply-to ID] [--kind msg] "text"
 bus poll     --as A [--topic T]     # new messages for you, advance cursor
-bus wait     --as A [--timeout 30] [--topic T]  # block until a message for you arrives
+bus wait     --as A [--timeout 30] [--topic T] [--reply-to ID]  # block until a message arrives
 bus tail     [-n 20]                # recent traffic, cursor untouched
 bus history  [-n N]                 # full room log
 bus watch    [-n 10] [--topic T]    # live-follow the room (observer, Ctrl-C to stop)
+bus thread   ID                     # print the full reply_to thread of a message
+bus inbox    --as A                 # peek unread for you (directed / questions), cursor untouched
+bus prune    [--keep N] [--force]   # trim room to newest N (refuses if it drops unread)
 bus join     --as A                 # register, cursor to "now"
 bus agents                          # who's present
 bus claim    --as A --issue N       # atomic claim (lock + label)
 bus renew    --as A --issue N       # extend your claim TTL (long tasks)
 bus release  --as A --issue N       # release your claim
+bus reap     [--release ISSUE]      # list stale locks (holder gone); free one you've verified
 bus status   --as A --issue N --set status:pr-open
+bus board                           # table: gh issue + status + lock holder + presence
 bus init                            # create status:* labels in BUS_GH_REPO
 bus doctor                          # check redis + gh
 ```
@@ -176,6 +181,10 @@ authentication** — that's the "homegrown simple" tradeoff. Know the sharp edge
 - **`--to all __SHUTDOWN__` is a fleet kill-switch.** One message stops every
   agent (Stop hook + `agent-loop.sh` both honor it). That's intended for the
   operator; it's also available to any agent on the bus.
+- **Maintenance commands are not an auth boundary.** `bus prune` and
+  `bus reap --release` are explicit manual commands and never run automatically,
+  but any trusted local caller can invoke them. This matches the no-RBAC local
+  trust model.
 - **Message content is untrusted input to your agents.** A peer's message body
   is fed into each agent's context. The Stop hook fences it in an explicit
   "UNTRUSTED" boundary and `prompts/agent-system.md` tells agents not to obey

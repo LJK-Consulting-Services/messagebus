@@ -15,21 +15,26 @@ Task ordering uses two layers:
 Commands:
   send     publish a message to a room
   poll     read new messages addressed to you (non-blocking); --topic to scope
-  wait     block until a message for you arrives (XREAD BLOCK); --topic to scope
+  wait     block until a message arrives; --topic / --reply-to to scope
   tail     show recent messages without moving your cursor (observability)
   history  dump the full room log
   watch    live-follow every message in a room (read-only observer); --topic to scope
-
-A --topic <t> filter (poll/wait/watch) narrows delivery to that exact topic, but
-never hides a __SHUTDOWN__ in poll/wait — the kill-switch must not be defeated by
-an agent's own scoping.
+  thread   print the full reply_to thread containing a message id
+  inbox    peek unread messages for you (directed or questions); cursor untouched
+  prune    trim a room to the newest --keep messages (destructive, guarded)
   join     register presence and set your cursor to "now"
   agents   list agents currently present in a room
   claim    atomically claim a gh issue (Redis lock + status label)
   release  release a claim you hold
   renew    extend the TTL on a claim you hold (long-running tasks)
+  reap     list stale issue locks (holder absent); --release <issue> to free one
   status   transition a gh issue's status label + announce on the bus
+  board    table of gh issues + status label + lock holder + presence
   init     create the status:* labels in BUS_GH_REPO
+
+A --topic <t> (poll/wait/watch) or --reply-to <id> (wait) filter narrows delivery
+to an exact match, but never hides a __SHUTDOWN__ in poll/wait — the kill-switch
+must not be defeated by an agent's own scoping.
   doctor   check Redis connectivity and gh auth
 
 Config via env:
@@ -177,16 +182,32 @@ def read_result_code(delivered):
     return RC_DELIVERED
 
 
+def terminal_text(value):
+    """Escape terminal control characters in untrusted display text."""
+    out = []
+    for ch in str(value):
+        code = ord(ch)
+        if ch in "\n\t" or (code >= 32 and code != 127 and not 0x80 <= code <= 0x9F):
+            out.append(ch)
+        else:
+            out.append(f"\\x{code:02x}")
+    return "".join(out)
+
+
+def terminal_line(value):
+    return terminal_text(value).replace("\n", " ")
+
+
 def emit(msg, as_json):
     if as_json:
         print(json.dumps(msg, ensure_ascii=False))
     else:
-        who = msg["from"]
-        to = msg.get("to", "all")
+        who = terminal_line(msg["from"])
+        to = terminal_line(msg.get("to", "all"))
         arrow = "" if to == "all" else f" -> {to}"
-        topic = f" [{msg['topic']}]" if msg.get("topic") else ""
-        reply = f" (re {msg['reply_to']})" if msg.get("reply_to") else ""
-        print(f"{msg['id']}  {who}{arrow}{topic}{reply}\n  {msg['body']}")
+        topic = f" [{terminal_line(msg['topic'])}]" if msg.get("topic") else ""
+        reply = f" (re {terminal_line(msg['reply_to'])})" if msg.get("reply_to") else ""
+        print(f"{terminal_line(msg['id'])}  {who}{arrow}{topic}{reply}\n  {terminal_text(msg['body'])}")
 
 
 def fields_to_msg(msg_id, fields):
@@ -201,13 +222,13 @@ def fields_to_msg(msg_id, fields):
     }
 
 
-def deliverable(msg, agent, topic=None):
+def deliverable(msg, agent, topic=None, reply_to=None):
     """True if this message should be shown to `agent`.
 
-    `topic`, if given, narrows delivery to messages with that exact topic — but
-    NOT the shutdown signal. A topic filter scopes chatter; it must never let an
-    agent's own scoping swallow a `--to all __SHUTDOWN__` kill-switch (which
-    carries an empty topic). So __SHUTDOWN__ always passes the topic filter.
+    `topic` / `reply_to`, if given, narrow delivery (exact match) — but NEITHER
+    filters the shutdown signal. A scoped listener (one topic, or awaiting one
+    reply) must never let its own scoping swallow a `--to all __SHUTDOWN__`
+    kill-switch, so __SHUTDOWN__ always passes both filters.
     """
     addressed = msg["to"] == "all" or msg["to"] == agent
     if not addressed:
@@ -215,8 +236,12 @@ def deliverable(msg, agent, topic=None):
     is_shutdown = msg["body"].strip() == SHUTDOWN
     if msg["from"] == agent and not is_shutdown:
         return False  # suppress self-echo, except a self-addressed shutdown
-    if topic and msg["topic"] != topic and not is_shutdown:
+    if is_shutdown:
+        return True   # stop signal bypasses every narrowing filter
+    if topic and msg["topic"] != topic:
         return False  # topic narrows chatter, never the stop signal
+    if reply_to and msg["reply_to"] != reply_to:
+        return False  # awaiting a specific reply, never the stop signal
     return True
 
 
@@ -241,7 +266,7 @@ def cmd_send(r, args):
     return 0
 
 
-def read_from_cursor(r, room, agent, block_ms=None, count=100, topic=None):
+def read_from_cursor(r, room, agent, block_ms=None, count=100, topic=None, reply_to=None):
     """One XREAD from the agent's cursor. Returns (delivered, last_seen_id).
 
     The cursor advances past EVERY entry seen (last_seen), so a topic filter
@@ -259,7 +284,7 @@ def read_from_cursor(r, room, agent, block_ms=None, count=100, topic=None):
         for msg_id, fields in entries:
             last_seen = msg_id
             msg = fields_to_msg(msg_id, fields)
-            if deliverable(msg, agent, topic):
+            if deliverable(msg, agent, topic, reply_to):
                 delivered.append(msg)
     return delivered, last_seen
 
@@ -298,7 +323,8 @@ def cmd_wait(r, args):
         # would block forever. The outer loop re-blocks on the remaining budget.
         block_ms = max(1, min(BLOCK_CHUNK_MS, int(remaining * 1000)))
         delivered, last_seen = read_from_cursor(
-            r, args.room, args.as_agent, block_ms=block_ms, topic=args.topic
+            r, args.room, args.as_agent, block_ms=block_ms,
+            topic=args.topic, reply_to=args.reply_to
         )
         if last_seen:
             r.set(k_cursor(args.room, args.as_agent), last_seen)
@@ -343,6 +369,240 @@ def cmd_history(r, args):
     entries = r.xrange(k_stream(args.room), count=args.n)
     for msg_id, fields in entries:
         emit(fields_to_msg(msg_id, fields), args.json)
+    return 0
+
+
+def _id_key(sid):
+    """Sort key for a Redis stream id 'ms-seq' (numeric, not lexicographic —
+    '9-0' must sort before '10-0')."""
+    ms, _, seq = sid.partition("-")
+    return (int(ms), int(seq or 0))
+
+
+def cmd_thread(r, args):
+    """Print the full reply_to thread containing message <id>: walk up to the
+    root, then print every message reachable down the reply_to tree, in order."""
+    byid = {mid: fields_to_msg(mid, f)
+            for mid, f in r.xrange(k_stream(args.room))}
+    if args.id not in byid:
+        sys.stderr.write(f"bus thread: message {args.id} not in room {args.room}\n")
+        return 1
+    children = {}
+    for mid, m in byid.items():
+        rt = m["reply_to"]
+        if rt and rt in byid:
+            children.setdefault(rt, []).append(mid)
+    root, seen = args.id, set()          # walk up to the thread root
+    while byid[root]["reply_to"] in byid and root not in seen:
+        seen.add(root)
+        root = byid[root]["reply_to"]
+    thread, stack = set(), [root]        # collect the whole subtree from root
+    while stack:
+        x = stack.pop()
+        if x in thread:
+            continue
+        thread.add(x)
+        stack.extend(children.get(x, []))
+    for mid in sorted(thread, key=_id_key):
+        emit(byid[mid], args.json)
+    return 0
+
+
+def cmd_inbox(r, args):
+    """PEEK (does NOT advance the cursor) the unread messages that need your
+    attention: directed to you, or questions. Cursor is left untouched so a
+    later poll/wait still delivers them."""
+    touch_presence(r, args.room, args.as_agent)
+    cur = r.get(k_cursor(args.room, args.as_agent)) or "0-0"
+    peek_cap = 1000
+    resp = r.xread({k_stream(args.room): cur}, count=peek_cap)  # bounded peek, no block
+    entries = resp[0][1] if resp else []
+    items = []
+    for mid, f in entries:
+        m = fields_to_msg(mid, f)
+        if m["from"] == args.as_agent:
+            continue
+        directed = m["to"] == args.as_agent
+        # a question counts only if it's actually addressed to me (or broadcast);
+        # a question aimed at another agent is not my inbox.
+        if directed or (m["kind"] == "question" and m["to"] == "all"):
+            items.append(m)
+    if len(entries) == peek_cap:
+        sys.stderr.write(f"bus inbox: showing the oldest {peek_cap} unread; more remain — poll to advance\n")
+    if args.json:
+        for m in items:
+            emit(m, True)  # JSONL, consistent with poll/wait/tail/history
+    elif not items:
+        print("(inbox empty — no unread directed messages or questions)")
+    else:
+        for m in items:
+            tag = "Q" if m["kind"] == "question" else "@"
+            topic = f" [{terminal_line(m['topic'])}]" if m["topic"] else ""
+            body = terminal_line(m["body"])[:100]
+            print(f"{tag} {terminal_line(m['id'])}  {terminal_line(m['from'])}{topic}: {body}")
+    return 0
+
+
+def xtrim_minid(r, stream, minid):
+    return r.execute_command("XTRIM", stream, "MINID", minid)
+
+
+def cursor_has_unread_before(r, stream, cursor, boundary):
+    return bool(r.xrange(stream, f"({cursor}", f"({boundary}", count=1))
+
+
+def cmd_prune(r, args):
+    """Trim a room's stream to the newest --keep messages. DESTRUCTIVE. Refuses
+    if any agent's cursor is behind the keep-window (would drop unread), unless
+    --force. Never auto-runs; operator-invoked only."""
+    stream = k_stream(args.room)
+    total = r.xlen(stream)
+    if total <= args.keep:
+        print(f"room {args.room}: {total} messages <= keep {args.keep}; nothing to trim")
+        return 0
+    boundary = r.xrevrange(stream, count=args.keep)[-1][0]  # oldest id we'd keep
+    behind = []
+    for key in r.scan_iter(match=k_cursor(args.room, "*")):
+        cval = r.get(key)
+        if cval and cursor_has_unread_before(r, stream, cval, boundary):
+            behind.append((key.rsplit(":", 1)[-1], cval))
+    if behind and not args.force:
+        who = ", ".join(f"{terminal_line(a)}@{terminal_line(c)}" for a, c in behind)
+        sys.stderr.write(
+            f"bus prune: REFUSING — {len(behind)} agent cursor(s) behind the keep-window "
+            f"boundary {terminal_line(boundary)}; trimming would drop unread messages ({who}). "
+            f"Re-run with --force to override.\n")
+        return 1
+    if behind:
+        sys.stderr.write(f"bus prune: --force: dropping unread for {len(behind)} lagging agent(s)\n")
+    # Trim by the checked boundary, not by MAXLEN. If a writer appends between
+    # the cursor scan and trim, MINID may keep more than --keep, but it cannot
+    # move the deletion boundary forward and drop unread messages we did not
+    # check.
+    removed = xtrim_minid(r, stream, boundary)
+    print(f"pruned room {args.room}: removed {removed}, kept {r.xlen(stream)} (was {total})")
+    return 0
+
+
+def _holder_present(r, holder):
+    """True if `holder` has a presence key in ANY room (locks are global, an
+    agent may be live in a different room than the one reap was invoked for)."""
+    return bool(holder) and any(True for _ in r.scan_iter(match=f"bus:presence:*:{holder}"))
+
+
+def stale_lock_info(r, issue, present_set=None):
+    """Return (holder, ttl) if the lock is held by an absent agent, else None.
+    Pass `present_set` (a snapshot of present agent ids) to avoid a per-call
+    keyspace scan when checking many locks; omit it for a single fresh check."""
+    holder = r.get(k_lock(issue))
+    if not holder:
+        return None
+    present = holder in present_set if present_set is not None else _holder_present(r, holder)
+    if present:
+        return None
+    return holder, r.ttl(k_lock(issue))
+
+
+def compare_delete_lock(r, issue, holder):
+    return r.eval(
+        """
+        if redis.call('GET', KEYS[1]) == ARGV[1] then
+            return redis.call('DEL', KEYS[1])
+        end
+        return 0
+        """,
+        1, k_lock(issue), holder,
+    )
+
+
+def cmd_reap(r, args):
+    """List issue locks whose holder has no presence anywhere (possibly a dead
+    agent). ADVISORY — the 8h lock TTL is the real death-expiry, and a turn-based
+    agent idle past its 90s presence TTL is NOT dead. Absent presence is a weak
+    death signal, so there is deliberately NO blanket release: `--release <issue>`
+    frees exactly ONE lock the operator has verified is genuinely dead."""
+    present_set = {k.rsplit(":", 1)[-1] for k in r.scan_iter(match="bus:presence:*")}
+    stale = []
+    for key in r.scan_iter(match="bus:lock:issue:*"):
+        issue = key.rsplit(":", 1)[-1]
+        info = stale_lock_info(r, issue, present_set)
+        if info:
+            holder, ttl = info
+            stale.append((issue, holder, ttl))
+    stale.sort(key=lambda s: int(s[0]) if s[0].isdigit() else 0)
+    if args.json:
+        print(json.dumps([{"issue": i, "holder": h, "ttl": t} for i, h, t in stale]))
+    elif not stale:
+        print("no stale locks (every lock holder is present)")
+    else:
+        for i, h, t in stale:
+            print(f"issue #{terminal_line(i)}\tholder={terminal_line(h)}\tttl={t}s\tpresent=no")
+    if args.release is not None:
+        target = str(args.release)
+        current = stale_lock_info(r, target)
+        if not current:
+            sys.stderr.write(f"bus reap --release {target}: not a stale lock "
+                             f"(holder present, or not locked) — refusing to release\n")
+            return 1
+        holder, _ = current
+        if not compare_delete_lock(r, target, holder):
+            sys.stderr.write(f"bus reap --release {target}: lock changed while releasing — refusing\n")
+            return 1
+        print(f"released stale lock on #{target} (was {terminal_line(holder)})")
+    return 0
+
+
+def cmd_board(r, args):
+    """One table: every status-labelled gh issue + its status + Redis lock
+    holder + whether that holder is present. Composes gh + Redis; read-only."""
+    if not GH_REPO:
+        sys.stderr.write("bus board: set BUS_GH_REPO=owner/repo\n")
+        return 2
+    rc, out, err = gh(["issue", "list", "--state", "all", "--limit", "1000",
+                       "--json", "number,title,labels"], check=False)
+    gh_rows = {}
+    try:
+        issues = json.loads(out) if (rc == 0 and out) else []
+    except json.JSONDecodeError:
+        issues = []
+        rc = 1
+    if rc != 0:
+        sys.stderr.write(f"bus board: gh issue list unavailable; showing Redis locks only: {err}\n")
+    else:
+        for it in issues:
+            labels = [l["name"] for l in (it.get("labels") or [])]
+            status = next((l for l in labels if l.startswith("status:")), None)
+            if status:
+                gh_rows[str(it["number"])] = {
+                    "issue": str(it["number"]),
+                    "status": status,
+                    "title": it.get("title", ""),  # raw; escaped only for the human table
+                }
+    lock_rows = {}
+    for key in r.scan_iter(match="bus:lock:issue:*"):
+        issue = key.rsplit(":", 1)[-1]
+        lock_rows[issue] = r.get(key)
+    present_set = {k.rsplit(":", 1)[-1] for k in r.scan_iter(match="bus:presence:*")}
+    rows = []
+    for issue in sorted(set(gh_rows) | set(lock_rows),
+                        key=lambda x: int(x) if x.isdigit() else 0):
+        holder = lock_rows.get(issue)
+        meta = gh_rows.get(issue, {})
+        present = "-" if not holder else ("yes" if holder in present_set else "no")
+        rows.append((issue, meta.get("status", "unknown"), holder or "-",
+                     present, meta.get("title", "unknown")))
+    # rows are already built in numeric issue order above; a re-sort by the
+    # string issue id would put #10 before #2, so don't.
+    if args.json:
+        print(json.dumps([{"issue": n, "status": s, "holder": h, "present": p, "title": t}
+                          for n, s, h, p, t in rows]))
+        return 0
+    if not rows:
+        print("(board empty — no status-labelled or claimed issues)")
+        return 0
+    print(f"{'ISSUE':<6} {'STATUS':<16} {'HOLDER':<14} {'PRES':<4} TITLE")
+    for n, s, h, p, t in rows:
+        print(f"#{terminal_line(n):<5} {terminal_line(s):<16} {terminal_line(h):<14} {p:<4} {terminal_line(t)[:44]}")
     return 0
 
 
@@ -614,6 +874,8 @@ def build_parser():
     w = sub.add_parser("wait", help="block until a message for you arrives")
     _as(w); _topic(w)
     w.add_argument("--timeout", type=float, default=30.0, help="seconds (default 30)")
+    w.add_argument("--reply-to", dest="reply_to", type=ident, default=None,
+                   help="only wake on a reply to this message id")
 
     t = sub.add_parser("tail", help="recent messages, no cursor change")
     t.add_argument("-n", type=int, default=20)
@@ -623,6 +885,21 @@ def build_parser():
     wt = sub.add_parser("watch", help="live-follow all messages in a room (observer, Ctrl-C to stop)")
     wt.add_argument("-n", type=int, default=10, help="show last N for context before following (default 10)")
     _topic(wt)
+
+    thr = sub.add_parser("thread", help="print the reply_to thread containing a message id")
+    thr.add_argument("id", type=ident, help="a message id somewhere in the thread")
+
+    _as(sub.add_parser("inbox", help="peek unread messages for you (directed or questions); cursor untouched"))
+
+    pr = sub.add_parser("prune", help="trim a room to the newest --keep messages (destructive, guarded)")
+    pr.add_argument("--keep", type=positive_int, default=5000, help="messages to keep (default 5000)")
+    pr.add_argument("--force", action="store_true", help="trim even if it drops unread for lagging agents")
+
+    rp = sub.add_parser("reap", help="list stale issue locks (holder absent); --release <issue> to free ONE")
+    rp.add_argument("--release", type=positive_int, default=None, metavar="ISSUE",
+                    help="release exactly one stale lock you've verified is dead (default: list only)")
+
+    sub.add_parser("board", help="table of gh issues + status + lock holder + presence")
 
     _as(sub.add_parser("join", help="register presence, cursor to now"))
     sub.add_parser("agents", help="list present agents")
@@ -654,6 +931,8 @@ DISPATCH = {
     "tail": cmd_tail, "history": cmd_history, "watch": cmd_watch, "join": cmd_join,
     "agents": cmd_agents, "claim": cmd_claim, "release": cmd_release,
     "renew": cmd_renew, "status": cmd_status,
+    "thread": cmd_thread, "inbox": cmd_inbox, "prune": cmd_prune,
+    "reap": cmd_reap, "board": cmd_board,
 }
 
 
