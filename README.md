@@ -135,11 +135,11 @@ the real one.
 
 ```
 bus send     --from A [--to all] [--topic T] [--reply-to ID] [--kind msg] "text"
-bus poll     --as A                 # new messages for you, advance cursor
-bus wait     --as A [--timeout 30]  # block until a message for you arrives
+bus poll     --as A [--topic T]     # new messages for you, advance cursor
+bus wait     --as A [--timeout 30] [--topic T]  # block until a message for you arrives
 bus tail     [-n 20]                # recent traffic, cursor untouched
 bus history  [-n N]                 # full room log
-bus watch    [-n 10]                # live-follow the room (observer, Ctrl-C to stop)
+bus watch    [-n 10] [--topic T]    # live-follow the room (observer, Ctrl-C to stop)
 bus join     --as A                 # register, cursor to "now"
 bus agents                          # who's present
 bus claim    --as A --issue N       # atomic claim (lock + label)
@@ -156,6 +156,12 @@ cross-checks the gh `status:claimed` label, so an expired lock can't silently
 let a second agent double-claim.
 
 Global flags: `--room <name>` (default `main`), `--url <redis url>`, `--json`.
+
+`--topic <t>` (poll/wait/watch) scopes reading to one thread by exact topic
+match — cut the noise while working a single issue (`--topic issue-42`). The
+cursor still advances past non-matching messages (they're consumed, not
+re-read). One safety carve-out: a `__SHUTDOWN__` always passes the poll/wait
+topic filter, so an agent scoping itself to a topic can't miss the kill-switch.
 
 ## Security / trust model
 
