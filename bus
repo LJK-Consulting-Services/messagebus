@@ -18,6 +18,7 @@ Commands:
   wait     block until a message for you arrives (XREAD BLOCK), advance cursor
   tail     show recent messages without moving your cursor (observability)
   history  dump the full room log
+  watch    live-follow every message in a room (read-only observer)
   join     register presence and set your cursor to "now"
   agents   list agents currently present in a room
   claim    atomically claim a gh issue (Redis lock + status label)
@@ -61,8 +62,15 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+SOCKET_TIMEOUT = 5     # seconds; client-side read timeout (fail fast on dead Redis)
+# A blocking XREAD must block for LESS than SOCKET_TIMEOUT or the client socket
+# read itself times out and raises. So blocking reads are issued in chunks and
+# re-blocked in a loop; the chunk must stay safely under SOCKET_TIMEOUT.
+BLOCK_CHUNK_MS = 1000
+
+
 def connect(url):
-    r = redis.Redis.from_url(url, decode_responses=True, socket_timeout=5)
+    r = redis.Redis.from_url(url, decode_responses=True, socket_timeout=SOCKET_TIMEOUT)
     r.ping()  # fail fast with a clear error if server is down
     return r
 
@@ -267,8 +275,10 @@ def cmd_wait(r, args):
             if not args.json:
                 print("(timeout, no messages)")
             return RC_NONE
-        # never pass 0: XREAD BLOCK 0 blocks forever. Floor at 1ms.
-        block_ms = max(1, int(remaining * 1000))
+        # Block in chunks under SOCKET_TIMEOUT (a longer single block would trip
+        # the client socket read timeout and crash). Floor at 1ms; XREAD BLOCK 0
+        # would block forever. The outer loop re-blocks on the remaining budget.
+        block_ms = max(1, min(BLOCK_CHUNK_MS, int(remaining * 1000)))
         delivered, last_seen = read_from_cursor(
             r, args.room, args.as_agent, block_ms=block_ms
         )
@@ -281,10 +291,16 @@ def cmd_wait(r, args):
         # saw only traffic not addressed to us (or nothing) -> keep waiting
 
 
-def cmd_tail(r, args):
-    entries = r.xrevrange(k_stream(args.room), count=args.n)
+def emit_recent(r, room, n, as_json):
+    """Print the last n messages (oldest-first) and return the raw entries."""
+    entries = r.xrevrange(k_stream(room), count=n)
     for msg_id, fields in reversed(entries):
-        emit(fields_to_msg(msg_id, fields), args.json)
+        emit(fields_to_msg(msg_id, fields), as_json)
+    return entries
+
+
+def cmd_tail(r, args):
+    emit_recent(r, args.room, args.n, args.json)
     return 0
 
 
@@ -293,6 +309,37 @@ def cmd_history(r, args):
     for msg_id, fields in entries:
         emit(fields_to_msg(msg_id, fields), args.json)
     return 0
+
+
+def cmd_watch(r, args):
+    """Live-follow every message in a room as it arrives (tail -f style).
+
+    Read-only OBSERVER: it never registers presence or moves any agent's cursor,
+    so watching a room doesn't perturb the agents working in it. Shows the last
+    -n messages for context, then blocks for new ones until Ctrl-C.
+    """
+    last = "$"  # "$" = only messages added after we start blocking
+    if args.n > 0:
+        entries = emit_recent(r, args.room, args.n, args.json)
+        if entries:
+            last = entries[0][0]  # continue strictly after the newest shown
+    sys.stdout.flush()
+    try:
+        while True:
+            # block in chunks under SOCKET_TIMEOUT (block=0 would block forever
+            # and trip the client socket read timeout); loop on empty returns.
+            resp = r.xread({k_stream(args.room): last}, block=BLOCK_CHUNK_MS)
+            if not resp:
+                continue
+            _, entries = resp[0]
+            for msg_id, fields in entries:
+                last = msg_id
+                emit(fields_to_msg(msg_id, fields), args.json)
+            # a follow tool must flush per batch or a piped consumer sees nothing
+            # until the buffer fills (stdout is block-buffered when not a tty).
+            sys.stdout.flush()
+    except KeyboardInterrupt:
+        return 0
 
 
 def cmd_join(r, args):
@@ -526,6 +573,9 @@ def build_parser():
     h = sub.add_parser("history", help="full room log")
     h.add_argument("-n", type=int, default=1000)
 
+    wt = sub.add_parser("watch", help="live-follow all messages in a room (observer, Ctrl-C to stop)")
+    wt.add_argument("-n", type=int, default=10, help="show last N for context before following (default 10)")
+
     _as(sub.add_parser("join", help="register presence, cursor to now"))
     sub.add_parser("agents", help="list present agents")
 
@@ -553,7 +603,7 @@ def build_parser():
 # command -> handler. Membership here also means "this command needs Redis".
 DISPATCH = {
     "send": cmd_send, "poll": cmd_poll, "wait": cmd_wait,
-    "tail": cmd_tail, "history": cmd_history, "join": cmd_join,
+    "tail": cmd_tail, "history": cmd_history, "watch": cmd_watch, "join": cmd_join,
     "agents": cmd_agents, "claim": cmd_claim, "release": cmd_release,
     "renew": cmd_renew, "status": cmd_status,
 }

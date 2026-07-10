@@ -89,6 +89,48 @@ re-invokes itself whenever a message for it lands:
   send it a message whose body is exactly `__SHUTDOWN__`.
 - `BUS_MAX_TURNS` (default 200) caps consecutive auto-continues as a runaway guard.
 
+> **Ordering matters: start agents BEFORE you inject the opening prompt.** `join`
+> sets an agent's cursor to "now", so any message sent before an agent has
+> joined is not delivered to it. Bring every agent online (watch for its
+> presence in `bus agents`), *then* `bus send` the kickoff.
+
+## Watch the conversation (supervised autonomy)
+
+The strongest way to run this today is **supervised**: pre-break the work into gh
+issues (the issues are the real coordination), let agents claim + execute +
+report, and watch the bus live so you can intervene if they drift instead of
+converge:
+
+```bash
+bus watch          # live-follow room "main"
+bus --room smoke watch     # follow a specific room
+```
+
+`watch` is a read-only observer — it never registers presence or moves any
+agent's cursor, so watching never perturbs the agents.
+
+## Proving the drivers (before you trust an autonomous run)
+
+`examples/echo-agent.sh` is a trivial agent that reads a bus message on stdin and
+replies on the bus. Use it to prove `agent-loop.sh` drives a real external
+process end-to-end before wiring a real CLI:
+
+```bash
+# terminal 1: drive the echo agent, and watch
+scripts/agent-loop.sh echo-1 examples/echo-agent.sh echo-1 &
+bus watch
+# terminal 2 (after echo-1 shows in `bus agents`):
+bus send --from operator --to echo-1 "ping"
+#   -> you see echo-1's reply arrive live in the watch
+touch .bus-state/stop-echo-1     # stop it
+```
+
+Swap `examples/echo-agent.sh echo-1` for your real CLI once the mechanism is
+proven — e.g. `codex exec -` or `claude -p --append-system-prompt "$(scripts/agent-bootstrap.sh codex-1)"`.
+The exact Codex/Claude invocation (does it read the prompt from stdin? one turn
+per call?) is the only unverified piece — start with the echo agent, then wire
+the real one.
+
 ## Commands
 
 ```
@@ -97,6 +139,7 @@ bus poll     --as A                 # new messages for you, advance cursor
 bus wait     --as A [--timeout 30]  # block until a message for you arrives
 bus tail     [-n 20]                # recent traffic, cursor untouched
 bus history  [-n N]                 # full room log
+bus watch    [-n 10]                # live-follow the room (observer, Ctrl-C to stop)
 bus join     --as A                 # register, cursor to "now"
 bus agents                          # who's present
 bus claim    --as A --issue N       # atomic claim (lock + label)
