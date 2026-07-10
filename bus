@@ -1,0 +1,578 @@
+#!/usr/bin/env python3
+"""
+bus — a tiny, durable message bus for multi-agent coordination.
+
+Backed by Redis Streams (durable log + per-agent cursor), NOT pub/sub.
+Pub/sub drops messages when an agent is mid-turn and not subscribed; a
+turn-based agent would lose exactly the messages that matter. Streams
+persist every message and each agent tracks its own read position, so an
+agent that was busy (or dead) for 10 minutes catches up on wake.
+
+Task ordering uses two layers:
+  - Redis SET NX  -> atomic claim lock (resolves the claim race)
+  - GitHub issue labels -> durable, human-visible state machine
+
+Commands:
+  send     publish a message to a room
+  poll     read new messages addressed to you (non-blocking), advance cursor
+  wait     block until a message for you arrives (XREAD BLOCK), advance cursor
+  tail     show recent messages without moving your cursor (observability)
+  history  dump the full room log
+  join     register presence and set your cursor to "now"
+  agents   list agents currently present in a room
+  claim    atomically claim a gh issue (Redis lock + status label)
+  release  release a claim you hold
+  renew    extend the TTL on a claim you hold (long-running tasks)
+  status   transition a gh issue's status label + announce on the bus
+  init     create the status:* labels in BUS_GH_REPO
+  doctor   check Redis connectivity and gh auth
+
+Config via env:
+  BUS_REDIS_URL   default redis://127.0.0.1:6379/0
+  BUS_ROOM        default "main"
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+from datetime import datetime, timezone
+
+try:
+    import redis
+except ImportError:
+    sys.stderr.write("bus: redis-py not installed. Run: pip install redis\n")
+    sys.exit(2)
+
+DEFAULT_URL = os.environ.get("BUS_REDIS_URL", "redis://127.0.0.1:6379/0")
+DEFAULT_ROOM = os.environ.get("BUS_ROOM", "main")
+PRESENCE_TTL = 90  # seconds; refreshed on every send/poll/wait/join
+
+# ---- key helpers -----------------------------------------------------------
+
+def k_stream(room):   return f"bus:stream:{room}"
+def k_cursor(room, a): return f"bus:cursor:{room}:{a}"
+def k_presence(room, a): return f"bus:presence:{room}:{a}"
+def k_lock(issue):    return f"bus:lock:issue:{issue}"
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def connect(url):
+    r = redis.Redis.from_url(url, decode_responses=True, socket_timeout=5)
+    r.ping()  # fail fast with a clear error if server is down
+    return r
+
+
+def touch_presence(r, room, agent):
+    if agent:
+        r.set(k_presence(room, agent), now_iso(), ex=PRESENCE_TTL)
+
+
+# ---- gh helpers ------------------------------------------------------------
+
+import subprocess
+
+# Target repo for issue/label commands. Without it, gh uses the cwd's repo,
+# but `bus` usually runs from the messagebus dir which is NOT that repo.
+GH_REPO = os.environ.get("BUS_GH_REPO", "")
+
+# gh subcommands that do NOT accept -R/--repo. Everything else gets -R, so a
+# new repo-aware call fails safe (targeted at BUS_GH_REPO) instead of silently
+# acting on the cwd's repo.
+_NON_REPO = {"auth", "config", "api"}
+
+
+def gh(args, check=True):
+    """Run a gh command, return (rc, stdout, stderr)."""
+    full = ["gh"] + args
+    if GH_REPO and args and args[0] not in _NON_REPO:
+        full += ["-R", GH_REPO]
+    p = subprocess.run(full, capture_output=True, text=True)
+    if check and p.returncode != 0:
+        raise RuntimeError(f"gh {' '.join(args)} failed: {p.stderr.strip()}")
+    return p.returncode, p.stdout.strip(), p.stderr.strip()
+
+
+def issue_labels(issue):
+    """Current label names on an issue, or None if gh couldn't answer.
+
+    None (read failed) is deliberately distinct from [] (issue genuinely has no
+    labels) so callers don't mistake a transient gh error for 'no labels'.
+    """
+    rc, out, _ = gh(["issue", "view", str(issue), "--json", "labels",
+                     "-q", ".labels[].name"], check=False)
+    if rc != 0:
+        return None
+    return out.splitlines() if out else []
+
+
+STATUS_LABELS = [
+    "status:open", "status:claimed", "status:pr-open",
+    "status:merged", "status:deployed", "status:verified",
+]
+
+
+def set_status_label(issue, new_label):
+    """Add new_label, remove any other status:* label the issue actually has.
+
+    Deriving the remove-set from the issue's current labels (not blindly
+    removing all five) means gh never sees a "remove a label it doesn't have"
+    error, so there's no fragile stderr parsing or retry.
+    """
+    if new_label not in STATUS_LABELS:
+        raise ValueError(f"unknown status label: {new_label}")
+    current = issue_labels(issue)
+    if current is None:
+        # couldn't read labels -> add the new one only, don't guess removals.
+        # A later transition (with a working read) derives removals from real
+        # state and cleans up any stale label, so this self-heals.
+        sys.stderr.write(f"warning: could not read labels on #{issue}; "
+                         f"adding {new_label} without removing others\n")
+        current = []
+    remove = [l for l in STATUS_LABELS if l != new_label and l in current]
+    args = ["issue", "edit", str(issue), "--add-label", new_label]
+    for l in remove:
+        args += ["--remove-label", l]
+    gh(args, check=False)
+
+
+# ---- message plumbing ------------------------------------------------------
+
+SHUTDOWN = "__SHUTDOWN__"  # a message with this exact body means "stop"
+
+# exit codes shared with the shell drivers (stop-hook.sh, agent-loop.sh)
+RC_DELIVERED = 0   # messages for the agent were printed
+RC_NONE = 10       # nothing addressed to the agent (empty poll / wait timeout)
+RC_SHUTDOWN = 11   # a delivered message was the shutdown sentinel
+
+
+def make_fields(frm, to, body, kind="msg", topic="", reply_to=""):
+    """The single source of truth for the on-stream message schema (write side,
+    mirror of fields_to_msg on the read side)."""
+    return {"from": frm, "to": to, "topic": topic,
+            "reply_to": reply_to, "kind": kind, "body": body}
+
+
+def read_result_code(delivered):
+    if not delivered:
+        return RC_NONE
+    if any(m["body"].strip() == SHUTDOWN for m in delivered):
+        return RC_SHUTDOWN
+    return RC_DELIVERED
+
+
+def emit(msg, as_json):
+    if as_json:
+        print(json.dumps(msg, ensure_ascii=False))
+    else:
+        who = msg["from"]
+        to = msg.get("to", "all")
+        arrow = "" if to == "all" else f" -> {to}"
+        topic = f" [{msg['topic']}]" if msg.get("topic") else ""
+        reply = f" (re {msg['reply_to']})" if msg.get("reply_to") else ""
+        print(f"{msg['id']}  {who}{arrow}{topic}{reply}\n  {msg['body']}")
+
+
+def fields_to_msg(msg_id, fields):
+    return {
+        "id": msg_id,
+        "from": fields.get("from", "?"),
+        "to": fields.get("to", "all"),
+        "topic": fields.get("topic", ""),
+        "reply_to": fields.get("reply_to", ""),
+        "kind": fields.get("kind", "msg"),
+        "body": fields.get("body", ""),
+    }
+
+
+def deliverable(msg, agent):
+    """True if this message should be shown to `agent`."""
+    addressed = msg["to"] == "all" or msg["to"] == agent
+    if msg["from"] == agent:
+        # normally don't echo your own posts back — but a self-addressed
+        # shutdown is the documented way for an agent to stop itself, so it
+        # must survive the echo filter to reach read_result_code.
+        return addressed and msg["body"].strip() == SHUTDOWN
+    return addressed
+
+
+# ---- commands --------------------------------------------------------------
+
+def cmd_send(r, args):
+    body = args.body
+    if body == "-" or (body is None and not sys.stdin.isatty()):
+        body = sys.stdin.read()
+    if not body:
+        sys.stderr.write("bus send: empty body\n")
+        return 2
+    fields = make_fields(args.frm, args.to, body.strip(),
+                         kind=args.kind, topic=args.topic or "",
+                         reply_to=args.reply_to or "")
+    msg_id = r.xadd(k_stream(args.room), fields)
+    touch_presence(r, args.room, args.frm)
+    if args.json:
+        print(json.dumps({"id": msg_id, "room": args.room}))
+    else:
+        print(f"sent {msg_id} to room={args.room} to={args.to}")
+    return 0
+
+
+def read_from_cursor(r, room, agent, block_ms=None, count=100):
+    """One XREAD from the agent's cursor. Returns (delivered, last_seen_id)."""
+    cur = r.get(k_cursor(room, agent)) or "0-0"
+    kwargs = {"count": count}
+    if block_ms is not None:
+        kwargs["block"] = block_ms
+    resp = r.xread({k_stream(room): cur}, **kwargs)
+    delivered, last_seen = [], None
+    if resp:
+        _, entries = resp[0]
+        for msg_id, fields in entries:
+            last_seen = msg_id
+            msg = fields_to_msg(msg_id, fields)
+            if deliverable(msg, agent):
+                delivered.append(msg)
+    return delivered, last_seen
+
+
+def cmd_poll(r, args):
+    touch_presence(r, args.room, args.as_agent)
+    delivered, last_seen = read_from_cursor(r, args.room, args.as_agent)
+    if last_seen:
+        r.set(k_cursor(args.room, args.as_agent), last_seen)
+    for m in delivered:
+        emit(m, args.json)
+    if not delivered and not args.json:
+        print("(no new messages)")
+    return read_result_code(delivered)
+
+
+def cmd_wait(r, args):
+    """Block up to --timeout seconds for a message addressed to us.
+
+    We advance the cursor past every message we see (even ones not for us),
+    then keep blocking on the remaining time budget so unrelated traffic
+    doesn't make us return empty.
+    """
+    import time
+    touch_presence(r, args.room, args.as_agent)
+    deadline = time.monotonic() + args.timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            if not args.json:
+                print("(timeout, no messages)")
+            return RC_NONE
+        # never pass 0: XREAD BLOCK 0 blocks forever. Floor at 1ms.
+        block_ms = max(1, int(remaining * 1000))
+        delivered, last_seen = read_from_cursor(
+            r, args.room, args.as_agent, block_ms=block_ms
+        )
+        if last_seen:
+            r.set(k_cursor(args.room, args.as_agent), last_seen)
+        if delivered:
+            for m in delivered:
+                emit(m, args.json)
+            return read_result_code(delivered)
+        # saw only traffic not addressed to us (or nothing) -> keep waiting
+
+
+def cmd_tail(r, args):
+    entries = r.xrevrange(k_stream(args.room), count=args.n)
+    for msg_id, fields in reversed(entries):
+        emit(fields_to_msg(msg_id, fields), args.json)
+    return 0
+
+
+def cmd_history(r, args):
+    entries = r.xrange(k_stream(args.room), count=args.n)
+    for msg_id, fields in entries:
+        emit(fields_to_msg(msg_id, fields), args.json)
+    return 0
+
+
+def cmd_join(r, args):
+    # start reading from "now": don't replay the whole room on first join.
+    info_id = "0-0"
+    try:
+        last = r.xrevrange(k_stream(args.room), count=1)
+        if last:
+            info_id = last[0][0]
+    except redis.ResponseError:
+        pass
+    r.set(k_cursor(args.room, args.as_agent), info_id)
+    touch_presence(r, args.room, args.as_agent)
+    if args.json:
+        print(json.dumps({"joined": args.as_agent, "room": args.room, "cursor": info_id}))
+    else:
+        print(f"{args.as_agent} joined room={args.room} (cursor at {info_id})")
+    return 0
+
+
+def cmd_agents(r, args):
+    keys = list(r.scan_iter(match=k_presence(args.room, "*")))
+    vals = r.mget(keys) if keys else []
+    present = [{"agent": k.rsplit(":", 1)[-1], "last_seen": v}
+               for k, v in zip(keys, vals)]
+    present.sort(key=lambda a: a["agent"])
+    if args.json:
+        print(json.dumps(present))
+    else:
+        if not present:
+            print(f"(no agents present in room={args.room})")
+        for a in present:
+            print(f"{a['agent']}\tlast_seen={a['last_seen']}")
+    return 0
+
+
+def announce(r, room, frm, body, topic=""):
+    r.xadd(k_stream(room), make_fields(frm, "all", body, kind="system", topic=topic))
+
+
+def cmd_claim(r, args):
+    """Atomic claim: Redis SET NX wins the race, gh label is the durable record."""
+    lock = k_lock(args.issue)
+    # Defense against an expired Redis lock: if gh already shows the issue
+    # claimed, refuse even though SET NX would succeed. The label outlives the
+    # lock TTL, so this stops a second agent double-claiming a long-running task.
+    labels = issue_labels(args.issue)
+    if labels is None:
+        # couldn't read labels -> the cross-check can't run; fall back to the
+        # Redis lock alone (the baseline race arbiter) and say so.
+        sys.stderr.write(f"warning: could not read labels on #{args.issue}; "
+                         f"relying on the Redis lock only for this claim\n")
+    elif "status:claimed" in labels:
+        held = r.get(lock)
+        if held and held != args.as_agent:
+            sys.stderr.write(f"issue #{args.issue} already claimed by {held} (label set)\n")
+            return 1
+        if not held:
+            sys.stderr.write(
+                f"issue #{args.issue} is labelled status:claimed but the lock expired; "
+                f"resolve manually (bus release/status) before reclaiming\n")
+            return 1
+    won = r.set(lock, args.as_agent, nx=True, ex=args.ttl)
+    if not won:
+        holder = r.get(lock)
+        if holder == args.as_agent:
+            print(f"you ({args.as_agent}) already hold issue #{args.issue}")
+            return 0
+        sys.stderr.write(f"issue #{args.issue} already claimed by {holder}\n")
+        return 1
+    # We won the lock. Reflect to gh + announce. If gh fails, keep the lock
+    # (the announce still tells others), but surface the error.
+    err = None
+    try:
+        set_status_label(args.issue, "status:claimed")
+        gh(["issue", "comment", str(args.issue),
+            "--body", f"Claimed by `{args.as_agent}` via bus at {now_iso()}."], check=False)
+    except Exception as e:  # noqa: BLE001 - report and continue
+        err = str(e)
+    announce(r, args.room, args.as_agent,
+             f"claimed issue #{args.issue}", topic=f"issue-{args.issue}")
+    print(f"{args.as_agent} claimed issue #{args.issue}")
+    if err:
+        sys.stderr.write(f"warning: lock held but gh update failed: {err}\n")
+    return 0
+
+
+def require_holder(r, issue, agent, verb):
+    """Return the lock key if `agent` holds the claim, else write an error and
+    return None. Shared ownership guard for release/renew."""
+    lock = k_lock(issue)
+    holder = r.get(lock)
+    if holder != agent:
+        sys.stderr.write(
+            f"cannot {verb} #{issue}: held by {holder or '(nobody)'}, not {agent}\n")
+        return None
+    return lock
+
+
+def cmd_release(r, args):
+    lock = require_holder(r, args.issue, args.as_agent, "release")
+    if not lock:
+        return 1
+    r.delete(lock)
+    # We drop the lock but intentionally leave the status label as-is: releasing
+    # gives up ownership without erasing the progress already recorded on the issue.
+    announce(r, args.room, args.as_agent,
+             f"released issue #{args.issue}", topic=f"issue-{args.issue}")
+    print(f"{args.as_agent} released issue #{args.issue}")
+    return 0
+
+
+def cmd_status(r, args):
+    set_status_label(args.issue, args.set)
+    gh(["issue", "comment", str(args.issue),
+        "--body", f"Status -> `{args.set}` by `{args.as_agent}` at {now_iso()}."], check=False)
+    # a status update is a sign of life -> renew the claim lock if we hold it
+    lock = k_lock(args.issue)
+    if r.get(lock) == args.as_agent:
+        r.expire(lock, args.ttl)
+    announce(r, args.room, args.as_agent,
+             f"issue #{args.issue} -> {args.set}", topic=f"issue-{args.issue}")
+    print(f"issue #{args.issue} -> {args.set}")
+    return 0
+
+
+def cmd_renew(r, args):
+    """Extend the claim lock TTL. Only the holder may renew. Guards long tasks."""
+    lock = require_holder(r, args.issue, args.as_agent, "renew")
+    if not lock:
+        return 1
+    r.expire(lock, args.ttl)
+    print(f"{args.as_agent} renewed claim on #{args.issue} (+{args.ttl}s)")
+    return 0
+
+
+# distinct colors so the six phases are visually separable in the gh UI
+_LABEL_COLORS = {
+    "status:open": "ededed", "status:claimed": "fbca04",
+    "status:pr-open": "1d76db", "status:merged": "5319e7",
+    "status:deployed": "0e8a16", "status:verified": "0052cc",
+}
+
+
+def cmd_init(args):
+    """Create the status:* labels in the target repo (idempotent via --force)."""
+    if not GH_REPO:
+        sys.stderr.write("bus init: set BUS_GH_REPO=owner/repo first\n")
+        return 2
+    for label in STATUS_LABELS:
+        gh(["label", "create", label, "--color", _LABEL_COLORS[label],
+            "--description", "bus task state", "--force"], check=False)
+        print(f"ensured label {label}")
+    return 0
+
+
+def cmd_doctor(r_url):
+    ok = True
+    # Redis
+    try:
+        r = connect(r_url)
+        print(f"redis: OK ({r_url})")
+    except Exception as e:  # noqa: BLE001
+        print(f"redis: FAIL ({r_url}) -> {e}")
+        print("  start it: ./scripts/start-redis.sh   (or: brew services start redis)")
+        ok = False
+    # gh
+    rc, out, err = gh(["auth", "status"], check=False)
+    if rc == 0:
+        print("gh: OK (authenticated)")
+    else:
+        print(f"gh: FAIL -> {err or out}")
+        ok = False
+    return 0 if ok else 1
+
+
+# ---- argparse --------------------------------------------------------------
+
+TTL_HELP = "lock TTL seconds (default 8h)"
+
+# agent ids and room names become filename and Redis-key components, so keep
+# them to a safe charset (no path separators, no glob/':' key confusion).
+_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def ident(value):
+    if not _ID_RE.match(value):
+        raise argparse.ArgumentTypeError(
+            f"'{value}' must match [A-Za-z0-9._-]+ (no slashes/spaces/':')")
+    return value
+
+
+def positive_int(value):
+    if not value.isdigit() or int(value) < 1:
+        raise argparse.ArgumentTypeError(f"'{value}' must be a positive integer")
+    return int(value)
+
+
+def _as(parser):
+    parser.add_argument("--as", dest="as_agent", type=ident, required=True,
+                        help="your agent id")
+
+
+def _issue(parser):
+    parser.add_argument("--issue", type=positive_int, required=True)
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="bus", description="Tiny durable multi-agent message bus (Redis Streams).")
+    p.add_argument("--url", default=DEFAULT_URL, help=f"Redis URL (default {DEFAULT_URL})")
+    p.add_argument("--room", default=DEFAULT_ROOM, type=ident, help=f"room/topic stream (default {DEFAULT_ROOM})")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("send", help="publish a message")
+    s.add_argument("--from", dest="frm", type=ident, required=True, help="your agent id")
+    s.add_argument("--to", default="all", type=ident, help="recipient agent id or 'all' (default all)")
+    s.add_argument("--topic", default="", help="optional topic, e.g. issue-42")
+    s.add_argument("--reply-to", default="", help="message id you're replying to")
+    s.add_argument("--kind", default="msg", help="msg|question|answer|system (default msg)")
+    s.add_argument("body", nargs="?", help="message text, or '-' / piped stdin")
+
+    _as(sub.add_parser("poll", help="read new messages (non-blocking)"))
+
+    w = sub.add_parser("wait", help="block until a message for you arrives")
+    _as(w)
+    w.add_argument("--timeout", type=float, default=30.0, help="seconds (default 30)")
+
+    t = sub.add_parser("tail", help="recent messages, no cursor change")
+    t.add_argument("-n", type=int, default=20)
+    h = sub.add_parser("history", help="full room log")
+    h.add_argument("-n", type=int, default=1000)
+
+    _as(sub.add_parser("join", help="register presence, cursor to now"))
+    sub.add_parser("agents", help="list present agents")
+
+    c = sub.add_parser("claim", help="atomically claim a gh issue")
+    _as(c); _issue(c)
+    c.add_argument("--ttl", type=int, default=28800, help=TTL_HELP)
+
+    rl = sub.add_parser("release", help="release a claim you hold")
+    _as(rl); _issue(rl)
+
+    rn = sub.add_parser("renew", help="extend the TTL on a claim you hold")
+    _as(rn); _issue(rn)
+    rn.add_argument("--ttl", type=int, default=28800, help=TTL_HELP)
+
+    st = sub.add_parser("status", help="transition a gh issue status label")
+    _as(st); _issue(st)
+    st.add_argument("--set", required=True, choices=STATUS_LABELS)
+    st.add_argument("--ttl", type=int, default=28800, help=TTL_HELP)
+
+    sub.add_parser("init", help="create status:* labels in BUS_GH_REPO")
+    sub.add_parser("doctor", help="check redis + gh")
+    return p
+
+
+# command -> handler. Membership here also means "this command needs Redis".
+DISPATCH = {
+    "send": cmd_send, "poll": cmd_poll, "wait": cmd_wait,
+    "tail": cmd_tail, "history": cmd_history, "join": cmd_join,
+    "agents": cmd_agents, "claim": cmd_claim, "release": cmd_release,
+    "renew": cmd_renew, "status": cmd_status,
+}
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    if args.cmd == "doctor":
+        return cmd_doctor(args.url)
+    if args.cmd == "init":
+        return cmd_init(args)
+    try:
+        r = connect(args.url)
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write(f"bus: cannot reach Redis at {args.url}: {e}\n")
+        sys.stderr.write("  run `bus doctor` or start Redis: ./scripts/start-redis.sh\n")
+        return 3
+    return DISPATCH[args.cmd](r, args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
