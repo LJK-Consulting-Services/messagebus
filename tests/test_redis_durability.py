@@ -75,8 +75,13 @@ class RedisUnderTest:
 @pytest.fixture
 def redis_under_test(bus_module, tmp_path):
     if shutil.which("redis-server") is None:
-        if os.environ.get("GITHUB_ACTIONS"):
-            pytest.fail("redis-server must be installed in CI for the durability tests")
+        # Fail-closed wherever the environment is SUPPOSED to have the binary, so
+        # the restart-survival acceptance can never quietly stop running. Gated on
+        # an explicit opt-in rather than on GITHUB_ACTIONS: the CI step that
+        # installs redis-server lives in .github/workflows/ci.yml, and it sets
+        # this — the two land together or not at all.
+        if os.environ.get("BUS_REQUIRE_REDIS_SERVER") == "1":
+            pytest.fail("BUS_REQUIRE_REDIS_SERVER=1 but redis-server is not on PATH")
         pytest.skip("redis-server not on PATH; skipping real kill+restart tests")
     server = RedisUnderTest(tmp_path, _free_port(), bus_module)
     server.start()

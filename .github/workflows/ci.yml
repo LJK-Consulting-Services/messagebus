@@ -73,6 +73,7 @@ jobs:
       - name: Pytest
         env:
           BUS_INTEGRATION_REDIS_URL: redis://127.0.0.1:6379/0
+          BUS_REQUIRE_REDIS_SERVER: "1"
         run: |
           python -m pytest --cov=. --cov-report=term-missing --cov-report=json:coverage.json
           python scripts/check-bus-coverage.py coverage.json
