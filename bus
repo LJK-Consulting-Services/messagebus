@@ -1159,6 +1159,25 @@ def cmd_huddle_open(r, args):
     except RuntimeError as e:
         sys.stderr.write(f"bus huddle open: {e}\n")
         return 1
+    # Defense against an expired solo lock: if gh already shows the issue
+    # claimed but the Redis lock has lapsed, refuse — the durable label outlives
+    # the TTL, so a solo `bus claim` in flight must not be stolen by a huddle
+    # (mirrors cmd_claim's cross-check).
+    labels = issue_labels(issue)
+    if labels is None:
+        sys.stderr.write(f"warning: could not read labels on #{issue}; relying on "
+                         f"the Redis lock only for this huddle open\n")
+    elif "status:claimed" in labels:
+        held = r.get(lock)
+        if held and held != huddle_holder(issue):
+            sys.stderr.write(f"bus huddle open: #{issue} already claimed by {held} "
+                             f"(label set)\n")
+            return 1
+        if not held:
+            sys.stderr.write(
+                f"bus huddle open: #{issue} is labelled status:claimed but the lock "
+                f"expired; resolve manually (bus release/status) before opening a huddle\n")
+            return 1
     won = r.set(lock, huddle_holder(issue), nx=True, ex=args.ttl)
     if not won:
         sys.stderr.write(f"bus huddle open: issue #{issue} already locked by {r.get(lock)}\n")
@@ -1167,7 +1186,9 @@ def cmd_huddle_open(r, args):
     # back cleanly — no huddle should hold the issue lock with no branch.
     rc, val = create_shared_branch(main, args.base, branch, allow_stale=args.allow_stale)
     if rc != 0:
-        r.delete(lock)
+        # Compare-and-delete, not a blind delete: if our short TTL already lapsed
+        # and another agent re-took the lock, a plain delete would nuke THEIR lock.
+        compare_delete_lock(r, issue, huddle_holder(issue))
         sys.stderr.write(f"bus huddle open: {val}; rolled back the lock on #{issue}\n")
         return 1
     base_commit = val
@@ -1200,6 +1221,17 @@ def cmd_huddle_join(r, args):
     rule deferred). A WATCH/MULTI loop makes concurrent joins safe (no lost add)."""
     issue = args.issue
     key = k_huddle(issue)
+    # Refuse to append to a zombie: metadata has no TTL, so it can outlive a
+    # lapsed (expired/reaped) session lock. If the lock is gone the huddle is
+    # dead — don't join it. Advisory (pen/write-authority is deferred), so the
+    # benign TOCTOU between this check and the add just appends to metadata.
+    if not r.get(key):
+        sys.stderr.write(f"bus huddle join: no huddle on #{issue}\n")
+        return 1
+    if r.get(k_lock(issue)) != huddle_holder(issue):
+        sys.stderr.write(f"bus huddle join: #{issue}'s huddle lock is gone "
+                         f"(expired or reaped); ask the opener to reopen it\n")
+        return 1
     with r.pipeline() as pipe:
         while True:
             try:
@@ -1256,23 +1288,31 @@ def cmd_huddle_close(r, args):
         sys.stderr.write(f"bus huddle close: {args.as_agent} is not a participant of "
                          f"#{issue}'s huddle; only participants may close\n")
         return 1
+    # Advance the label ONLY if we still legitimately hold the session lock.
+    # compare_delete_lock returns 1 iff the lock was ours (atomic, no TOCTOU); a
+    # 0 means it already expired or was reaped — possibly re-acquired by someone
+    # else — so advancing status:pr-open would clobber their state. Either way we
+    # ALWAYS clear the metadata: close is the only orphan-cleanup path and must
+    # never leave meta behind (meta has no TTL; the lock does).
+    owned = compare_delete_lock(r, issue, huddle_holder(issue))
     err = None
-    try:
-        set_status_label(issue, "status:pr-open")
-        gh(["issue", "comment", str(issue),
-            "--body", f"Huddle closed by `{args.as_agent}` via bus at {now_iso()}."],
-           check=False)
-    except Exception as e:  # noqa: BLE001 - report and continue
-        err = str(e)
-    # Best-effort lock drop (only if still the huddle's), then ALWAYS clear the
-    # metadata — the lock may have already expired (it has a TTL; metadata does
-    # not), and close is the only cleanup path, so it must never leave meta behind.
-    compare_delete_lock(r, issue, huddle_holder(issue))
+    if owned:
+        try:
+            set_status_label(issue, "status:pr-open")
+            gh(["issue", "comment", str(issue),
+                "--body", f"Huddle closed by `{args.as_agent}` via bus at {now_iso()}."],
+               check=False)
+        except Exception as e:  # noqa: BLE001 - report and continue
+            err = str(e)
     r.delete(k_huddle(issue))
     announce(r, args.room, args.as_agent, f"closed huddle on #{issue}",
              topic=f"issue-{issue}")
     print(f"{args.as_agent} closed huddle on #{issue}")
-    if err:
+    if not owned:
+        sys.stderr.write(f"warning: huddle #{issue} lock was already gone (expired or "
+                         f"reaped); cleared metadata but did NOT advance the status "
+                         f"label — set it manually if the issue still needs it\n")
+    elif err:
         sys.stderr.write(f"warning: huddle closed but gh update failed: {err}\n")
     return 0
 
