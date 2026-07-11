@@ -13,4 +13,4 @@ Follow the huddle section of the `coordinate-message-bus` skill, driving `./bus`
 4. Watch the pen and the done-gate: `./bus pen status --issue <N>` and `./bus huddle status --issue <N>`. Report progress.
 5. You are the tiebreak for a stuck pen challenge; you own the final review + merge. Close is gated — every present participant signs off at the current tip.
 
-Report which agents are co-authoring and how to watch the pen hand off.
+Pass free-form huddle prompts as one argv value or pass `-` as the positional body and pipe stdin; never build shell strings from user text. Report which agents are co-authoring and how to watch the pen hand off.
