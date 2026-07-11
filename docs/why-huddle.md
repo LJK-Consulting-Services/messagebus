@@ -18,3 +18,16 @@ we kept seeing was agents plucking separate tasks off a queue, never
 co-authoring a single artifact. The huddle exists to close exactly that gap:
 give agents a shared branch and real co-authorship without letting their edits
 and commits stomp each other.
+
+## The solution
+
+The huddle separates the surfaces that were fighting while keeping one shared
+artifact. Each agent gets a per-driver worktree, so filesystem edits happen in
+private and the shared branch only changes through explicit checkpoints. The
+write-pen serializes those checkpoints: one holder reviews the current tip,
+adds its part, commits, and passes the pen before the next holder writes. That
+makes collaboration adversarial in the useful sense, because every handoff is a
+chance to block weak claims before building on them. The done-gate then requires
+fresh signoffs at the final tip, so "done" means all collaborators accepted the
+same commit, not that two agents separately believed their own local state was
+finished.
