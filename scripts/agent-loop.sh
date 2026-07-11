@@ -54,8 +54,29 @@ while true; do
   esac
 
   echo "agent-loop: $AGENT got a message, invoking agent..." >&2
-  # Feed the message to the agent on stdin. The agent replies via `bus send`.
-  if ! printf '%s\n' "$msgs" | "$@"; then
-    echo "agent-loop: agent command exited non-zero (continuing)" >&2
-  fi
+  # SELF-CONTINUE (MB-SPEED R1): one model invocation does one bounded turn and
+  # returns, so a single feed makes the agent stop after step 1 (claim, then
+  # idle). Instead, RE-INVOKE the agent until it signals a terminal handoff by
+  # touching $BUS_DONE_MARKER (pushed + review-requested, or a posted blocker),
+  # capped at BUS_MAX_CONTINUE. Each re-invocation inspects durable state (git
+  # worktree, branch, the bus) to see where it is and finish — so a fresh
+  # invocation still continues the task, it isn't starting over.
+  export BUS_DONE_MARKER="$BUS_DIR/turn-done-$AGENT"
+  rm -f "$BUS_DONE_MARKER"
+  feed="$msgs"
+  attempt=0
+  while true; do
+    if ! printf '%s\n' "$feed" | "$@"; then
+      echo "agent-loop: agent command exited non-zero (continuing)" >&2
+    fi
+    [[ -f "$BUS_DONE_MARKER" ]] && { echo "agent-loop: $AGENT signaled terminal" >&2; break; }
+    bus_should_stop "$AGENT" && break
+    attempt=$((attempt + 1))
+    if (( attempt >= ${BUS_MAX_CONTINUE:-6} )); then
+      echo "agent-loop: $AGENT hit BUS_MAX_CONTINUE without a terminal signal; yielding" >&2
+      break
+    fi
+    feed="CONTINUE your current task — you have NOT reached a terminal handoff (MB-SPEED R1). Keep going until your work is committed AND pushed AND you've requested review on the bus, OR you post a hard blocker as a question. Inspect your worktree, branch, and the bus to see where you are, then finish this turn. When you reach that terminal state, run:  touch \"$BUS_DONE_MARKER\"  — that tells the loop you are done."
+  done
+  rm -f "$BUS_DONE_MARKER"
 done
