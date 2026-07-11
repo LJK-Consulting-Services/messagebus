@@ -1,0 +1,19 @@
+{
+  "name": "messagebus",
+  "owner": {
+    "name": "LJK Consulting Services",
+    "url": "https://github.com/LJK-Consulting-Services"
+  },
+  "metadata": {
+    "description": "Claude Code plugin for coordinating AI agents on messagebus.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "messagebus-coordinator",
+      "source": "./",
+      "description": "Coordinate a team of AI agents on the messagebus in plain language — dispatch tasks, watch the board, run co-authoring huddles, and gate + merge their work.",
+      "version": "0.1.0"
+    }
+  ]
+}
