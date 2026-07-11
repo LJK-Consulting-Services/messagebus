@@ -45,6 +45,9 @@ def test_checkpoint_push_failure_keeps_pen_and_emits_no_checkpoint(
     monkeypatch.setattr(bus_module, "huddle_worktree", lambda *_args: "/worktree")
 
     def git(repo, *args, check=True):
+        # B2 (#82): _synced_tip resolves the leased-against tip before staging.
+        if repo == "/worktree" and args == ("rev-parse", "--verify", "origin/huddle/issue-79"):
+            return 0, "base", ""
         if repo == "/worktree" and args == ("add", "-A"):
             return 0, "", ""
         if repo == "/worktree" and args == ("diff", "--cached", "--quiet"):
@@ -58,7 +61,19 @@ def test_checkpoint_push_failure_keeps_pen_and_emits_no_checkpoint(
             "origin/huddle/issue-79",
         ):
             return 1, "", ""
-        if repo == "/worktree" and args == ("push", "origin", "HEAD:huddle/issue-79"):
+        # _leased_push: resolve HEAD, confirm it descends from the synced tip, then the
+        # leased push itself is rejected by a racing writer.
+        if repo == "/worktree" and args == ("rev-parse", "HEAD"):
+            return 0, "headsha", ""
+        if repo == "/worktree" and args == ("merge-base", "--is-ancestor", "base", "HEAD"):
+            return 0, "", ""
+        if repo == "/worktree" and args == (
+            "push",
+            "--porcelain",
+            "--force-with-lease=refs/heads/huddle/issue-79:base",
+            "origin",
+            "HEAD:huddle/issue-79",
+        ):
             return 1, "", "rejected"
         raise AssertionError(f"unexpected git call: {repo} {args}")
 
@@ -89,6 +104,8 @@ def test_checkpoint_guard_and_noop_paths(bus_module, fake_redis, ns, monkeypatch
     monkeypatch.setattr(bus_module, "huddle_worktree", lambda *_args: "/worktree")
 
     def git(_repo, *args, check=True):
+        if args == ("rev-parse", "--verify", "origin/huddle/issue-79"):
+            return 0, "base", ""
         if args == ("add", "-A"):
             return 0, "", ""
         if args == ("diff", "--cached", "--quiet"):
@@ -108,16 +125,31 @@ def test_checkpoint_success_pushes_and_announces(bus_module, fake_redis, ns, mon
     monkeypatch.setattr(bus_module, "huddle_worktree", lambda *_args: "/worktree")
 
     def git(_repo, *args, check=True):
+        # B2 (#82): synced tip we lease against.
+        if args == ("rev-parse", "--verify", "origin/huddle/issue-79"):
+            return 0, "base", ""
         if args == ("add", "-A"):
             return 0, "", ""
         if args == ("diff", "--cached", "--quiet"):
             return 0, "", ""
         if args == ("merge-base", "--is-ancestor", "HEAD", "origin/huddle/issue-79"):
             return 1, "", ""
-        if args == ("push", "origin", "HEAD:huddle/issue-79"):
-            return 0, "", ""
-        if args == ("rev-parse", "--short", "HEAD"):
+        # _leased_push: HEAD resolves to abc1234, descends from the synced tip, the
+        # leased push lands, and the post-push ls-remote confirms remote == HEAD.
+        if args == ("rev-parse", "HEAD"):
             return 0, "abc1234", ""
+        if args == ("merge-base", "--is-ancestor", "base", "HEAD"):
+            return 0, "", ""
+        if args == (
+            "push",
+            "--porcelain",
+            "--force-with-lease=refs/heads/huddle/issue-79:base",
+            "origin",
+            "HEAD:huddle/issue-79",
+        ):
+            return 0, "", ""
+        if args == ("ls-remote", "--heads", "origin", "huddle/issue-79"):
+            return 0, "abc1234\trefs/heads/huddle/issue-79", ""
         raise AssertionError(args)
 
     monkeypatch.setattr(bus_module, "git", git)

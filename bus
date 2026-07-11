@@ -1215,9 +1215,19 @@ def create_shared_branch(main, base, branch, allow_stale=False):
     rc, out, _ = git(main, "ls-remote", "--heads", "origin", branch, check=False)
     if rc == 0 and out.strip():
         return 1, f"remote branch {branch} already exists (leftover huddle?); remove it first"
-    rc, _, err = git(main, "push", "origin", f"{base_commit}:refs/heads/{branch}", check=False)
-    if rc != 0:
-        return 1, f"git push {branch} failed: {err}"
+    # Atomic create. A plain `push base:refs/heads/branch` is create-OR-fast-forward:
+    # if a racing writer created `branch` between the ls-remote check above and this
+    # push, it would silently fast-forward THEIR branch (or no-op on an equal tip)
+    # instead of failing. Empty-expect `--force-with-lease=refs/heads/branch:` requires
+    # the remote ref to NOT exist, so a race is rejected (stale info); `--porcelain`
+    # lets us confirm we actually created it (`[new branch]`) rather than any other
+    # outcome. (B2 git-ref collision hardening; see #82.)
+    rc, out, err = git(main, "push", "--porcelain",
+                       f"--force-with-lease=refs/heads/{branch}:",
+                       "origin", f"{base_commit}:refs/heads/{branch}", check=False)
+    if rc != 0 or "[new branch]" not in out:
+        return 1, (f"atomic create of {branch} failed (racing writer or leftover branch?); "
+                   f"refusing to fast-forward an existing ref: {err or out or 'no [new branch]'}")
     return 0, base_commit
 
 
@@ -1552,10 +1562,56 @@ def cmd_pen_status(r, args):
     return 0
 
 
+def _synced_tip(path, shared):
+    """The origin/<shared> tip huddle_worktree just fetched — the commit our push must
+    lease against. Deliberately NOT a re-fetch: a re-fetch would silently adopt a racing
+    writer's push as our base and defeat the collision guard. Returns the sha, or None if
+    the shared ref can't be resolved (huddle_worktree should have caught that first)."""
+    rc, tip, _ = git(path, "rev-parse", "--verify", f"origin/{shared}", check=False)
+    return tip if rc == 0 else None
+
+
+def _leased_push(path, shared, integrated):
+    """Push worktree HEAD to origin/`shared`, LEASED against `integrated` (the tip we
+    last synced down), then VERIFY the remote actually advanced to our HEAD.
+
+    The pen is meant to guarantee a single writer, but a git-ref collision (a racing
+    push/branch/delete against the same origin) can still move the shared ref between
+    our sync and our push. A plain push would then be rejected as non-ff (noisy) or, if
+    the remote moved to a commit our HEAD still fast-forwards, advance a base we never
+    reviewed. Leasing against `integrated` makes a moved ref REJECT (never clobbers a
+    peer's commit); the post-push ls-remote check catches a mismatch (e.g. our push
+    half-landed then got overwritten).
+
+    Returns (rc, head_sha, err): rc 0 = pushed and verified; rc 1 = BLOCKING
+    (lease reject or post-push mismatch — caller must not advance any state)."""
+    rc, head, _ = git(path, "rev-parse", "HEAD", check=False)
+    # Never force a non-ff: HEAD must descend from the tip we're leasing against, or a
+    # lease-authorized force could discard the commit currently on `integrated`.
+    rc2, _, _ = git(path, "merge-base", "--is-ancestor", integrated, "HEAD", check=False)
+    if rc2 != 0:
+        return 1, head, (f"HEAD {head[:8]} does not descend from the synced tip "
+                         f"{integrated[:8]}; refusing to force (diverged — recover manually)")
+    lease = f"refs/heads/{shared}:{integrated}"
+    rc3, out, err = git(path, "push", "--porcelain", f"--force-with-lease={lease}",
+                        "origin", f"HEAD:{shared}", check=False)
+    if rc3 != 0:
+        # B6-TODO(#81): emit structured event type="lease-reject" (BLOCKING) here.
+        return 1, head, (f"leased push rejected — another writer moved {shared} since our "
+                         f"last sync (git-ref collision): {err or out}")
+    rc4, rout, _ = git(path, "ls-remote", "--heads", "origin", shared, check=False)
+    remote_sha = rout.split()[0] if (rc4 == 0 and rout.strip()) else ""
+    if remote_sha != head:
+        # B6-TODO(#81): emit structured event type="post-push-mismatch" (BLOCKING) here.
+        return 1, head, (f"post-push mismatch: remote {shared} is {remote_sha[:8] or '(none)'}, "
+                         f"expected {head[:8]}; run `bus huddle recover`")
+    return 0, head, ""
+
+
 def cmd_pen_checkpoint(r, args):
     """Pen holder: stage + commit + push WIP to the shared branch (one command —
-    MB-SPEED: no manual git ceremony). Fast-forward push; the pen guarantees a
-    single writer so it stays linear."""
+    MB-SPEED: no manual git ceremony). The push is leased against the tip we synced
+    down (via `_leased_push`) so a git-ref collision is rejected, never clobbered."""
     issue = args.issue
     if not _require_pen(r, issue, args.as_agent, "checkpoint"):
         return 1
@@ -1567,6 +1623,11 @@ def cmd_pen_checkpoint(r, args):
         return 1
     path = huddle_worktree(r, main, issue, args.as_agent)
     if not path:
+        return 1
+    integrated = _synced_tip(path, huddle_branch(issue))
+    if not integrated:
+        sys.stderr.write(f"bus pen checkpoint: cannot resolve synced tip of "
+                         f"origin/{huddle_branch(issue)} on #{issue}\n")
         return 1
     git(path, "add", "-A", check=False)
     rc, _, _ = git(path, "diff", "--cached", "--quiet", check=False)
@@ -1580,14 +1641,14 @@ def cmd_pen_checkpoint(r, args):
     if rc == 0:
         print(f"pen checkpoint: nothing to commit on #{issue}")
         return 0
-    # push HEAD to the shared branch (fast-forward — flushes a fresh commit AND
-    # any prior unpushed commits a retry is recovering).
-    rc, _, err = git(path, "push", "origin", f"HEAD:{huddle_branch(issue)}", check=False)
+    # push HEAD to the shared branch, leased against the synced tip (flushes a fresh
+    # commit AND any prior unpushed commits a retry is recovering). A moved ref is
+    # rejected, not clobbered; a post-push mismatch is caught.
+    rc, head, err = _leased_push(path, huddle_branch(issue), integrated)
     if rc != 0:
-        sys.stderr.write(f"bus pen checkpoint: push failed (not fast-forward? another "
-                         f"writer pushed — the pen was violated): {err}\n")
+        sys.stderr.write(f"bus pen checkpoint: {err}\n")
         return 1
-    rc, tip, _ = git(path, "rev-parse", "--short", "HEAD", check=False)
+    tip = head[:7]
     announce(r, args.room, args.as_agent, f"checkpointed #{issue} (tip {tip})",
              topic=f"issue-{issue}")
     print(f"{args.as_agent} checkpointed #{issue} to {huddle_branch(issue)} (tip {tip})")
@@ -1812,9 +1873,53 @@ def donegate(r, issue, meta, closer):
     return (len(reasons) == 0), reasons
 
 
+def cmd_huddle_recover(r, args):
+    """Recover a driver's committed-but-unpushed work after a push mismatch or a
+    git-ref collision. Re-syncs to the TRUE current remote tip and re-pushes, leased,
+    only when our HEAD cleanly fast-forwards it — NEVER resetting away local commits
+    and NEVER forcing over a genuine divergence. Idempotent: safe to re-run.
+
+    Only the pen holder may recover — recovery pushes to the shared branch, which the
+    single-writer pen invariant reserves to the holder."""
+    issue = args.issue
+    if not _require_pen(r, issue, args.as_agent, "recover"):
+        return 1
+    touch_presence(r, args.room, args.as_agent)
+    try:
+        main = main_repo_dir()
+    except RuntimeError as e:
+        sys.stderr.write(f"bus huddle recover: {e}\n")
+        return 1
+    shared = huddle_branch(issue)
+    # huddle_worktree freshly fetches origin/<shared> and syncs the worktree without
+    # ever discarding committed-but-unpushed work (it skips the reset when HEAD isn't
+    # an ancestor of the shared tip).
+    path = huddle_worktree(r, main, issue, args.as_agent)
+    if not path:
+        return 1
+    integrated = _synced_tip(path, shared)
+    if not integrated:
+        sys.stderr.write(f"bus huddle recover: shared branch origin/{shared} missing; "
+                         f"cannot recover safely (was the huddle closed?)\n")
+        return 1
+    _, head, _ = git(path, "rev-parse", "HEAD", check=False)
+    if head == integrated:
+        print(f"recover #{issue}: already in sync at {head[:8]}; nothing to recover")
+        return 0
+    rc, head, err = _leased_push(path, shared, integrated)
+    if rc != 0:
+        sys.stderr.write(f"bus huddle recover: {err}\n")
+        return 1
+    announce(r, args.room, args.as_agent, f"recovered #{issue} (tip {head[:7]})",
+             topic=f"issue-{issue}")
+    print(f"{args.as_agent} recovered #{issue} -> {shared} at {head[:8]}")
+    return 0
+
+
 def cmd_huddle(r, args):
     return {"open": cmd_huddle_open, "join": cmd_huddle_join,
-            "status": cmd_huddle_status, "close": cmd_huddle_close}[args.huddle_cmd](r, args)
+            "status": cmd_huddle_status, "close": cmd_huddle_close,
+            "recover": cmd_huddle_recover}[args.huddle_cmd](r, args)
 
 
 # ---- argparse --------------------------------------------------------------
@@ -1956,6 +2061,9 @@ def build_parser():
     hc = hdsub.add_parser("close", help="close the huddle (done-gate: all present signed off, no blocks)")
     _as(hc); _issue(hc)
     hc.add_argument("--force", action="store_true", help="close even if the done-gate isn't met")
+    hr = hdsub.add_parser("recover", help="re-push a driver's unpushed work after a push "
+                                          "mismatch / git-ref collision (never resets or forces)")
+    _as(hr); _issue(hr)
 
     pn = sub.add_parser("pen", help="huddle write pen: who commits to the shared branch")
     pnsub = pn.add_subparsers(dest="pen_cmd", required=True)
