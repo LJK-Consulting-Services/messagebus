@@ -171,8 +171,26 @@ their own terminals under `agent-loop.sh`; your Claude session dispatches to the
 watches, and gates their work. You never type a `bus` command yourself — you
 describe the outcome and Claude drives.
 
-**Set it up once** — start a Claude Code session in this repo and give it its role
-(paste this as your first message, or put it in the repo's `CLAUDE.md`):
+**Option A — install the coordinator plugin (recommended).** This repo ships a
+Claude Code plugin, `messagebus-coordinator`, and is its own plugin marketplace.
+From any Claude Code session:
+
+```
+/plugin marketplace add LJK-Consulting-Services/messagebus
+/plugin install messagebus-coordinator@messagebus
+```
+
+The plugin adds a `coordinate-message-bus` skill (it auto-loads the coordinator
+role — no prompt to paste) and three slash commands: `/bus-dispatch <task>`,
+`/bus-huddle <issue|task>`, and `/bus-board`. It drives the `./bus` CLI directly;
+no MCP server is required. To load it straight from a local checkout while
+developing, skip the marketplace and run `claude --plugin-dir /path/to/messagebus`.
+
+Run the coordinator session from inside this repo (so `./bus` and `gh` are on
+hand), or set `BUS_GH_REPO=owner/repo` in its environment.
+
+**Option B — no plugin, just paste the role.** Start a Claude Code session in
+this repo and give it its role as your first message (or put it in `CLAUDE.md`):
 
 ```
 You are the coordinator for a team of agents on the message bus in this repo.
@@ -183,18 +201,18 @@ watch with `./bus watch` and `./bus board`, pace with `./bus wait --as coordinat
 and gate + merge the agents' PRs. Never poll --as an agent (it eats their messages).
 ```
 
-For plugin-based setup, install this repo as a local Claude Code plugin instead:
+**Optional structured tools (MCP).** `scripts/bus-mcp.py` is a thin MCP server
+that exposes the bus as typed tools (`bus_send`, `bus_board`, `bus_tail`,
+`bus_huddle_status`, …) if you'd rather the coordinator call typed tools than
+shell out. It's off by default. To turn it on, register it with an absolute path
+— from the repo root:
 
 ```bash
-claude --plugin-dir /absolute/path/to/messagebus
+claude mcp add messagebus -- python3 "$PWD/scripts/bus-mcp.py"
 ```
 
-The plugin ships `coordinate-message-bus`, plus `/bus-dispatch`, `/bus-huddle`,
-and `/bus-board` commands. It also configures a local `messagebus` MCP server
-that wraps `./bus` as structured tools (`bus_send`, `bus_board`, `bus_tail`,
-`bus_huddle_status`, and related helpers). Keep running Claude from this
-repository, or set `BUS_GH_REPO=owner/repo`, `BUS_REPO_DIR=/path/to/messagebus`,
-and `BUS_WORKTREE_ROOT=/path/to/worktrees` in the coordinator environment.
+The coordinator skill drives the `./bus` CLI regardless, so the MCP server is a
+convenience, never required.
 
 **Then just type what you want**, exactly like you'd talk to any Claude session:
 
