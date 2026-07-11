@@ -80,6 +80,15 @@ def test_huddle_close_open_block_keeps_critical_state_and_skips_status_update(
     assert json.loads(fake_redis.get(bus_module.k_block(79))) == [
         {"agent": "bob", "reason": "untested"}
     ]
-    assert fake_redis.xlen(bus_module.k_stream("main")) == 0
+    # B6 (#81): a blocked close emits exactly one structured donegate_block event
+    # carrying the COUNT of open reasons — never the raw block reason text.
+    events = fake_redis.xrange(bus_module.k_stream("main"))
+    assert len(events) == 1
+    payload = json.loads(events[0][1]["body"])
+    assert events[0][1]["kind"] == "event"
+    assert payload["event"] == bus_module.EV_DONEGATE_BLOCK
+    assert payload["schema_version"] == bus_module.EVENT_SCHEMA_VERSION
+    assert payload["fields"] == {"issue": 79, "closer": "alice", "open_reasons": 1}
+    assert "untested" not in events[0][1]["body"]  # raw block reason never leaks
     status.assert_not_called()
     gh.assert_not_called()
