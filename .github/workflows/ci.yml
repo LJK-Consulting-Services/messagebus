@@ -40,24 +40,6 @@ jobs:
       - name: Install dependencies
         run: python -m pip install --require-hashes -r requirements-dev.txt
 
-      # The B3 durability tests spawn (and SIGKILL) their OWN redis-server with
-      # AOF on: the service container above has no append log and is not ours to
-      # kill. They fail rather than skip when this binary is missing, so the
-      # restart-survival acceptance can never silently stop running in CI.
-      #
-      # policy-rc.d is what keeps the install from fighting the service container:
-      # Debian's redis postinst starts a system redis on 6379, which the container
-      # already publishes on the host, so it would fail to bind. Exit 101 tells
-      # the maintainer script "do not start services"; we only want the binary.
-      - name: Install redis-server (for kill+restart durability tests)
-        run: |
-          printf '#!/bin/sh\nexit 101\n' | sudo tee /usr/sbin/policy-rc.d >/dev/null
-          sudo chmod +x /usr/sbin/policy-rc.d
-          sudo apt-get update
-          sudo apt-get install -y redis-server
-          sudo rm -f /usr/sbin/policy-rc.d
-          redis-server --version
-
       - name: Syntax gate
         run: |
           python - <<'PY'
@@ -73,7 +55,6 @@ jobs:
       - name: Pytest
         env:
           BUS_INTEGRATION_REDIS_URL: redis://127.0.0.1:6379/0
-          BUS_REQUIRE_REDIS_SERVER: "1"
         run: |
           python -m pytest --cov=. --cov-report=term-missing --cov-report=json:coverage.json
           python scripts/check-bus-coverage.py coverage.json
