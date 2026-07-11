@@ -162,6 +162,63 @@ window); a *present* driver keeps the pen until it `pen pass`es (concede) or
 never force-taken. Any new push dismisses stale sign-offs, so a huddle can't be
 closed over code nobody re-approved.
 
+### 5. Orchestrating from a Claude Code session (the coordinator)
+
+The bus works best with a **coordinator** — usually a Claude Code CLI session —
+that *drives* the run instead of participating in the chat. The worker agents
+(`claude-2`, `codex-1`, …) run in their own terminals under `agent-loop.sh` (or a
+Stop hook); the coordinator breaks work into gh issues, injects tasks over the
+bus, watches, and gates + merges the results. The pattern used to build this repo:
+
+```bash
+# You are the coordinator (a Claude Code session). Set the target repo once.
+export BUS_GH_REPO=owner/repo
+
+# 0. Confirm the worker agents are online (start them FIRST, in their own terminals).
+./bus agents                                   # claude-2, codex-1 should show fresh presence
+
+# 1. Break the work into gh issues — the issues ARE the coordination substrate.
+gh issue create --title "feat: X" --label status:open --body "..."
+
+# 2. Inject the kickoff. Address agents directly; --topic scopes the thread.
+./bus send --from coordinator --to claude-2 --topic issue-42 \
+  "You drive issue #42. claim --worktree, build, commit, push, open a PR, report."
+./bus send --from coordinator --to codex-1 --topic issue-42 \
+  "You review #42. When claude-2 pushes, critique the diff on the bus (file:line)."
+
+# 3. Watch it happen — read-only, never perturbs the agents.
+./bus watch                                    # live feed of the whole room
+./bus board                                    # issue | status | lock holder | present
+./bus ws list                                  # who's building where (dirty / unpushed)
+
+# 4. Pace without consuming an agent's messages: wait as a NON-participant id.
+./bus wait --as coordinator --timeout 60       # blocks ~60s or until a msg for "coordinator"
+
+# 5. Gate + merge the agents' PRs yourself (they build; you own quality).
+gh pr diff <N>;  # ...review...  gh pr merge <N> --squash --delete-branch
+```
+
+For a **co-authoring huddle**, the coordinator seeds it and lets the agents
+co-write, stepping in only to gate:
+
+```bash
+./bus send --from coordinator --to claude-2 --topic issue-42 \
+  "Open a huddle on #42: huddle open, join codex-1, write your section, checkpoint, signoff, pass the pen to codex-1."
+./bus send --from coordinator --to codex-1 --topic issue-42 \
+  "Co-author #42: when you get the pen, review claude-2's work (block if weak), add your section, checkpoint, signoff."
+./bus watch                                    # observe the pen move + the done-gate
+```
+
+Coordinator tips:
+- Use `bus watch` (read-only) to observe and `bus wait --as coordinator` (a
+  non-agent id) to pace — never `poll --as <agent>`, which would eat that agent's
+  messages.
+- The coordinator is the **tiebreak** for a stuck pen challenge and owns the
+  merge — it is not a participant in the done-gate.
+- Everything the coordinator needs to know across a restart lives in **git refs +
+  gh issue labels + the latest issue comment** — not in bus chatter (which is
+  ephemeral). Trust those, in that order.
+
 ---
 
 ## Full command reference
