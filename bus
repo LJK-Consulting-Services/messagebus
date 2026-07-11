@@ -68,6 +68,7 @@ def k_presence(room, a): return f"bus:presence:{room}:{a}"
 def k_lock(issue):    return f"bus:lock:issue:{issue}"
 def k_worktree(issue): return f"bus:worktree:issue:{issue}"
 def k_huddle(issue):  return f"bus:huddle:issue:{issue}"
+def k_pen(issue):     return f"bus:pen:issue:{issue}"
 
 
 def now_iso():
@@ -1223,6 +1224,7 @@ def cmd_huddle_open(r, args):
         "driver": args.as_agent, "branch": branch, "base": args.base,
         "base_commit": base_commit, "session": session, "status": "open",
         "created_at": now_iso()}))
+    r.set(k_pen(issue), args.as_agent)  # opener holds the write pen initially
     touch_presence(r, args.room, args.as_agent)
     # gh is best-effort: the lock + branch + metadata already exist, so a gh
     # outage must not abort a live huddle (mirrors cmd_claim).
@@ -1334,6 +1336,7 @@ def cmd_huddle_close(r, args):
         except Exception as e:  # noqa: BLE001 - report and continue
             err = str(e)
     r.delete(k_huddle(issue))
+    r.delete(k_pen(issue))  # pen dies with the huddle
     announce(r, args.room, args.as_agent, f"closed huddle on #{issue}",
              topic=f"issue-{issue}")
     print(f"{args.as_agent} closed huddle on #{issue}")
@@ -1344,6 +1347,151 @@ def cmd_huddle_close(r, args):
     elif err:
         sys.stderr.write(f"warning: huddle closed but gh update failed: {err}\n")
     return 0
+
+
+def huddle_worktree(main, issue, agent):
+    """Ensure `agent` has a per-driver worktree for the huddle, fast-forwarded to
+    the shared branch's tip. Per-driver worktrees give OS-level isolation (the
+    ratified design); the SHARED source of truth is origin/huddle/issue-N, which
+    only the pen holder pushes to. Returns the path, or None on error."""
+    root = worktree_root(main)
+    shared = huddle_branch(issue)                 # remote shared branch
+    local = f"hw-{issue}-{agent}"                 # this driver's local branch
+    path = os.path.join(root, f"huddle-{issue}-{agent}")
+    git(main, "fetch", "origin", shared, check=False)
+    rc, _, _ = git(main, "rev-parse", "--verify", f"origin/{shared}", check=False)
+    if rc != 0:
+        sys.stderr.write(f"huddle pen: shared branch origin/{shared} not found\n")
+        return None
+    if os.path.isdir(path):
+        # Sync to the shared tip, but NEVER lose work. Reset only when the tree is
+        # clean AND HEAD is an ancestor of the shared tip (a pure fast-forward —
+        # nothing local to lose). A clean tree can still hold committed-but-unpushed
+        # commits (e.g. a prior push failed); those are ahead of shared, so we skip
+        # the reset and warn rather than `reset --hard` them away.
+        rc, out, _ = git(path, "status", "--porcelain", check=False)
+        if not out.strip():
+            rc, _, _ = git(path, "merge-base", "--is-ancestor", "HEAD",
+                          f"origin/{shared}", check=False)
+            if rc == 0:
+                git(path, "reset", "--hard", f"origin/{shared}", check=False)
+            else:
+                sys.stderr.write(f"huddle pen: #{issue} worktree has local commits not "
+                                 f"on origin/{shared}; not resetting (push them first)\n")
+        return path
+    os.makedirs(root, exist_ok=True)
+    rc, _, err = git(main, "worktree", "add", path, "-B", local, f"origin/{shared}", check=False)
+    if rc != 0:
+        sys.stderr.write(f"huddle pen: worktree add failed: {err}\n")
+        return None
+    return path
+
+
+def _require_pen(r, issue, agent, verb):
+    holder = r.get(k_pen(issue))
+    if holder != agent:
+        sys.stderr.write(f"bus pen {verb}: you ({agent}) don't hold the pen on #{issue} "
+                         f"(holder: {holder or '(none)'})\n")
+        return False
+    return True
+
+
+def cmd_pen_status(r, args):
+    issue = args.issue
+    holder = r.get(k_pen(issue))
+    if not holder:
+        sys.stderr.write(f"bus pen status: no pen on #{issue} (no active huddle?)\n")
+        return 1
+    tip = "?"
+    try:
+        main = main_repo_dir()
+        git(main, "fetch", "origin", huddle_branch(issue), check=False)
+        rc, out, _ = git(main, "rev-parse", "--short", f"origin/{huddle_branch(issue)}", check=False)
+        if rc == 0:
+            tip = out
+    except RuntimeError:
+        pass
+    if args.json:
+        print(json.dumps({"issue": issue, "holder": holder, "branch": huddle_branch(issue), "tip": tip}))
+    else:
+        print(f"pen #{issue}: holder={terminal_line(holder)}  branch={huddle_branch(issue)}  tip={tip}")
+    return 0
+
+
+def cmd_pen_checkpoint(r, args):
+    """Pen holder: stage + commit + push WIP to the shared branch (one command —
+    MB-SPEED: no manual git ceremony). Fast-forward push; the pen guarantees a
+    single writer so it stays linear."""
+    issue = args.issue
+    if not _require_pen(r, issue, args.as_agent, "checkpoint"):
+        return 1
+    try:
+        main = main_repo_dir()
+    except RuntimeError as e:
+        sys.stderr.write(f"bus pen checkpoint: {e}\n")
+        return 1
+    path = huddle_worktree(main, issue, args.as_agent)
+    if not path:
+        return 1
+    git(path, "add", "-A", check=False)
+    rc, _, _ = git(path, "diff", "--cached", "--quiet", check=False)
+    if rc != 0:  # staged changes -> commit them
+        git(path, "-c", f"user.email={args.as_agent}@bus", "-c", f"user.name={args.as_agent}",
+            "commit", "-m", f"wip: #{issue} checkpoint by {args.as_agent}", check=False)
+    # nothing to send only if HEAD is already at/behind the shared tip (no new
+    # commit AND no prior committed-but-unpushed work).
+    rc, _, _ = git(path, "merge-base", "--is-ancestor", "HEAD",
+                  f"origin/{huddle_branch(issue)}", check=False)
+    if rc == 0:
+        print(f"pen checkpoint: nothing to commit on #{issue}")
+        return 0
+    # push HEAD to the shared branch (fast-forward — flushes a fresh commit AND
+    # any prior unpushed commits a retry is recovering).
+    rc, _, err = git(path, "push", "origin", f"HEAD:{huddle_branch(issue)}", check=False)
+    if rc != 0:
+        sys.stderr.write(f"bus pen checkpoint: push failed (not fast-forward? another "
+                         f"writer pushed — the pen was violated): {err}\n")
+        return 1
+    rc, tip, _ = git(path, "rev-parse", "--short", "HEAD", check=False)
+    announce(r, args.room, args.as_agent, f"checkpointed #{issue} (tip {tip})",
+             topic=f"issue-{issue}")
+    print(f"{args.as_agent} checkpointed #{issue} to {huddle_branch(issue)} (tip {tip})")
+    return 0
+
+
+def cmd_pen_pass(r, args):
+    """Hand the pen to another participant. Commit+push our WIP FIRST (no
+    uncommitted work crosses a handoff), then move the pen. Only the current
+    holder may pass; only to a huddle participant."""
+    issue = args.issue
+    if not _require_pen(r, issue, args.as_agent, "pass"):
+        return 1
+    meta = _huddle_meta(r, issue)
+    if not meta:
+        sys.stderr.write(f"bus pen pass: no huddle on #{issue}\n")
+        return 1
+    if args.to not in meta["participants"]:
+        sys.stderr.write(f"bus pen pass: {args.to} is not a participant of #{issue}'s "
+                         f"huddle (they must `bus huddle join` first)\n")
+        return 1
+    # checkpoint our work before the handoff; ABORT if it fails to push, so we
+    # never move the pen with committed work stranded off the shared branch.
+    if cmd_pen_checkpoint(r, args) != 0:
+        sys.stderr.write(f"bus pen pass: checkpoint failed to push; keeping the pen with "
+                         f"{args.as_agent}. Fix the push, then retry the pass.\n")
+        return 1
+    r.set(k_pen(issue), args.to)
+    meta["driver"] = args.to
+    r.set(k_huddle(issue), json.dumps(meta))
+    announce(r, args.room, args.as_agent, f"passed the pen on #{issue} to {args.to}",
+             topic=f"issue-{issue}")
+    print(f"{args.as_agent} passed the pen on #{issue} to {args.to}")
+    return 0
+
+
+def cmd_pen(r, args):
+    return {"status": cmd_pen_status, "checkpoint": cmd_pen_checkpoint,
+            "pass": cmd_pen_pass}[args.pen_cmd](r, args)
 
 
 def cmd_huddle(r, args):
@@ -1490,6 +1638,16 @@ def build_parser():
     hc = hdsub.add_parser("close", help="close the huddle: status:pr-open, release the lock + metadata")
     _as(hc); _issue(hc)
 
+    pn = sub.add_parser("pen", help="huddle write pen: who commits to the shared branch (checkpoint/pass)")
+    pnsub = pn.add_subparsers(dest="pen_cmd", required=True)
+    ps = pnsub.add_parser("status", help="print the current pen holder + shared branch tip")
+    _issue(ps)
+    pc = pnsub.add_parser("checkpoint", help="pen holder: commit + push your WIP to the shared branch")
+    _as(pc); _issue(pc)
+    pp = pnsub.add_parser("pass", help="hand the pen to another participant (commit+push first)")
+    _as(pp); _issue(pp)
+    pp.add_argument("--to", type=ident, required=True, help="the participant to hand the pen to")
+
     sub.add_parser("init", help="create status:* labels in BUS_GH_REPO")
     sub.add_parser("doctor", help="check redis + gh")
     return p
@@ -1503,7 +1661,7 @@ DISPATCH = {
     "renew": cmd_renew, "status": cmd_status,
     "thread": cmd_thread, "inbox": cmd_inbox, "prune": cmd_prune,
     "reap": cmd_reap, "board": cmd_board, "ws": cmd_ws,
-    "huddle": cmd_huddle,
+    "huddle": cmd_huddle, "pen": cmd_pen,
 }
 
 
