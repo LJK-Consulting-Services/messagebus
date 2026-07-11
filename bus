@@ -908,6 +908,16 @@ def cmd_doctor(r_url):
     else:
         print(f"gh: FAIL -> {err or out}")
         ok = False
+    try:
+        print(f"worktree root: {worktree_root(main_repo_dir())}")
+    except Exception:  # noqa: BLE001
+        print("worktree root: unavailable")
+    try:
+        p = subprocess.run(["git", "--version"], capture_output=True, text=True)
+        git_version = p.stdout.splitlines()[0] if p.returncode == 0 and p.stdout else "not found"
+    except Exception:  # noqa: BLE001
+        git_version = "not found"
+    print(f"git: {git_version}")
     return 0 if ok else 1
 
 
