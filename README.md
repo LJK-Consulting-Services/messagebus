@@ -151,9 +151,36 @@ bus release  --as A --issue N       # release your claim
 bus reap     [--release ISSUE]      # list stale locks (holder gone); free one you've verified
 bus status   --as A --issue N --set status:pr-open
 bus board                           # table: gh issue + status + lock holder + presence
+bus ws create --as A --issue N      # isolated git worktree for an issue you claimed
+bus ws path   --issue N             # print the worktree path
+bus ws list                         # all agent worktrees (dirty / unpushed / present)
+bus ws remove --as A --issue N      # remove a worktree (refuses if dirty/unpushed)
 bus init                            # create status:* labels in BUS_GH_REPO
 bus doctor                          # check redis + gh
 ```
+
+## Isolated parallel building (worktrees)
+
+Task claims coordinate *who owns* an issue, but agents building in the **same
+working directory** collide on files and the git index. `bus ws` gives each
+claimed issue its own git worktree so agents build in true isolation:
+
+```bash
+bus claim --as A --issue 42 --worktree     # claim + isolated worktree in one step
+cd "$(bus ws path --issue 42)"             # A builds here; the coordinator's tree is untouched
+#   ... build, commit, git push, gh pr create ...
+bus ws remove --as A --issue 42            # after merge (refuses if dirty/unpushed)
+```
+
+Each worktree is a sibling dir `../<repo>-worktrees/issue-N-A` on branch
+`feat/issue-N-A`, cut from a **freshly fetched** `origin/<base>` (default `dev`;
+`--base main` for hotfixes) — never a stale local ref. Safety, mirroring
+prune/reap: `ws remove` refuses to destroy uncommitted **or unpushed** work
+without `--force`; `claim --worktree` is **fail-closed** (if the worktree can't
+be created, the claim is rolled back so an agent never silently works the main
+tree); a dead agent's worktree is surfaced by `bus reap` but **never
+auto-removed**. Config: `BUS_WORKTREE_ROOT` overrides the location,
+`BUS_REPO_DIR` the target repo.
 
 Claim locks default to an 8h TTL and auto-renew on every `bus status`. For a
 task that outlives that without status changes, call `bus renew`. A claim also
