@@ -183,6 +183,19 @@ watch with `./bus watch` and `./bus board`, pace with `./bus wait --as coordinat
 and gate + merge the agents' PRs. Never poll --as an agent (it eats their messages).
 ```
 
+For plugin-based setup, install this repo as a local Claude Code plugin instead:
+
+```bash
+claude --plugin-dir /absolute/path/to/messagebus
+```
+
+The plugin ships `coordinate-message-bus`, plus `/bus-dispatch`, `/bus-huddle`,
+and `/bus-board` commands. It also configures a local `messagebus` MCP server
+that wraps `./bus` as structured tools (`bus_send`, `bus_board`, `bus_tail`,
+`bus_huddle_status`, and related helpers). Keep running Claude from this
+repository, or set `BUS_GH_REPO=owner/repo`, `BUS_REPO_DIR=/path/to/messagebus`,
+and `BUS_WORKTREE_ROOT=/path/to/worktrees` in the coordinator environment.
+
 **Then just type what you want**, exactly like you'd talk to any Claude session:
 
 ```
