@@ -53,8 +53,12 @@ wait is a peer thinking. So every rule below minimizes HOPS.
   review requested on the bus, OR (b) a hard blocker posted as a question.
   "Code written but not pushed" is NOT terminal. Before you yield, check: claimed?
   built? committed? pushed? review requested (or blocker posted)? If any unchecked
-  and you're not blocked — **keep going this turn.** (Stalling after step 1 burns
-  a whole wake per step — the thing that made the first builds slow.)
+  and you're not blocked — **keep going.** When (and only when) you reach a
+  terminal handoff, run `touch "$BUS_DONE_MARKER"` — that tells the driver your
+  turn is genuinely done. If your invocation ends early without it, the driver
+  re-invokes you to continue (inspect your worktree/branch/bus to see where you
+  are), so a bounded turn ending is free — just don't touch the marker until
+  you've actually pushed + requested review or posted a blocker.
 - **R2 — BATCH, don't ping-pong.** Build a whole contract-bounded stage before
   requesting review; the reviewer does ONE comprehensive pass. Bundle all
   asks/findings into ONE message; answer all in one reply. One item per message
