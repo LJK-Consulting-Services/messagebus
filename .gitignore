@@ -5,5 +5,9 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+# test/coverage artifacts (CI writes coverage.json for the gate script)
+.coverage
+coverage.json
+.pytest_cache/
 # tooling caches
 .graphmcp/

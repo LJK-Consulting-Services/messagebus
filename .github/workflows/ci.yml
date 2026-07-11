@@ -40,6 +40,16 @@ jobs:
       - name: Install dependencies
         run: python -m pip install --require-hashes -r requirements-dev.txt
 
+      # The B3 durability tests spawn (and SIGKILL) their OWN redis-server with
+      # AOF on: the service container above has no append log and is not ours to
+      # kill. They fail rather than skip when this binary is missing, so the
+      # restart-survival acceptance can never silently stop running in CI.
+      - name: Install redis-server (for kill+restart durability tests)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y redis-server
+          redis-server --version
+
       - name: Syntax gate
         run: |
           python - <<'PY'

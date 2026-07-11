@@ -49,10 +49,13 @@ import os
 import re
 import secrets
 import sys
+import time
 from datetime import datetime, timezone
 
 try:
     import redis
+    from redis.backoff import ExponentialBackoff
+    from redis.retry import Retry
 except ImportError:
     sys.stderr.write("bus: redis-py not installed. Run: pip install redis\n")
     sys.exit(2)
@@ -88,11 +91,65 @@ SOCKET_TIMEOUT = 5     # seconds; client-side read timeout (fail fast on dead Re
 # re-blocked in a loop; the chunk must stay safely under SOCKET_TIMEOUT.
 BLOCK_CHUNK_MS = 1000
 
+RETRY_ATTEMPTS = 3        # per-command retries inside one client (B3)
+HEALTH_CHECK_INTERVAL = 30  # seconds idle before redis-py PINGs a pooled connection
+
+# Backoff schedule for rebuilding a client after the server goes away entirely
+# (restart). Bounded on purpose: ~30s total, then the caller gives up loudly
+# rather than hanging a turn forever on a Redis that is never coming back.
+RECONNECT_BACKOFF = (1, 2, 4, 8, 15)
+
+# What "the connection is gone" looks like coming out of redis-py. A killed
+# server usually surfaces as ConnectionError, but a half-open socket can time out
+# first, and both mean the same thing to us: this client is dead, build a new one.
+# These are the redis-py exceptions, NOT the builtins — builtin ConnectionError is
+# an OSError and never matches what redis-py raises.
+REDIS_GONE = (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError)
+
 
 def connect(url):
-    r = redis.Redis.from_url(url, decode_responses=True, socket_timeout=SOCKET_TIMEOUT)
+    """Build a Redis client that survives a blip.
+
+    `retry` + `retry_on_error` make redis-py transparently re-dial and re-send a
+    command that died on a dropped/timed-out connection, so a transient blip no
+    longer takes an agent's whole turn down. `health_check_interval` PINGs a
+    connection that has sat idle, so a long-lived process discovers a stale
+    socket on its own terms instead of on the next real command.
+
+    `socket_timeout` stays at 5s: it is load-bearing for the chunked-block
+    invariant above (BLOCK_CHUNK_MS < SOCKET_TIMEOUT). Retries wrap the *chunk*,
+    they never lengthen a single blocking read.
+
+    Retrying makes writes at-least-once: if an `xadd` reaches the server but the
+    reply is lost, the retry appends a second copy. For a coordination log a rare
+    duplicate line is strictly better than a crashed agent, and the one write
+    where a duplicate would matter — the `SET NX` claim in cmd_claim — already
+    re-reads the holder when `NX` reports it lost, so a re-sent claim self-heals
+    into "you already hold this issue".
+    """
+    r = redis.Redis.from_url(
+        url, decode_responses=True, socket_timeout=SOCKET_TIMEOUT,
+        retry=Retry(ExponentialBackoff(), RETRY_ATTEMPTS),
+        retry_on_error=list(REDIS_GONE),
+        health_check_interval=HEALTH_CHECK_INTERVAL,
+    )
     r.ping()  # fail fast with a clear error if server is down
     return r
+
+
+def reconnect(url, sleep=time.sleep):
+    """Rebuild a client after the server itself went away (a restart, not a blip
+    — redis-py's own retry already covers the blip). Returns a live client, or
+    None once the bounded backoff schedule is exhausted.
+
+    `sleep` is injectable so the retry path is testable without real waits."""
+    for delay in RECONNECT_BACKOFF:
+        sleep(delay)
+        try:
+            return connect(url)
+        except (redis.exceptions.RedisError, OSError):
+            continue  # server still down; keep backing off until the budget runs out
+    return None
 
 
 def touch_presence(r, room, agent):
@@ -253,6 +310,7 @@ SHUTDOWN = "__SHUTDOWN__"  # a message with this exact body means "stop"
 RC_DELIVERED = 0   # messages for the agent were printed
 RC_NONE = 10       # nothing addressed to the agent (empty poll / wait timeout)
 RC_SHUTDOWN = 11   # a delivered message was the shutdown sentinel
+RC_REDIS_DOWN = 3  # Redis unreachable (at startup, or a restart we couldn't ride out)
 
 
 def make_fields(frm, to, body, kind="msg", topic="", reply_to=""):
@@ -275,11 +333,19 @@ EVENT_SCHEMA_VERSION = 1
 # field. Add a new type here (and its emit site) when a reliability fix wants to
 # surface a structured signal. Only EV_DONEGATE_BLOCK is wired on `dev` today.
 EV_DONEGATE_BLOCK = "donegate_block"
+EV_RECONNECT = "reconnect"                    # B3: agent survived a Redis restart
+EV_RETENTION_BLOCKED = "retention_blocked"    # B3: trim refused, unread would drop
+EV_RETENTION_FORCED = "retention_forced"      # B3: --force dropped unread messages
+EV_DRAIN = "drain"                            # B3: agent handed back state on exit
 # B6-TODO(#81): B2 (#82) adds EV_LEASE_REJECT + EV_POSTPUSH_MISMATCH here and
 #   emits them from _leased_push on force-with-lease rejection / ls-remote drift.
-# B6-TODO(#81): B3 adds EV_RECONNECT + EV_RETENTION_BLOCKED + EV_PERSISTENCE_MODE.
 # B6-TODO(#81): B4 adds EV_SELFCONTINUE_BUDGET_EXHAUSTED.
-EVENT_TYPES = {EV_DONEGATE_BLOCK}
+EVENT_TYPES = {EV_DONEGATE_BLOCK, EV_RECONNECT, EV_RETENTION_BLOCKED,
+               EV_RETENTION_FORCED, EV_DRAIN}
+
+# Identity stamped on events emitted by operator/system commands that have no
+# --as agent of their own (retention). Not an agent id: nothing polls as "bus".
+SYSTEM_AGENT = "bus"
 
 _EVENT_VALUE_MAX = 200
 # Anything URL/URI-shaped is treated as potentially sensitive (tokens ride in
@@ -472,8 +538,12 @@ def cmd_wait(r, args):
     We advance the cursor past every message we see (even ones not for us),
     then keep blocking on the remaining time budget so unrelated traffic
     doesn't make us return empty.
+
+    Survives a Redis restart: a dropped connection rebuilds the client and
+    re-blocks from the SAME cursor (which lives in Redis, so it is exactly where
+    we left off, and AOF carries it across the restart). Reconnect time is spent
+    from the caller's timeout budget, so `--timeout` still bounds the call.
     """
-    import time
     touch_presence(r, args.room, args.as_agent)
     deadline = time.monotonic() + args.timeout
     while True:
@@ -486,12 +556,30 @@ def cmd_wait(r, args):
         # the client socket read timeout and crash). Floor at 1ms; XREAD BLOCK 0
         # would block forever. The outer loop re-blocks on the remaining budget.
         block_ms = max(1, min(BLOCK_CHUNK_MS, int(remaining * 1000)))
-        delivered, last_seen = read_from_cursor(
-            r, args.room, args.as_agent, block_ms=block_ms,
-            topic=args.topic, reply_to=args.reply_to
-        )
-        if last_seen:
-            r.set(k_cursor(args.room, args.as_agent), last_seen)
+        # The whole Redis-touching part of the iteration is guarded, not just the
+        # read: a server that dies between the read and the cursor advance must
+        # also be survivable. Re-running the iteration is safe precisely because
+        # the cursor has NOT advanced yet — we re-read and re-deliver the same
+        # messages rather than skipping them.
+        try:
+            delivered, last_seen = read_from_cursor(
+                r, args.room, args.as_agent, block_ms=block_ms,
+                topic=args.topic, reply_to=args.reply_to
+            )
+            if last_seen:
+                r.set(k_cursor(args.room, args.as_agent), last_seen)
+        except REDIS_GONE:
+            r = reconnect(args.url)
+            if r is None:
+                sys.stderr.write("bus wait: lost Redis and could not reconnect\n")
+                return RC_REDIS_DOWN
+            # Presence expired while we were disconnected; re-register, then say
+            # so on the stream. Both are writes, so they can only run AFTER the
+            # reconnect succeeded — never announce a reconnect to a dead Redis.
+            touch_presence(r, args.room, args.as_agent)
+            announce_event(r, args.room, args.as_agent, EV_RECONNECT,
+                           {"agent": args.as_agent, "room": args.room, "cmd": "wait"})
+            continue
         if delivered:
             for m in delivered:
                 emit(m, args.json)
@@ -656,37 +744,97 @@ def cursor_has_unread_before(r, stream, cursor, boundary):
     return bool(r.xrange(stream, f"({cursor}", f"({boundary}", count=1))
 
 
+def safe_trim_room(r, room, keep, force=False, dry_run=False):
+    """Cursor-aware retention for ONE room. The single trim path — `bus prune`
+    and any scheduled retention job both go through here, so neither can invent
+    its own (unsafe) bound.
+
+    Returns a result dict: {room, keep, total, boundary, behind, blocked,
+    trimmed, removed, remaining}, where `behind` is [{agent, cursor}] for every
+    agent whose cursor still has unread messages below the keep-window boundary,
+    and `blocked` means the trim was refused to protect them.
+
+    Why never `XADD MAXLEN` / `XTRIM MAXLEN`: a maxlen trim drops the oldest N
+    entries by count, with no idea where anyone's cursor is — it silently deletes
+    messages a lagging agent has not read. This trims by MINID at a boundary
+    already checked against every cursor. If a writer appends between the scan
+    and the trim, MINID may keep MORE than `keep`, but it can never move the
+    deletion boundary forward onto unread messages we did not check.
+
+    Emitting the retention events lives HERE, with the trim, not in `cmd_prune`:
+    the whole point of the seam is that a second caller (a scheduled retention
+    job) cannot trim — or refuse to trim — without leaving the same audit trail.
+
+    `dry_run` computes the identical decision and reports it, writing nothing at
+    all: no trim, and no event either.
+    """
+    stream = k_stream(room)
+    total = r.xlen(stream)
+    result = {"room": room, "keep": keep, "total": total, "boundary": None,
+              "behind": [], "blocked": False, "trimmed": False,
+              "removed": 0, "remaining": total}
+    if total <= keep:
+        return result
+    boundary = r.xrevrange(stream, count=keep)[-1][0]  # oldest id we'd keep
+    result["boundary"] = boundary
+    for key in r.scan_iter(match=k_cursor(room, "*")):
+        cval = r.get(key)
+        if cval and cursor_has_unread_before(r, stream, cval, boundary):
+            result["behind"].append({"agent": key.rsplit(":", 1)[-1], "cursor": cval})
+    result["behind"].sort(key=lambda b: b["agent"])
+    behind = result["behind"]
+    result["blocked"] = bool(behind) and not force
+    if dry_run:
+        return result
+    # Payloads are counts and ids only — an agent id is charset-checked (`ident`)
+    # and a cursor/boundary is a stream id, so neither can smuggle free text onto
+    # the stream.
+    if result["blocked"]:
+        announce_event(r, room, SYSTEM_AGENT, EV_RETENTION_BLOCKED,
+                       {"room": room, "keep": keep, "total": total,
+                        "boundary": boundary, "behind": len(behind)})
+        return result
+    result["removed"] = xtrim_minid(r, stream, boundary)
+    result["remaining"] = r.xlen(stream)
+    result["trimmed"] = True
+    if behind:  # --force: we dropped messages someone had not read
+        # Emitted AFTER the trim, or the trim would delete the very event that
+        # records it.
+        announce_event(r, room, SYSTEM_AGENT, EV_RETENTION_FORCED,
+                       {"room": room, "keep": keep, "removed": result["removed"],
+                        "boundary": boundary, "behind": len(behind)})
+    return result
+
+
 def cmd_prune(r, args):
     """Trim a room's stream to the newest --keep messages. DESTRUCTIVE. Refuses
     if any agent's cursor is behind the keep-window (would drop unread), unless
-    --force. Never auto-runs; operator-invoked only."""
-    stream = k_stream(args.room)
-    total = r.xlen(stream)
-    if total <= args.keep:
-        print(f"room {args.room}: {total} messages <= keep {args.keep}; nothing to trim")
-        return 0
-    boundary = r.xrevrange(stream, count=args.keep)[-1][0]  # oldest id we'd keep
-    behind = []
-    for key in r.scan_iter(match=k_cursor(args.room, "*")):
-        cval = r.get(key)
-        if cval and cursor_has_unread_before(r, stream, cval, boundary):
-            behind.append((key.rsplit(":", 1)[-1], cval))
-    if behind and not args.force:
-        who = ", ".join(f"{terminal_line(a)}@{terminal_line(c)}" for a, c in behind)
+    --force. Never auto-runs; operator-invoked only. Presentation only — the
+    retention decision, the trim and its events all belong to safe_trim_room."""
+    res = safe_trim_room(r, args.room, args.keep, force=args.force,
+                         dry_run=args.dry_run)
+    behind = res["behind"]
+    if args.json:
+        print(json.dumps({**res, "dry_run": args.dry_run}))
+    elif res["boundary"] is None:
+        print(f"room {args.room}: {res['total']} messages <= keep {args.keep}; nothing to trim")
+    elif res["blocked"]:
+        who = ", ".join(f"{terminal_line(b['agent'])}@{terminal_line(b['cursor'])}"
+                        for b in behind)
         sys.stderr.write(
             f"bus prune: REFUSING — {len(behind)} agent cursor(s) behind the keep-window "
-            f"boundary {terminal_line(boundary)}; trimming would drop unread messages ({who}). "
+            f"boundary {terminal_line(res['boundary'])}; trimming would drop unread messages ({who}). "
             f"Re-run with --force to override.\n")
-        return 1
-    if behind:
-        sys.stderr.write(f"bus prune: --force: dropping unread for {len(behind)} lagging agent(s)\n")
-    # Trim by the checked boundary, not by MAXLEN. If a writer appends between
-    # the cursor scan and trim, MINID may keep more than --keep, but it cannot
-    # move the deletion boundary forward and drop unread messages we did not
-    # check.
-    removed = xtrim_minid(r, stream, boundary)
-    print(f"pruned room {args.room}: removed {removed}, kept {r.xlen(stream)} (was {total})")
-    return 0
+    elif args.dry_run:
+        print(f"room {args.room}: would trim below {res['boundary']} "
+              f"(total {res['total']}, keep {args.keep}); no cursor is behind")
+    else:
+        print(f"pruned room {args.room}: removed {res['removed']}, "
+              f"kept {res['remaining']} (was {res['total']})")
+        if behind:
+            sys.stderr.write(f"bus prune: --force: dropped unread for "
+                             f"{len(behind)} lagging agent(s)\n")
+    return 1 if res["blocked"] else 0
 
 
 def _is_huddle_lock(holder):
@@ -717,7 +865,9 @@ def stale_lock_info(r, issue, present_set=None):
     return holder, r.ttl(k_lock(issue))
 
 
-def compare_delete_lock(r, issue, holder):
+def compare_delete(r, key, value):
+    """Atomically DEL `key`, but only while it still holds `value`. Deleting a
+    token someone else now owns is the whole failure mode this prevents."""
     return r.eval(
         """
         if redis.call('GET', KEYS[1]) == ARGV[1] then
@@ -725,8 +875,12 @@ def compare_delete_lock(r, issue, holder):
         end
         return 0
         """,
-        1, k_lock(issue), holder,
+        1, key, value,
     )
+
+
+def compare_delete_lock(r, issue, holder):
+    return compare_delete(r, k_lock(issue), holder)
 
 
 def compare_set_huddle_meta(r, issue, holder, meta_json):
@@ -786,6 +940,95 @@ def cmd_reap(r, args):
             sys.stderr.write(f"bus reap --release {target}: lock changed while releasing — refusing\n")
             return 1
         print(f"released stale lock on #{target} (was {terminal_line(holder)})")
+    return 0
+
+
+def _issue_sort(issue):
+    return int(issue) if str(issue).isdigit() else 0
+
+
+def _held_by(r, pattern, agent):
+    """Issue numbers whose key under `pattern` is currently owned by `agent`.
+    One MGET for the whole match, as cmd_agents does — not a GET per key."""
+    keys = list(r.scan_iter(match=pattern))
+    vals = r.mget(keys) if keys else []  # MGET of an empty list is an error
+    held = [k.rsplit(":", 1)[-1] for k, v in zip(keys, vals) if v == agent]
+    held.sort(key=_issue_sort)
+    return held
+
+
+def _unpushed_pen_issues(r, agent, issues):
+    """Of `issues`, the ones whose registered worktree still holds commits that
+    have reached no remote — work the next driver would not inherit."""
+    risky = []
+    for issue in issues:
+        meta = _ws_meta(r, issue, agent)
+        # No registered worktree (or it's already gone) means there is no local
+        # work to strand. worktree_unpushed fails closed on an unreadable repo,
+        # so the isdir check keeps a removed worktree from wedging drain forever.
+        if not meta or not os.path.isdir(meta["path"]):
+            continue
+        if worktree_unpushed(meta["path"], meta["base_commit"]):
+            risky.append(issue)
+    return risky
+
+
+def cmd_drain(r, args):
+    """Graceful shutdown: hand back the volatile state this agent holds so peers
+    aren't left waiting on a process that is leaving.
+
+    Releases the write pen on every huddle this agent drives (CAS, so a pen that
+    has already moved on is never stolen) and clears the agent's presence keys.
+    Peers can `pen take` at once instead of waiting out PEN_TAKE_GRACE, and
+    clearing presence is exactly what lets `bus reap` see this agent's claim
+    locks as stale.
+
+    Deliberately NOT done:
+      * closing the huddle — a unilateral close would drive straight through the
+        done-gate while other participants are still live and still signing off;
+      * releasing claim locks — a claim is durable work state, mirrored on the gh
+        issue; dropping it silently invites a second agent to re-claim
+        half-finished work. Held claims are reported, not touched.
+
+    Fail-closed: refuses while a pen we hold has committed-but-unpushed work,
+    because the next driver would build on a tip that is missing it.
+    """
+    agent = args.as_agent
+    pens = _held_by(r, "bus:pen:issue:*", agent)
+    locks = _held_by(r, "bus:lock:issue:*", agent)
+    risky = _unpushed_pen_issues(r, agent, pens)
+    if risky and not args.force:
+        sys.stderr.write(
+            f"bus drain: REFUSING — you hold the pen on "
+            f"{', '.join('#' + terminal_line(i) for i in risky)} with committed-but-unpushed "
+            f"work. Run `bus pen checkpoint --as {agent} --issue <N>` first, or --force to "
+            f"drop the pen and strand it.\n")
+        return 1
+    released = [i for i in pens if compare_delete(r, k_pen(i), agent)]
+    for issue in released:
+        announce(r, args.room, agent,
+                 f"draining on shutdown: released the write pen on #{issue}",
+                 topic=f"issue-{issue}")
+        # Scalars only: an issue number and booleans. Nothing free-text.
+        announce_event(r, args.room, agent, EV_DRAIN,
+                       {"agent": agent, "issue": _issue_sort(issue),
+                        "pen_released": True, "unpushed": issue in risky},
+                       topic=f"issue-{issue}")
+    # Presence last: while we still hold it, the announces above are attributable
+    # to a live agent. Agent ids and room names are charset-checked, so neither
+    # can smuggle a glob into this match. DEL is variadic and returns the count,
+    # so every room clears in one round-trip.
+    stale = list(r.scan_iter(match=f"bus:presence:*:{agent}"))
+    cleared = r.delete(*stale) if stale else 0
+    if args.json:
+        print(json.dumps({"agent": agent, "pens_released": released,
+                          "presence_cleared": cleared, "claims_held": locks,
+                          "unpushed": risky}))
+        return 0
+    print(f"{agent} drained: released {len(released)} pen(s), cleared {cleared} presence key(s)")
+    if locks:
+        print("  claims still held (durable — release explicitly, or let `bus reap` see them "
+              f"stale now that presence is gone): {', '.join('#' + terminal_line(i) for i in locks)}")
     return 0
 
 
@@ -855,6 +1098,13 @@ def cmd_watch(r, args):
     so watching a room doesn't perturb the agents working in it. Shows the last
     -n messages for context, then blocks for new ones until Ctrl-C. With
     --topic, only messages with that topic are shown (context and live).
+
+    Survives a Redis restart by rebuilding the client and re-blocking from the
+    same `last` id. That id is local (watch has no persisted cursor), so it MUST
+    be carried across the reconnect — resetting to "$" would silently swallow
+    every message published while the server was down. Reconnects are reported on
+    stderr, never as an EV_RECONNECT event: an observer that wrote to the stream
+    would no longer be an observer.
     """
     topic = args.topic
     last = "$"  # "$" = only messages added after we start blocking
@@ -867,7 +1117,15 @@ def cmd_watch(r, args):
         while True:
             # block in chunks under SOCKET_TIMEOUT (block=0 would block forever
             # and trip the client socket read timeout); loop on empty returns.
-            resp = r.xread({k_stream(args.room): last}, block=BLOCK_CHUNK_MS)
+            try:
+                resp = r.xread({k_stream(args.room): last}, block=BLOCK_CHUNK_MS)
+            except REDIS_GONE:
+                r = reconnect(args.url)
+                if r is None:
+                    sys.stderr.write("bus watch: lost Redis and could not reconnect\n")
+                    return RC_REDIS_DOWN
+                sys.stderr.write(f"bus watch: reconnected to Redis; resuming after {last}\n")
+                continue
             if not resp:
                 continue
             _, entries = resp[0]
@@ -1046,16 +1304,47 @@ def cmd_init(args):
     return 0
 
 
+def redis_persistence(r):
+    """How this Redis would survive a restart: 'aof', 'rdb', or 'none'.
+
+    AOF is what the bus needs — claim locks, the write pen and huddle metadata
+    are all live coordination state, and an RDB snapshot loses everything since
+    the last save point. Returns None when the mode can't be read (a managed
+    Redis may disable CONFIG entirely), which is 'unknown', never 'broken'."""
+    try:
+        cfg = r.config_get("appendonly", "save")
+    except Exception:  # noqa: BLE001 - an unreadable mode is a diagnostic gap, not a fault
+        return None
+    if not isinstance(cfg, dict):
+        return None
+    if cfg.get("appendonly") == "yes":
+        return "aof"
+    return "rdb" if (cfg.get("save") or "").strip() else "none"
+
+
 def cmd_doctor(r_url):
     ok = True
-    # Redis
+    # Redis. The connect probe and the persistence probe are reported separately
+    # on purpose: a server that is UP but won't answer CONFIG is a healthy bus
+    # with an unknown durability mode, and must never be printed as "redis: FAIL".
     try:
         r = connect(r_url)
-        print(f"redis: OK ({r_url})")
     except Exception as e:  # noqa: BLE001
         print(f"redis: FAIL ({r_url}) -> {e}")
         print("  start it: ./scripts/start-redis.sh   (or: brew services start redis)")
         ok = False
+    else:
+        print(f"redis: OK ({r_url})")
+        mode = redis_persistence(r)
+        if mode == "aof":
+            print("redis persistence: OK (appendonly)")
+        elif mode is None:
+            print("redis persistence: unknown (could not read CONFIG)")
+        else:
+            # Not a hard failure — a scratch bus is fine volatile — but the pen,
+            # the claim locks and huddle metadata all die with the server.
+            print(f"redis persistence: WARN ({mode}) — a restart drops claims/pen/huddle state")
+            print("  fix: ./scripts/start-redis.sh   (enables appendonly)")
     # gh
     rc, out, err = gh(["auth", "status"], check=False)
     if rc == 0:
@@ -2131,6 +2420,13 @@ def build_parser():
     pr = sub.add_parser("prune", help="trim a room to the newest --keep messages (destructive, guarded)")
     pr.add_argument("--keep", type=positive_int, default=5000, help="messages to keep (default 5000)")
     pr.add_argument("--force", action="store_true", help="trim even if it drops unread for lagging agents")
+    pr.add_argument("--dry-run", dest="dry_run", action="store_true",
+                    help="report what would be trimmed (and who is lagging); write nothing")
+
+    dr = sub.add_parser("drain", help="graceful shutdown: release your pens + presence (claims kept)")
+    _as(dr)
+    dr.add_argument("--force", action="store_true",
+                    help="drop the pen even with committed-but-unpushed work (strands it)")
 
     rp = sub.add_parser("reap", help="list stale issue locks (holder absent); --release <issue> to free ONE")
     rp.add_argument("--release", type=positive_int, default=None, metavar="ISSUE",
@@ -2229,7 +2525,7 @@ DISPATCH = {
     "agents": cmd_agents, "claim": cmd_claim, "release": cmd_release,
     "renew": cmd_renew, "status": cmd_status,
     "thread": cmd_thread, "inbox": cmd_inbox, "prune": cmd_prune,
-    "reap": cmd_reap, "board": cmd_board, "ws": cmd_ws,
+    "reap": cmd_reap, "drain": cmd_drain, "board": cmd_board, "ws": cmd_ws,
     "huddle": cmd_huddle, "pen": cmd_pen,
     "signoff": cmd_signoff, "unblock": cmd_unblock,
 }
@@ -2246,7 +2542,7 @@ def main(argv=None):
     except Exception as e:  # noqa: BLE001
         sys.stderr.write(f"bus: cannot reach Redis at {args.url}: {e}\n")
         sys.stderr.write("  run `bus doctor` or start Redis: ./scripts/start-redis.sh\n")
-        return 3
+        return RC_REDIS_DOWN
     return DISPATCH[args.cmd](r, args)
 
 
