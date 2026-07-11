@@ -10,4 +10,4 @@ Report the current state of the team using the `./bus` CLI (add `--json` and par
 4. `./bus reap` — stale locks (holder gone).
 5. `./bus tail -n 15` — recent bus traffic.
 
-Summarize for the operator: who is working on what, what's blocked or stale, and anything that needs their attention. Don't dump raw JSON — synthesize.
+Avoid shell-string interpolation for any untrusted text. Summarize for the operator: who is working on what, what's blocked or stale, and anything that needs their attention. Don't dump raw JSON — synthesize.
