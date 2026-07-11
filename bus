@@ -67,6 +67,7 @@ def k_cursor(room, a): return f"bus:cursor:{room}:{a}"
 def k_presence(room, a): return f"bus:presence:{room}:{a}"
 def k_lock(issue):    return f"bus:lock:issue:{issue}"
 def k_worktree(issue): return f"bus:worktree:issue:{issue}"
+def k_huddle(issue):  return f"bus:huddle:issue:{issue}"
 
 
 def now_iso():
@@ -563,6 +564,13 @@ def cmd_prune(r, args):
     return 0
 
 
+def _is_huddle_lock(holder):
+    """A huddle session lock (holder `huddle:issue-N`, see huddle_holder) is held
+    by the shared co-work session, not by any single agent — it has no presence
+    key, so presence-based staleness never applies. Treat it as a live session."""
+    return bool(holder) and holder.startswith("huddle:")
+
+
 def _holder_present(r, holder):
     """True if `holder` has a presence key in ANY room (locks are global, an
     agent may be live in a different room than the one reap was invoked for)."""
@@ -576,6 +584,8 @@ def stale_lock_info(r, issue, present_set=None):
     holder = r.get(k_lock(issue))
     if not holder:
         return None
+    if _is_huddle_lock(holder):
+        return None  # a live huddle session, never a dead-agent lock
     present = holder in present_set if present_set is not None else _holder_present(r, holder)
     if present:
         return None
@@ -675,7 +685,12 @@ def cmd_board(r, args):
                         key=lambda x: int(x) if x.isdigit() else 0):
         holder = lock_rows.get(issue)
         meta = gh_rows.get(issue, {})
-        present = "-" if not holder else ("yes" if holder in present_set else "no")
+        if not holder:
+            present = "-"
+        elif _is_huddle_lock(holder):
+            present = "sesh"  # a shared huddle session, not a single-agent presence
+        else:
+            present = "yes" if holder in present_set else "no"
         rows.append((issue, meta.get("status", "unknown"), holder or "-",
                      present, meta.get("title", "unknown")))
     # rows are already built in numeric issue order above; a re-sort by the
@@ -1097,6 +1112,230 @@ def cmd_ws(r, args):
             "list": cmd_ws_list, "remove": cmd_ws_remove}[args.ws_cmd](r, args)
 
 
+# ---- huddle commands (stage 1 of #22) --------------------------------------
+# A huddle is collaborative co-work on ONE issue (many agents, one branch). This
+# stage is session lifecycle ONLY: open/join/status/close + metadata. Pen
+# adjudication, critique, signoff and the done-gate are deferred to later stages.
+
+def huddle_holder(issue):
+    """Lock value the huddle holds bus:lock:issue:N as. Deliberately NOT an agent
+    id: it makes a solo `bus claim` refuse (cmd_claim sees status:claimed + a lock
+    held by someone other than the claimer) while the huddle session is alive."""
+    return f"huddle:issue-{issue}"
+
+
+def huddle_branch(issue):
+    return f"huddle/issue-{issue}"
+
+
+def _huddle_meta(r, issue):
+    raw = r.get(k_huddle(issue))
+    return json.loads(raw) if raw else None
+
+
+def create_shared_branch(main, base, branch, allow_stale=False):
+    """Push an empty `branch` at origin/`base`'s tip. Returns (rc, base_commit_or_err).
+    No worktree is created here — per-driver worktrees are a later (pen) stage."""
+    if base.startswith("-"):
+        return 1, "base must not start with '-'"
+    if not valid_git_ref(main, base) or not valid_git_ref(main, branch):
+        return 1, f"invalid base/branch ref (base={base}, branch={branch})"
+    rc, _, err = git(main, "fetch", "origin", base, check=False)
+    if rc != 0 and not allow_stale:
+        return 1, (f"`git fetch origin {base}` failed ({err}); refusing to cut from a "
+                   f"possibly-stale base. Fix the network or pass --allow-stale.")
+    rc, base_commit, _ = git(main, "rev-parse", "--verify", f"origin/{base}", check=False)
+    if rc != 0:
+        return 1, f"base origin/{base} not found"
+    rc, out, _ = git(main, "ls-remote", "--heads", "origin", branch, check=False)
+    if rc == 0 and out.strip():
+        return 1, f"remote branch {branch} already exists (leftover huddle?); remove it first"
+    rc, _, err = git(main, "push", "origin", f"{base_commit}:refs/heads/{branch}", check=False)
+    if rc != 0:
+        return 1, f"git push {branch} failed: {err}"
+    return 0, base_commit
+
+
+def cmd_huddle_open(r, args):
+    """Open a huddle: take the issue lock as the huddle session, create the shared
+    branch off origin/<base>, mark the issue claimed, record metadata, announce."""
+    issue = args.issue
+    lock = k_lock(issue)
+    branch = huddle_branch(issue)
+    # Metadata has no TTL and outlives the lock; if it's present a huddle already
+    # exists (or a prior one wasn't closed) — refuse before touching the lock.
+    if _huddle_meta(r, issue):
+        sys.stderr.write(f"bus huddle open: #{issue} already has an active huddle "
+                         f"(run `bus huddle close` to end it)\n")
+        return 1
+    try:
+        main = main_repo_dir()
+    except RuntimeError as e:
+        sys.stderr.write(f"bus huddle open: {e}\n")
+        return 1
+    # Defense against an expired solo lock: if gh already shows the issue
+    # claimed but the Redis lock has lapsed, refuse — the durable label outlives
+    # the TTL, so a solo `bus claim` in flight must not be stolen by a huddle
+    # (mirrors cmd_claim's cross-check).
+    labels = issue_labels(issue)
+    if labels is None:
+        sys.stderr.write(f"warning: could not read labels on #{issue}; relying on "
+                         f"the Redis lock only for this huddle open\n")
+    elif "status:claimed" in labels:
+        held = r.get(lock)
+        if held and held != huddle_holder(issue):
+            sys.stderr.write(f"bus huddle open: #{issue} already claimed by {held} "
+                             f"(label set)\n")
+            return 1
+        if not held:
+            sys.stderr.write(
+                f"bus huddle open: #{issue} is labelled status:claimed but the lock "
+                f"expired; resolve manually (bus release/status) before opening a huddle\n")
+            return 1
+    won = r.set(lock, huddle_holder(issue), nx=True, ex=args.ttl)
+    if not won:
+        sys.stderr.write(f"bus huddle open: issue #{issue} already locked by {r.get(lock)}\n")
+        return 1
+    # Set up the shared branch BEFORE the gh label, so a failure rolls the lock
+    # back cleanly — no huddle should hold the issue lock with no branch.
+    rc, val = create_shared_branch(main, args.base, branch, allow_stale=args.allow_stale)
+    if rc != 0:
+        # Compare-and-delete, not a blind delete: if our short TTL already lapsed
+        # and another agent re-took the lock, a plain delete would nuke THEIR lock.
+        compare_delete_lock(r, issue, huddle_holder(issue))
+        sys.stderr.write(f"bus huddle open: {val}; rolled back the lock on #{issue}\n")
+        return 1
+    base_commit = val
+    r.set(k_huddle(issue), json.dumps({
+        "issue": issue, "opener": args.as_agent, "participants": [args.as_agent],
+        "driver": args.as_agent, "branch": branch, "base": args.base,
+        "base_commit": base_commit, "status": "open", "created_at": now_iso()}))
+    touch_presence(r, args.room, args.as_agent)
+    # gh is best-effort: the lock + branch + metadata already exist, so a gh
+    # outage must not abort a live huddle (mirrors cmd_claim).
+    err = None
+    try:
+        set_status_label(issue, "status:claimed")
+        gh(["issue", "comment", str(issue),
+            "--body", f"Huddle opened by `{args.as_agent}` via bus at {now_iso()} "
+                      f"(branch `{branch}`)."], check=False)
+    except Exception as e:  # noqa: BLE001 - report and continue
+        err = str(e)
+    announce(r, args.room, args.as_agent,
+             f"opened huddle on #{issue} (branch {branch}, driver {args.as_agent})",
+             topic=f"issue-{issue}")
+    print(f"{args.as_agent} opened huddle on #{issue} (branch {branch})")
+    if err:
+        sys.stderr.write(f"warning: huddle open but gh update failed: {err}\n")
+    return 0
+
+
+def cmd_huddle_join(r, args):
+    """Add the agent to the huddle participants. Open join for stage 1 (admission
+    rule deferred). A WATCH/MULTI loop makes concurrent joins safe (no lost add)."""
+    issue = args.issue
+    key = k_huddle(issue)
+    # Refuse to append to a zombie: metadata has no TTL, so it can outlive a
+    # lapsed (expired/reaped) session lock. If the lock is gone the huddle is
+    # dead — don't join it. Advisory (pen/write-authority is deferred), so the
+    # benign TOCTOU between this check and the add just appends to metadata.
+    if not r.get(key):
+        sys.stderr.write(f"bus huddle join: no huddle on #{issue}\n")
+        return 1
+    if r.get(k_lock(issue)) != huddle_holder(issue):
+        sys.stderr.write(f"bus huddle join: #{issue}'s huddle lock is gone "
+                         f"(expired or reaped); ask the opener to reopen it\n")
+        return 1
+    with r.pipeline() as pipe:
+        while True:
+            try:
+                pipe.watch(key)
+                raw = pipe.get(key)
+                if not raw:
+                    pipe.unwatch()
+                    sys.stderr.write(f"bus huddle join: no huddle on #{issue}\n")
+                    return 1
+                meta = json.loads(raw)
+                if args.as_agent in meta["participants"]:
+                    pipe.unwatch()
+                    break
+                meta["participants"].append(args.as_agent)
+                pipe.multi()
+                pipe.set(key, json.dumps(meta))
+                pipe.execute()
+                break
+            except redis.WatchError:
+                continue  # another join landed between watch and exec; retry
+    touch_presence(r, args.room, args.as_agent)
+    announce(r, args.room, args.as_agent, f"joined huddle on #{issue}",
+             topic=f"issue-{issue}")
+    print(f"{args.as_agent} joined huddle on #{issue}")
+    return 0
+
+
+def cmd_huddle_status(r, args):
+    meta = _huddle_meta(r, args.issue)
+    if not meta:
+        sys.stderr.write(f"bus huddle status: no huddle on #{args.issue}\n")
+        return 1
+    if args.json:
+        print(json.dumps(meta))
+        return 0
+    print(f"huddle #{terminal_line(str(meta['issue']))}  status={terminal_line(meta['status'])}")
+    print(f"  opener:       {terminal_line(meta['opener'])}")
+    print(f"  driver:       {terminal_line(meta['driver'])}")
+    print(f"  branch:       {terminal_line(meta['branch'])}")
+    print(f"  participants: {', '.join(terminal_line(p) for p in meta['participants'])}")
+    return 0
+
+
+def cmd_huddle_close(r, args):
+    """Close the huddle: mark the issue pr-open, drop the lock + metadata. The
+    done-gate (signoffs) is deferred to stage 3, so this does NOT gate on quality.
+    Participant-only (a conscious stage-1 choice) to stop a bystander closing."""
+    issue = args.issue
+    meta = _huddle_meta(r, issue)
+    if not meta:
+        sys.stderr.write(f"bus huddle close: no huddle on #{issue}\n")
+        return 1
+    if args.as_agent not in meta["participants"]:
+        sys.stderr.write(f"bus huddle close: {args.as_agent} is not a participant of "
+                         f"#{issue}'s huddle; only participants may close\n")
+        return 1
+    # Advance the label ONLY if we still legitimately hold the session lock.
+    # compare_delete_lock returns 1 iff the lock was ours (atomic, no TOCTOU); a
+    # 0 means it already expired or was reaped — possibly re-acquired by someone
+    # else — so advancing status:pr-open would clobber their state. Either way we
+    # ALWAYS clear the metadata: close is the only orphan-cleanup path and must
+    # never leave meta behind (meta has no TTL; the lock does).
+    owned = compare_delete_lock(r, issue, huddle_holder(issue))
+    err = None
+    if owned:
+        try:
+            set_status_label(issue, "status:pr-open")
+            gh(["issue", "comment", str(issue),
+                "--body", f"Huddle closed by `{args.as_agent}` via bus at {now_iso()}."],
+               check=False)
+        except Exception as e:  # noqa: BLE001 - report and continue
+            err = str(e)
+    r.delete(k_huddle(issue))
+    announce(r, args.room, args.as_agent, f"closed huddle on #{issue}",
+             topic=f"issue-{issue}")
+    print(f"{args.as_agent} closed huddle on #{issue}")
+    if not owned:
+        sys.stderr.write(f"warning: huddle #{issue} lock was already gone (expired or "
+                         f"reaped); cleared metadata but did NOT advance the status "
+                         f"label — set it manually if the issue still needs it\n")
+    elif err:
+        sys.stderr.write(f"warning: huddle closed but gh update failed: {err}\n")
+    return 0
+
+
+def cmd_huddle(r, args):
+    return {"open": cmd_huddle_open, "join": cmd_huddle_join,
+            "status": cmd_huddle_status, "close": cmd_huddle_close}[args.huddle_cmd](r, args)
+
+
 # ---- argparse --------------------------------------------------------------
 
 TTL_HELP = "lock TTL seconds (default 8h)"
@@ -1222,6 +1461,20 @@ def build_parser():
     _as(wr); _issue(wr)
     wr.add_argument("--force", action="store_true", help="remove even if dirty/unpushed or not owner")
 
+    hd = sub.add_parser("huddle", help="collaborative co-work on one issue (stage 1: open/join/status/close)")
+    hdsub = hd.add_subparsers(dest="huddle_cmd", required=True)
+    ho = hdsub.add_parser("open", help="open a huddle: lock the issue, create the shared branch, status:claimed")
+    _as(ho); _issue(ho)
+    ho.add_argument("--base", type=ident, default="dev", help="base branch for the shared huddle branch (default dev)")
+    ho.add_argument("--ttl", type=int, default=28800, help=TTL_HELP)
+    ho.add_argument("--allow-stale", action="store_true", help="proceed even if git fetch fails (RISKY)")
+    hj = hdsub.add_parser("join", help="join an open huddle as a participant")
+    _as(hj); _issue(hj)
+    hs = hdsub.add_parser("status", help="print huddle opener/driver/participants/branch/status")
+    _issue(hs)
+    hc = hdsub.add_parser("close", help="close the huddle: status:pr-open, release the lock + metadata")
+    _as(hc); _issue(hc)
+
     sub.add_parser("init", help="create status:* labels in BUS_GH_REPO")
     sub.add_parser("doctor", help="check redis + gh")
     return p
@@ -1235,6 +1488,7 @@ DISPATCH = {
     "renew": cmd_renew, "status": cmd_status,
     "thread": cmd_thread, "inbox": cmd_inbox, "prune": cmd_prune,
     "reap": cmd_reap, "board": cmd_board, "ws": cmd_ws,
+    "huddle": cmd_huddle,
 }
 
 
