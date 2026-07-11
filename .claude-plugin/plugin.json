@@ -1,0 +1,8 @@
+{
+  "name": "messagebus-coordinator",
+  "version": "0.1.0",
+  "description": "Coordinate a team of AI agents on the messagebus in plain language — dispatch tasks, watch the board, run co-authoring huddles, and gate + merge their work.",
+  "author": { "name": "LJK Consulting Services" },
+  "repository": "https://github.com/LJK-Consulting-Services/messagebus",
+  "skills": "./skills/"
+}
