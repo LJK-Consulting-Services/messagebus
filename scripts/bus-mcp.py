@@ -15,6 +15,7 @@ BUS_REDIS_URL, BUS_ROOM, BUS_GH_REPO, BUS_REPO_DIR, BUS_WORKTREE_ROOT.
 
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -28,6 +29,16 @@ PROTOCOL_VERSION = "2024-11-05"
 
 def _room(a):
     return ["--room", a["room"]] if a.get("room") else []
+
+
+def _redact_secrets(text):
+    text = re.sub(r"\b(rediss?://)([^/\s@]*:[^@\s/]*@)", r"\1***@", text)
+    return re.sub(
+        r"([?&](?:password|pass|auth|token|access_token|secret)=)[^&\s)\"']*",
+        r"\1***",
+        text,
+        flags=re.IGNORECASE,
+    )
 
 
 TOOLS = {
@@ -129,14 +140,14 @@ def run_bus(tool, args):
         argv.append("--json")
     argv += spec["argv"](args)
     p = subprocess.run(argv, capture_output=True, text=True)  # argv, never shell
-    out = (p.stdout or "").strip()
-    err = (p.stderr or "").strip()
+    out = _redact_secrets((p.stdout or "").strip())
+    err = _redact_secrets((p.stderr or "").strip())
     if p.returncode != 0 and not out:
         return f"bus error (rc={p.returncode}): {err}", True
     text = out if out else (err or "(ok)")
     if err and out:
         text = f"{out}\n[stderr] {err}"
-    return text, False
+    return text, p.returncode != 0
 
 
 # ---- JSON-RPC / MCP plumbing ------------------------------------------------

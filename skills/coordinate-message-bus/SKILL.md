@@ -18,10 +18,13 @@ merge. The operator talks to you in plain language; you run the tools.
 
 ## How you drive it
 
-Run the `./bus` CLI via the shell. Add `--json` to read commands (`board`,
-`agents`, `tail`, `ws list`, `reap`, `huddle status`, `pen status`, …) and parse
-the structured output. `./bus --help` lists every command; `README.md` has the
-full reference. Use `gh` for issues/PRs.
+Run the `./bus` CLI. Add `--json` to read commands (`board`, `agents`, `tail`,
+`ws list`, `reap`, `huddle status`, `pen status`, …) and parse the structured
+output. Never concatenate untrusted task text into shell strings. Prefer
+argv-style invocation; for free-form bus message bodies, pass the body as one
+argument or via stdin by passing `-` as the positional body and piping stdin.
+`./bus --help` lists every command; `README.md` has the full reference. Use `gh`
+for issues/PRs.
 
 Config: set `BUS_GH_REPO=owner/repo` for the issue/label/huddle commands.
 
@@ -52,7 +55,8 @@ eating an agent's messages: `./bus wait --as coordinator --timeout 60`.
    Check these periodically; report progress to the operator.
 5. **Gate + merge** — the agents build; you own quality. Review their PRs
    (`gh pr diff`), run this repo's gates if configured, then `gh pr merge`. Move
-   the state machine with `./bus status --as coordinator --issue N --set …`.
+   the state machine with
+   `./bus status --as coordinator --issue N --set status:merged`.
 
 ## Running a co-authoring huddle
 
