@@ -564,6 +564,13 @@ def cmd_prune(r, args):
     return 0
 
 
+def _is_huddle_lock(holder):
+    """A huddle session lock (holder `huddle:issue-N`, see huddle_holder) is held
+    by the shared co-work session, not by any single agent — it has no presence
+    key, so presence-based staleness never applies. Treat it as a live session."""
+    return bool(holder) and holder.startswith("huddle:")
+
+
 def _holder_present(r, holder):
     """True if `holder` has a presence key in ANY room (locks are global, an
     agent may be live in a different room than the one reap was invoked for)."""
@@ -577,6 +584,8 @@ def stale_lock_info(r, issue, present_set=None):
     holder = r.get(k_lock(issue))
     if not holder:
         return None
+    if _is_huddle_lock(holder):
+        return None  # a live huddle session, never a dead-agent lock
     present = holder in present_set if present_set is not None else _holder_present(r, holder)
     if present:
         return None
@@ -676,7 +685,12 @@ def cmd_board(r, args):
                         key=lambda x: int(x) if x.isdigit() else 0):
         holder = lock_rows.get(issue)
         meta = gh_rows.get(issue, {})
-        present = "-" if not holder else ("yes" if holder in present_set else "no")
+        if not holder:
+            present = "-"
+        elif _is_huddle_lock(holder):
+            present = "sesh"  # a shared huddle session, not a single-agent presence
+        else:
+            present = "yes" if holder in present_set else "no"
         rows.append((issue, meta.get("status", "unknown"), holder or "-",
                      present, meta.get("title", "unknown")))
     # rows are already built in numeric issue order above; a re-sort by the
