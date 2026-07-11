@@ -1128,6 +1128,7 @@ def build_parser():
     p.add_argument("--url", default=DEFAULT_URL, help=f"Redis URL (default {DEFAULT_URL})")
     p.add_argument("--room", default=DEFAULT_ROOM, type=ident, help=f"room/topic stream (default {DEFAULT_ROOM})")
     p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.add_argument("--version", action="version", version="bus 0.1.0")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("send", help="publish a message")
