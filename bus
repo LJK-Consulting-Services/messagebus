@@ -1257,14 +1257,7 @@ def cmd_huddle_join(r, args):
     # lapsed (expired/reaped) session lock. If the lock is gone the huddle is
     # dead — don't join it. Advisory (pen/write-authority is deferred), so the
     # benign TOCTOU between this check and the add just appends to metadata.
-    raw0 = r.get(key)
-    if not raw0:
-        sys.stderr.write(f"bus huddle join: no huddle on #{issue}\n")
-        return 1
-    session = json.loads(raw0).get("session", huddle_holder(issue))
-    if r.get(k_lock(issue)) != session:
-        sys.stderr.write(f"bus huddle join: #{issue}'s huddle lock is gone "
-                         f"(expired or reaped); ask the opener to reopen it\n")
+    if not _require_live_huddle(r, issue, "huddle join"):
         return 1
     with r.pipeline() as pipe:
         while True:
@@ -1303,8 +1296,11 @@ def cmd_huddle_status(r, args):
         return 0
     print(f"huddle #{terminal_line(str(meta['issue']))}  status={terminal_line(meta['status'])}")
     print(f"  opener:       {terminal_line(meta['opener'])}")
-    print(f"  driver:       {terminal_line(meta['driver'])}")
-    print(f"  pen:          {terminal_line(r.get(k_pen(meta['issue'])) or '(none)')}")
+    # The pen holder IS the current driver (single source of truth: k_pen). Fall
+    # back to the recorded opener-driver only if the pen key is somehow absent, so
+    # the display never shows a driver frozen at open after the pen has moved on.
+    holder = r.get(k_pen(meta['issue']))
+    print(f"  driver (pen): {terminal_line(holder or meta['driver'])}")
     print(f"  branch:       {terminal_line(meta['branch'])}")
     print(f"  participants: {', '.join(terminal_line(p) for p in meta['participants'])}")
     return 0
@@ -1376,18 +1372,19 @@ def huddle_ws_path(main, issue, agent):
     return os.path.abspath(os.path.join(worktree_root(main), f"huddle-issue-{issue}-{agent}"))
 
 
-def _require_live_huddle(r, issue, verb):
+def _require_live_huddle(r, issue, cmd):
     """Return the huddle meta iff its session lock is still held, else None (after
-    writing an error). Mirrors join's zombie guard: metadata has no TTL and can
-    outlive a lapsed lock, so a live lock — matching the recorded session token —
-    is the liveness signal. Pen authority over a dead huddle is meaningless."""
+    writing a `bus <cmd>: ...` error). The single zombie guard shared by `huddle
+    join` and every pen command: metadata has no TTL and can outlive a lapsed
+    lock, so a live lock — matching the recorded session token — is the liveness
+    signal. Authority over a dead huddle (join it, drive it) is meaningless."""
     meta = _huddle_meta(r, issue)
     if not meta:
-        sys.stderr.write(f"bus pen {verb}: no huddle on #{issue}\n")
+        sys.stderr.write(f"bus {cmd}: no huddle on #{issue}\n")
         return None
     session = meta.get("session", huddle_holder(issue))
     if r.get(k_lock(issue)) != session:
-        sys.stderr.write(f"bus pen {verb}: #{issue}'s huddle lock is gone (expired or "
+        sys.stderr.write(f"bus {cmd}: #{issue}'s huddle lock is gone (expired or "
                          f"reaped); the huddle is dead\n")
         return None
     return meta
@@ -1416,8 +1413,7 @@ def huddle_ws_ensure(r, main, issue, agent, meta):
         if rc != 0:
             sys.stderr.write(f"bus pen: shared branch {branch} not found on origin\n")
             return 1, None
-        root = worktree_root(main)
-        os.makedirs(root, exist_ok=True)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         rc, _, err = git(main, "worktree", "add", "--detach", path, tip, check=False)
         if rc != 0:
             sys.stderr.write(f"bus pen: git worktree add failed: {err}\n")
@@ -1497,17 +1493,26 @@ def _pen_holder_or_error(r, issue, agent, verb):
     return True
 
 
+def _pen_main_or_error(verb):
+    """Resolve the main repo dir, or write a `bus pen <verb>` error. Returns
+    (main, None) on success, (None, 1) on failure — the write commands need the
+    repo root and abort identically when it can't be found."""
+    try:
+        return main_repo_dir(), None
+    except RuntimeError as e:
+        sys.stderr.write(f"bus pen {verb}: {e}\n")
+        return None, 1
+
+
 def cmd_pen_checkpoint(r, args):
-    meta = _require_live_huddle(r, args.issue, "checkpoint")
+    meta = _require_live_huddle(r, args.issue, "pen checkpoint")
     if not meta:
         return 1
     if not _pen_holder_or_error(r, args.issue, args.as_agent, "checkpoint"):
         return 1
-    try:
-        main = main_repo_dir()
-    except RuntimeError as e:
-        sys.stderr.write(f"bus pen checkpoint: {e}\n")
-        return 1
+    main, err = _pen_main_or_error("checkpoint")
+    if err:
+        return err
     rc, sha = huddle_checkpoint(r, main, args.issue, args.as_agent, meta)
     if rc != 0:
         return 1
@@ -1519,7 +1524,7 @@ def cmd_pen_checkpoint(r, args):
 
 
 def cmd_pen_pass(r, args):
-    meta = _require_live_huddle(r, args.issue, "pass")
+    meta = _require_live_huddle(r, args.issue, "pen pass")
     if not meta:
         return 1
     if not _pen_holder_or_error(r, args.issue, args.as_agent, "pass"):
@@ -1531,11 +1536,9 @@ def cmd_pen_pass(r, args):
         sys.stderr.write(f"bus pen pass: {args.to} is not a participant of #{args.issue}'s "
                          f"huddle; they must `bus huddle join` first\n")
         return 1
-    try:
-        main = main_repo_dir()
-    except RuntimeError as e:
-        sys.stderr.write(f"bus pen pass: {e}\n")
-        return 1
+    main, err = _pen_main_or_error("pass")
+    if err:
+        return err
     # Checkpoint the outgoing holder FIRST so the incoming holder inherits a pushed
     # tip. Abort the handoff if the checkpoint can't be persisted — never pass the
     # pen while the current holder's work is stranded only in their local worktree.
