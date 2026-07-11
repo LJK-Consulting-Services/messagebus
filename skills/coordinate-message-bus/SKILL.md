@@ -44,15 +44,16 @@ eating an agent's messages: `./bus wait --as coordinator --timeout 60`.
    `scripts/agent-loop.sh <id> <cli>` in their own terminals.
 2. **Break the work into gh issues** — `gh issue create --label status:open …`.
    The issues ARE the coordination substrate; one cohesive change per issue.
-3. **Dispatch** — `./bus send --from coordinator --to <agent> --topic issue-<N>
-   "…"`. Address agents directly; scope with the topic. Give each a clear role
-   (driver / reviewer) and the exact expectation (claim, build, push, PR).
-4. **Watch** — `./bus board` (issue → status → lock holder → present),
-   `./bus tail -n 15` (recent traffic), `./bus ws list` (who is building where).
-   Check these periodically; report progress to the operator.
+3. **Dispatch** — `bus_send(frm="coordinator", to="<agent>",
+   topic="issue-<N>", body="…")`. Address agents directly; scope with the topic.
+   Give each a clear role (driver / reviewer) and the exact expectation (claim,
+   build, push, PR).
+4. **Watch** — `bus_board` (issue → status → lock holder → present), `bus_tail`
+   (recent traffic), `bus_ws_list` (who is building where). Poll these
+   periodically; report progress to the operator.
 5. **Gate + merge** — the agents build; you own quality. Review their PRs
    (`gh pr diff`), run this repo's gates if configured, then `gh pr merge`. Move
-   the state machine with `./bus status --as coordinator --issue N --set …`.
+   the state machine with `bus_status_set` as work advances.
 
 ## Running a co-authoring huddle
 
@@ -60,15 +61,15 @@ A huddle lets agents author ONE branch together (write-pen + done-gate). You see
 it and gate it; the agents co-write.
 
 1. Create the issue. Tell one agent to open the huddle and admit the other:
-   `./bus send --from coordinator --to claude-2 --topic issue-<N> "Open a huddle
-   on #<N>: huddle open, join codex-1, write your section, checkpoint, signoff,
-   pass the pen to codex-1."`
+   `bus_send(frm="coordinator", to="claude-2", topic="issue-<N>", body="Open a
+   huddle on #<N>: huddle open, join codex-1, write your section, checkpoint,
+   signoff, pass the pen to codex-1.")`
 2. Tell the second agent to co-author on handoff:
-   `./bus send --from coordinator --to codex-1 --topic issue-<N> "When you get the
-   pen: review claude-2's work (block if weak), add your section, checkpoint,
-   signoff."`
-3. Watch the pen and the done-gate: `./bus pen status --issue N`,
-   `./bus huddle status --issue N`.
+   `bus_send(frm="coordinator", to="codex-1", topic="issue-<N>", body="When you
+   get the pen: review claude-2's work (block if weak), add your section,
+   checkpoint, signoff.")`
+3. Watch the pen move and the done-gate: `bus_pen_status(issue=N)`,
+   `bus_huddle_status(issue=N)`.
 4. If the pen is stuck (a challenge the driver won't concede), you are the
    tiebreak — decide and tell the holder to `pen pass`, or reassign.
 5. Close is gated: every present participant must sign off at the current tip.
@@ -76,8 +77,8 @@ it and gate it; the agents co-write.
 
 ## Rules
 
-- **Watch, don't poll.** `./bus board` / `./bus tail` are read-only. NEVER
-  `poll --as <agent>` — it consumes that agent's messages. To block-wait, use
+- **Watch, don't poll.** `bus_board`/`bus_tail` are read-only. NEVER `poll --as
+  <agent>` — it consumes that agent's messages. To block-wait, use
   `./bus wait --as coordinator` (a non-agent id).
 - **Truth lives in git + gh, not chat.** Across a `/clear` or restart, trust git
   refs, then gh issue `status:*` labels, then the latest issue comment. Bus
@@ -85,5 +86,5 @@ it and gate it; the agents co-write.
   acting on it.
 - **You gate; agents build.** Don't merge unreviewed agent code. Stateless agents
   (Codex) may stall mid-task — nudge them, or finish + gate the work yourself.
-- **A dead worker doesn't block you.** `./bus reap` surfaces stale locks;
-  `./bus ws list` shows abandoned worktrees. Reassign the issue to a live agent.
+- **A dead worker doesn't block you.** `bus_reap` surfaces stale locks;
+  `bus_ws_list` shows abandoned worktrees. Reassign the issue to a live agent.
