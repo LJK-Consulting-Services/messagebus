@@ -24,12 +24,13 @@ Commands:
   prune    trim a room to the newest --keep messages (destructive, guarded)
   join     register presence and set your cursor to "now"
   agents   list agents currently present in a room
-  claim    atomically claim a gh issue (Redis lock + status label)
+  claim    atomically claim a gh issue (Redis lock + status label); --worktree
   release  release a claim you hold
   renew    extend the TTL on a claim you hold (long-running tasks)
   reap     list stale issue locks (holder absent); --release <issue> to free one
   status   transition a gh issue's status label + announce on the bus
   board    table of gh issues + status label + lock holder + presence
+  ws       per-agent git worktrees: ws create/path/list/remove (isolated builds)
   init     create the status:* labels in BUS_GH_REPO
 
 A --topic <t> (poll/wait/watch) or --reply-to <id> (wait) filter narrows delivery
@@ -65,6 +66,7 @@ def k_stream(room):   return f"bus:stream:{room}"
 def k_cursor(room, a): return f"bus:cursor:{room}:{a}"
 def k_presence(room, a): return f"bus:presence:{room}:{a}"
 def k_lock(issue):    return f"bus:lock:issue:{issue}"
+def k_worktree(issue): return f"bus:worktree:issue:{issue}"
 
 
 def now_iso():
@@ -155,6 +157,83 @@ def set_status_label(issue, new_label):
     for l in remove:
         args += ["--remove-label", l]
     gh(args, check=False)
+
+
+# ---- git worktree helpers --------------------------------------------------
+
+def git(repo, *args, check=True):
+    """Run a git command in `repo` (argv, never a shell). Returns (rc, out, err)."""
+    p = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True)
+    if check and p.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)}: {p.stderr.strip()}")
+    return p.returncode, p.stdout.strip(), p.stderr.strip()
+
+
+def main_repo_dir():
+    """Absolute path of the MAIN repo, even when cwd is inside a worktree.
+
+    `--show-toplevel` returns the worktree root, so rooting the sibling worktree
+    dir off that would nest worktrees-of-worktrees. `--git-common-dir` points at
+    the shared `.git`, whose parent is the main working tree.
+    """
+    base = os.environ.get("BUS_REPO_DIR") or os.getcwd()
+    rc, common, _ = git(base, "rev-parse", "--path-format=absolute",
+                        "--git-common-dir", check=False)
+    if rc != 0:
+        raise RuntimeError("not inside a git repository (set BUS_REPO_DIR)")
+    return os.path.dirname(os.path.normpath(common))
+
+
+def worktree_root(main):
+    """Where per-agent worktrees live. Default: sibling `../<repo>-worktrees/`
+    (avoids in-repo nesting + the macOS sandbox EPERM seen on hidden dirs). A
+    custom BUS_WORKTREE_ROOT inside the repo is rejected unless --allow-nested."""
+    env = os.environ.get("BUS_WORKTREE_ROOT")
+    if env:
+        return os.path.abspath(env)
+    return os.path.join(os.path.dirname(main), f"{os.path.basename(main)}-worktrees")
+
+
+def valid_git_ref(main, ref):
+    rc, _, _ = git(main, "check-ref-format", f"refs/heads/{ref}", check=False)
+    return rc == 0
+
+
+def worktree_dirty(path):
+    """True if the worktree has uncommitted changes (incl. untracked)."""
+    rc, out, _ = git(path, "status", "--porcelain", check=False)
+    return rc == 0 and bool(out.strip())
+
+
+def worktree_unpushed(path, base_commit):
+    """True if the branch has commits beyond base_commit that NO remote ref
+    contains. A never-pushed branch has no upstream, so an `@{u}` comparison
+    would error or report 'nothing' and wrongly call it safe — instead we
+    check remote-containment directly, so unpushed work is never silently lost.
+    """
+    if not base_commit:
+        return True  # unknown base -> can't prove pushed -> fail closed
+    rc, ahead, _ = git(path, "rev-list", "HEAD", f"^{base_commit}", check=False)
+    if rc != 0:
+        return True  # can't compute -> assume unpushed (fail closed; git won't
+        #              backstop "unpushed" the way it does a dirty tree)
+    if not ahead.strip():
+        return False  # no commits beyond base -> nothing to lose
+    rc, head, _ = git(path, "rev-parse", "HEAD", check=False)
+    if rc != 0:
+        return True
+    rc, contained, _ = git(path, "for-each-ref", "--contains", head,
+                          "refs/remotes/", check=False)
+    if rc != 0:
+        return True
+    return not contained.strip()  # commits beyond base AND on no remote = unpushed
+
+
+def path_under(child, parent):
+    """True if `child` is `parent` or nested within it (both absolutised)."""
+    child = os.path.abspath(child)
+    parent = os.path.abspath(parent)
+    return child == parent or child.startswith(parent + os.sep)
 
 
 # ---- message plumbing ------------------------------------------------------
@@ -537,6 +616,14 @@ def cmd_reap(r, args):
     else:
         for i, h, t in stale:
             print(f"issue #{terminal_line(i)}\tholder={terminal_line(h)}\tttl={t}s\tpresent=no")
+    # advisory: worktrees whose holder is absent (possible dead agent). Never
+    # auto-removed — operator verifies the work is captured, then ws remove --force.
+    if not args.json:
+        orphans = [m for m in _iter_ws_meta(r) if m["agent"] not in present_set]
+        if orphans:
+            print("orphan worktrees (holder absent — verify work captured, then `ws remove --force`):")
+            for m in sorted(orphans, key=lambda x: int(x["issue"]) if str(x["issue"]).isdigit() else 0):
+                print(f"  #{terminal_line(str(m['issue']))}\t{terminal_line(m['agent'])}\t{terminal_line(m['path'])}")
     if args.release is not None:
         target = str(args.release)
         current = stale_lock_info(r, target)
@@ -709,6 +796,15 @@ def cmd_claim(r, args):
             return 0
         sys.stderr.write(f"issue #{args.issue} already claimed by {holder}\n")
         return 1
+    # If --worktree, set up isolation BEFORE writing the gh label, so a failure
+    # rolls the claim back cleanly — an agent must never hold a claim with no
+    # worktree and then silently work the coordinator's main tree.
+    if getattr(args, "worktree", False):
+        rc, path = ws_create(r, args.room, args.as_agent, args.issue, base=args.base)
+        if rc != 0:
+            r.delete(lock)
+            sys.stderr.write(f"bus claim: worktree setup failed; rolled back the claim on #{args.issue}\n")
+            return 1
     # We won the lock. Reflect to gh + announce. If gh fails, keep the lock
     # (the announce still tells others), but surface the error.
     err = None
@@ -815,6 +911,182 @@ def cmd_doctor(r_url):
     return 0 if ok else 1
 
 
+# ---- worktree commands -----------------------------------------------------
+
+def _ws_meta(r, issue):
+    raw = r.get(k_worktree(issue))
+    return json.loads(raw) if raw else None
+
+
+def _iter_ws_meta(r):
+    """Yield every registered worktree's metadata dict, skipping malformed or
+    legacy entries (missing required keys). Shared by ws list and reap."""
+    for key in r.scan_iter(match="bus:worktree:issue:*"):
+        raw = r.get(key)
+        try:
+            m = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if all(k in m for k in ("issue", "agent", "path", "branch", "base_commit")):
+            yield m
+
+
+def ws_create(r, room, agent, issue, base="dev", branch_type="feat",
+              allow_stale=False, allow_nested=False):
+    """Core of `ws create` / `claim --worktree`. Returns (rc, path_or_None)."""
+    if r.get(k_lock(issue)) != agent:
+        sys.stderr.write(f"bus ws create: you ({agent}) must hold the claim on #{issue} "
+                         f"(run `bus claim --as {agent} --issue {issue}`) first\n")
+        return 1, None
+    meta = _ws_meta(r, issue)
+    if meta:
+        if meta["agent"] == agent and os.path.isdir(meta["path"]):
+            return 0, meta["path"]  # resume
+        if meta["agent"] != agent:
+            sys.stderr.write(f"bus ws create: #{issue} worktree belongs to {meta['agent']} at "
+                             f"{meta['path']}; resolve (ws remove) before reclaiming\n")
+            return 1, None
+        # same agent but the dir is gone -> stale metadata, fall through to recreate
+    try:
+        main = main_repo_dir()
+    except RuntimeError as e:
+        sys.stderr.write(f"bus ws create: {e}\n")
+        return 1, None
+    root = worktree_root(main)
+    if path_under(root, main) and not allow_nested:
+        sys.stderr.write(f"bus ws create: worktree root {root} is inside the repo {main}; "
+                         f"use a sibling dir or pass --allow-nested\n")
+        return 1, None
+    # A leading '-' would be parsed as a git flag (e.g. base='-p' -> `git fetch
+    # origin -p` prunes refs). `ident` and check-ref-format both allow it, so
+    # reject it explicitly here — never let base/type become an option token.
+    if base.startswith("-") or branch_type.startswith("-"):
+        sys.stderr.write(f"bus ws create: base/type must not start with '-' (base={base}, type={branch_type})\n")
+        return 1, None
+    branch = f"{branch_type}/issue-{issue}-{agent}"
+    if not valid_git_ref(main, base) or not valid_git_ref(main, branch):
+        sys.stderr.write(f"bus ws create: invalid base/branch ref (base={base}, branch={branch})\n")
+        return 1, None
+    rc, _, err = git(main, "fetch", "origin", base, check=False)
+    if rc != 0 and not allow_stale:
+        sys.stderr.write(f"bus ws create: `git fetch origin {base}` failed ({err}); refusing to "
+                         f"cut from a possibly-stale base. Fix the network or pass --allow-stale.\n")
+        return 1, None
+    rc, base_commit, _ = git(main, "rev-parse", "--verify", f"origin/{base}", check=False)
+    if rc != 0:
+        sys.stderr.write(f"bus ws create: base origin/{base} not found\n")
+        return 1, None
+    rc, _, _ = git(main, "rev-parse", "--verify", f"refs/heads/{branch}", check=False)
+    if rc == 0:
+        sys.stderr.write(f"bus ws create: branch {branch} already exists (leftover worktree?); "
+                         f"remove it first\n")
+        return 1, None
+    os.makedirs(root, exist_ok=True)
+    path = os.path.abspath(os.path.join(root, f"issue-{issue}-{agent}"))
+    rc, _, err = git(main, "worktree", "add", path, "-b", branch, f"origin/{base}", check=False)
+    if rc != 0:
+        sys.stderr.write(f"bus ws create: git worktree add failed: {err}\n")
+        return 1, None
+    r.set(k_worktree(issue), json.dumps({
+        "issue": issue, "agent": agent, "path": path, "branch": branch,
+        "base": base, "base_commit": base_commit, "created_at": now_iso()}))
+    announce(r, room, agent, f"created worktree for #{issue} at {path} (branch {branch})",
+             topic=f"issue-{issue}")
+    return 0, path
+
+
+def cmd_ws_create(r, args):
+    rc, path = ws_create(r, args.room, args.as_agent, args.issue, base=args.base,
+                         branch_type=args.type, allow_stale=args.allow_stale,
+                         allow_nested=args.allow_nested)
+    if rc == 0:
+        print(path)
+    return rc
+
+
+def cmd_ws_path(r, args):
+    meta = _ws_meta(r, args.issue)
+    if not meta:
+        sys.stderr.write(f"bus ws path: no worktree for #{args.issue}\n")
+        return 1
+    print(meta["path"])
+    return 0
+
+
+def cmd_ws_list(r, args):
+    present_set = {k.rsplit(":", 1)[-1] for k in r.scan_iter(match="bus:presence:*")}
+    rows = []
+    for m in _iter_ws_meta(r):
+        path, exists = m["path"], os.path.isdir(m["path"])
+        dirty = "gone" if not exists else ("yes" if worktree_dirty(path) else "-")
+        unpushed = "yes" if exists and worktree_unpushed(path, m["base_commit"]) else "-"
+        present = "yes" if m["agent"] in present_set else "no"
+        rows.append((m["issue"], m["agent"], m["branch"], path, dirty, unpushed, present))
+    rows.sort(key=lambda x: int(x[0]) if str(x[0]).isdigit() else 0)
+    if args.json:
+        print(json.dumps([{"issue": i, "agent": a, "branch": b, "path": p,
+                           "dirty": d, "unpushed": u, "present": pr}
+                          for i, a, b, p, d, u, pr in rows]))
+        return 0
+    if not rows:
+        print("(no agent worktrees)")
+        return 0
+    print(f"{'ISSUE':<6} {'AGENT':<12} {'BRANCH':<26} {'DIRTY':<6} {'UNPUSH':<7} {'PRES':<4} PATH")
+    for i, a, b, p, d, u, pr in rows:
+        print(f"#{str(i):<5} {terminal_line(a):<12} {terminal_line(b):<26} "
+              f"{d:<6} {u:<7} {pr:<4} {terminal_line(p)}")
+    return 0
+
+
+def cmd_ws_remove(r, args):
+    meta = _ws_meta(r, args.issue)
+    if not meta:
+        sys.stderr.write(f"bus ws remove: no worktree for #{args.issue}\n")
+        return 1
+    if meta["agent"] != args.as_agent and not args.force:
+        sys.stderr.write(f"bus ws remove: #{args.issue} worktree belongs to {meta['agent']}, "
+                         f"not {args.as_agent}; --force to override\n")
+        return 1
+    path = meta["path"]
+    try:
+        main = main_repo_dir()
+        root = worktree_root(main)
+    except RuntimeError as e:
+        sys.stderr.write(f"bus ws remove: {e}\n")
+        return 1
+    # only ever remove a registered path under our own worktree root
+    if not path_under(path, root):
+        sys.stderr.write(f"bus ws remove: refusing — {path} is not under the worktree root {root}\n")
+        return 1
+    if path_under(os.getcwd(), path):
+        sys.stderr.write(f"bus ws remove: you are inside {path}; run from the main tree\n")
+        return 1
+    if os.path.isdir(path) and not args.force:
+        if worktree_dirty(path):
+            sys.stderr.write(f"bus ws remove: #{args.issue} has uncommitted changes; "
+                             f"commit/stash or --force to discard\n")
+            return 1
+        if worktree_unpushed(path, meta["base_commit"]):
+            sys.stderr.write(f"bus ws remove: #{args.issue} has unpushed commits; "
+                             f"push first or --force to discard\n")
+            return 1
+    rm = ["worktree", "remove", path] + (["--force"] if args.force else [])
+    rc, _, err = git(main, *rm, check=False)
+    if rc != 0 and os.path.isdir(path):
+        sys.stderr.write(f"bus ws remove: git worktree remove failed: {err}\n")
+        return 1
+    r.delete(k_worktree(args.issue))
+    announce(r, args.room, args.as_agent, f"removed worktree for #{args.issue}",
+             topic=f"issue-{args.issue}")
+    print(f"removed worktree for #{args.issue} ({path})")
+    return 0
+
+
+def cmd_ws(r, args):
+    return {"create": cmd_ws_create, "path": cmd_ws_path,
+            "list": cmd_ws_list, "remove": cmd_ws_remove}[args.ws_cmd](r, args)
+
+
 # ---- argparse --------------------------------------------------------------
 
 TTL_HELP = "lock TTL seconds (default 8h)"
@@ -907,6 +1179,10 @@ def build_parser():
     c = sub.add_parser("claim", help="atomically claim a gh issue")
     _as(c); _issue(c)
     c.add_argument("--ttl", type=int, default=28800, help=TTL_HELP)
+    c.add_argument("--worktree", action="store_true",
+                   help="also create an isolated git worktree for this issue (fail-closed)")
+    c.add_argument("--base", type=ident, default="dev",
+                   help="base branch for --worktree, freshly fetched (default dev)")
 
     rl = sub.add_parser("release", help="release a claim you hold")
     _as(rl); _issue(rl)
@@ -920,6 +1196,21 @@ def build_parser():
     st.add_argument("--set", required=True, choices=STATUS_LABELS)
     st.add_argument("--ttl", type=int, default=28800, help=TTL_HELP)
 
+    ws = sub.add_parser("ws", help="per-agent git worktrees for isolated parallel building")
+    wsub = ws.add_subparsers(dest="ws_cmd", required=True)
+    wc = wsub.add_parser("create", help="create/resume an isolated worktree for an issue you claimed")
+    _as(wc); _issue(wc)
+    wc.add_argument("--base", type=ident, default="dev", help="base branch, freshly fetched (default dev)")
+    wc.add_argument("--type", type=ident, default="feat", help="branch type prefix (default feat)")
+    wc.add_argument("--allow-stale", action="store_true", help="proceed even if git fetch fails (RISKY)")
+    wc.add_argument("--allow-nested", action="store_true", help="allow a worktree root inside the repo")
+    wp = wsub.add_parser("path", help="print the worktree path for an issue")
+    _issue(wp)
+    wsub.add_parser("list", help="list all agent worktrees (dirty / unpushed / present)")
+    wr = wsub.add_parser("remove", help="remove an issue's worktree (guarded: refuses dirty/unpushed)")
+    _as(wr); _issue(wr)
+    wr.add_argument("--force", action="store_true", help="remove even if dirty/unpushed or not owner")
+
     sub.add_parser("init", help="create status:* labels in BUS_GH_REPO")
     sub.add_parser("doctor", help="check redis + gh")
     return p
@@ -932,7 +1223,7 @@ DISPATCH = {
     "agents": cmd_agents, "claim": cmd_claim, "release": cmd_release,
     "renew": cmd_renew, "status": cmd_status,
     "thread": cmd_thread, "inbox": cmd_inbox, "prune": cmd_prune,
-    "reap": cmd_reap, "board": cmd_board,
+    "reap": cmd_reap, "board": cmd_board, "ws": cmd_ws,
 }
 
 
