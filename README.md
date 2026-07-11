@@ -414,3 +414,30 @@ Redis keys (for the curious): `bus:stream:<room>`, `bus:cursor:<room>:<agent>`,
 `bus:presence:<room>:<agent>` (90s TTL), `bus:lock:issue:<N>`,
 `bus:worktree:issue:<N>`, `bus:huddle:issue:<N>`, `bus:pen:issue:<N>`,
 `bus:signoff:issue:<N>`, `bus:block:issue:<N>`.
+
+## Status transitions
+
+`bus status` moves an issue along the linear pipeline
+`open → claimed → pr-open → merged → deployed → verified`. Forward moves (any
+distance) are always allowed; a no-op re-set of the current label is skipped (no
+duplicate comment); a backward move is refused unless you pass `--force`. Two
+"back to work" edges are always legal without `--force`: `claimed → open`
+(abandon a claim) and `pr-open → claimed` (PR closed, back to building). If the
+current label can't be read, the move is refused (even with `--force` — `--force`
+overrides legality, not an unreadable state; retry when gh is reachable). This
+stops a fat-finger from sending a `verified` issue back to `open`, without
+constraining real forward progress.
+
+`bus claim` and huddle-open also set `status:claimed`, but they run inside agent
+loops where a hard refusal could wedge a driver mid-task. So on those acquire
+paths a backslide (claiming an issue already past `claimed`) is a **warning**,
+not a block — the explicit `bus status` command is the one place a backward move
+is refused. huddle-close advances to `pr-open` (forward by construction).
+
+## Tests
+
+Pure-function tests (no Redis or gh needed) for the status-transition gate:
+
+```bash
+python -m unittest discover -s tests    # from the repo root; needs redis-py importable
+```
