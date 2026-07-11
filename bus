@@ -1,0 +1,1898 @@
+#!/usr/bin/env python3
+"""
+bus — a tiny, durable message bus for multi-agent coordination.
+
+Backed by Redis Streams (durable log + per-agent cursor), NOT pub/sub.
+Pub/sub drops messages when an agent is mid-turn and not subscribed; a
+turn-based agent would lose exactly the messages that matter. Streams
+persist every message and each agent tracks its own read position, so an
+agent that was busy (or dead) for 10 minutes catches up on wake.
+
+Task ordering uses two layers:
+  - Redis SET NX  -> atomic claim lock (resolves the claim race)
+  - GitHub issue labels -> durable, human-visible state machine
+
+Commands:
+  send     publish a message to a room
+  poll     read new messages addressed to you (non-blocking); --topic to scope
+  wait     block until a message arrives; --topic / --reply-to to scope
+  tail     show recent messages without moving your cursor (observability)
+  history  dump the full room log
+  watch    live-follow every message in a room (read-only observer); --topic to scope
+  thread   print the full reply_to thread containing a message id
+  inbox    peek unread messages for you (directed or questions); cursor untouched
+  prune    trim a room to the newest --keep messages (destructive, guarded)
+  join     register presence and set your cursor to "now"
+  agents   list agents currently present in a room
+  claim    atomically claim a gh issue (Redis lock + status label); --worktree
+  release  release a claim you hold
+  renew    extend the TTL on a claim you hold (long-running tasks)
+  reap     list stale issue locks (holder absent); --release <issue> to free one
+  status   transition a gh issue's status label + announce on the bus
+  board    table of gh issues + status label + lock holder + presence
+  ws       per-agent git worktrees: ws create/path/list/remove (isolated builds)
+  init     create the status:* labels in BUS_GH_REPO
+
+A --topic <t> (poll/wait/watch) or --reply-to <id> (wait) filter narrows delivery
+to an exact match, but never hides a __SHUTDOWN__ in poll/wait — the kill-switch
+must not be defeated by an agent's own scoping.
+  doctor   check Redis connectivity and gh auth
+
+Config via env:
+  BUS_REDIS_URL   default redis://127.0.0.1:6379/0
+  BUS_ROOM        default "main"
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+from datetime import datetime, timezone
+
+try:
+    import redis
+except ImportError:
+    sys.stderr.write("bus: redis-py not installed. Run: pip install redis\n")
+    sys.exit(2)
+
+DEFAULT_URL = os.environ.get("BUS_REDIS_URL", "redis://127.0.0.1:6379/0")
+DEFAULT_ROOM = os.environ.get("BUS_ROOM", "main")
+PRESENCE_TTL = 90  # seconds; refreshed on every send/poll/wait/join + pen/huddle op
+PEN_TAKE_GRACE = 120  # seconds an absent driver has to reappear before a force-take
+
+# ---- key helpers -----------------------------------------------------------
+
+def k_stream(room):   return f"bus:stream:{room}"
+def k_cursor(room, a): return f"bus:cursor:{room}:{a}"
+def k_presence(room, a): return f"bus:presence:{room}:{a}"
+def k_lock(issue):    return f"bus:lock:issue:{issue}"
+def k_worktree(issue): return f"bus:worktree:issue:{issue}"
+def k_huddle(issue):  return f"bus:huddle:issue:{issue}"
+def k_pen(issue):     return f"bus:pen:issue:{issue}"
+def k_penchal(issue): return f"bus:penchal:issue:{issue}"
+def k_signoff(issue): return f"bus:signoff:issue:{issue}"
+def k_block(issue):   return f"bus:block:issue:{issue}"
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+SOCKET_TIMEOUT = 5     # seconds; client-side read timeout (fail fast on dead Redis)
+# A blocking XREAD must block for LESS than SOCKET_TIMEOUT or the client socket
+# read itself times out and raises. So blocking reads are issued in chunks and
+# re-blocked in a loop; the chunk must stay safely under SOCKET_TIMEOUT.
+BLOCK_CHUNK_MS = 1000
+
+
+def connect(url):
+    r = redis.Redis.from_url(url, decode_responses=True, socket_timeout=SOCKET_TIMEOUT)
+    r.ping()  # fail fast with a clear error if server is down
+    return r
+
+
+def touch_presence(r, room, agent):
+    if agent:
+        r.set(k_presence(room, agent), now_iso(), ex=PRESENCE_TTL)
+
+
+# ---- gh helpers ------------------------------------------------------------
+
+import subprocess
+
+# Target repo for issue/label commands. Without it, gh uses the cwd's repo,
+# but `bus` usually runs from the messagebus dir which is NOT that repo.
+GH_REPO = os.environ.get("BUS_GH_REPO", "")
+
+# gh subcommands that do NOT accept -R/--repo. Everything else gets -R, so a
+# new repo-aware call fails safe (targeted at BUS_GH_REPO) instead of silently
+# acting on the cwd's repo.
+_NON_REPO = {"auth", "config", "api"}
+
+
+def gh(args, check=True):
+    """Run a gh command, return (rc, stdout, stderr)."""
+    full = ["gh"] + args
+    if GH_REPO and args and args[0] not in _NON_REPO:
+        full += ["-R", GH_REPO]
+    p = subprocess.run(full, capture_output=True, text=True)
+    if check and p.returncode != 0:
+        raise RuntimeError(f"gh {' '.join(args)} failed: {p.stderr.strip()}")
+    return p.returncode, p.stdout.strip(), p.stderr.strip()
+
+
+def issue_labels(issue):
+    """Current label names on an issue, or None if gh couldn't answer.
+
+    None (read failed) is deliberately distinct from [] (issue genuinely has no
+    labels) so callers don't mistake a transient gh error for 'no labels'.
+    """
+    rc, out, _ = gh(["issue", "view", str(issue), "--json", "labels",
+                     "-q", ".labels[].name"], check=False)
+    if rc != 0:
+        return None
+    return out.splitlines() if out else []
+
+
+STATUS_LABELS = [
+    "status:open", "status:claimed", "status:pr-open",
+    "status:merged", "status:deployed", "status:verified",
+]
+
+
+def set_status_label(issue, new_label):
+    """Add new_label, remove any other status:* label the issue actually has.
+
+    Deriving the remove-set from the issue's current labels (not blindly
+    removing all five) means gh never sees a "remove a label it doesn't have"
+    error, so there's no fragile stderr parsing or retry.
+    """
+    if new_label not in STATUS_LABELS:
+        raise ValueError(f"unknown status label: {new_label}")
+    current = issue_labels(issue)
+    if current is None:
+        # couldn't read labels -> add the new one only, don't guess removals.
+        # A later transition (with a working read) derives removals from real
+        # state and cleans up any stale label, so this self-heals.
+        sys.stderr.write(f"warning: could not read labels on #{issue}; "
+                         f"adding {new_label} without removing others\n")
+        current = []
+    remove = [l for l in STATUS_LABELS if l != new_label and l in current]
+    args = ["issue", "edit", str(issue), "--add-label", new_label]
+    for l in remove:
+        args += ["--remove-label", l]
+    gh(args, check=False)
+
+
+# ---- git worktree helpers --------------------------------------------------
+
+def git(repo, *args, check=True):
+    """Run a git command in `repo` (argv, never a shell). Returns (rc, out, err)."""
+    p = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True)
+    if check and p.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)}: {p.stderr.strip()}")
+    return p.returncode, p.stdout.strip(), p.stderr.strip()
+
+
+def main_repo_dir():
+    """Absolute path of the MAIN repo, even when cwd is inside a worktree.
+
+    `--show-toplevel` returns the worktree root, so rooting the sibling worktree
+    dir off that would nest worktrees-of-worktrees. `--git-common-dir` points at
+    the shared `.git`, whose parent is the main working tree.
+    """
+    base = os.environ.get("BUS_REPO_DIR") or os.getcwd()
+    rc, common, _ = git(base, "rev-parse", "--path-format=absolute",
+                        "--git-common-dir", check=False)
+    if rc != 0:
+        raise RuntimeError("not inside a git repository (set BUS_REPO_DIR)")
+    return os.path.dirname(os.path.normpath(common))
+
+
+def worktree_root(main):
+    """Where per-agent worktrees live. Default: sibling `../<repo>-worktrees/`
+    (avoids in-repo nesting + the macOS sandbox EPERM seen on hidden dirs). A
+    custom BUS_WORKTREE_ROOT inside the repo is rejected unless --allow-nested."""
+    env = os.environ.get("BUS_WORKTREE_ROOT")
+    if env:
+        return os.path.abspath(env)
+    return os.path.join(os.path.dirname(main), f"{os.path.basename(main)}-worktrees")
+
+
+def valid_git_ref(main, ref):
+    rc, _, _ = git(main, "check-ref-format", f"refs/heads/{ref}", check=False)
+    return rc == 0
+
+
+def worktree_dirty(path):
+    """True if the worktree has uncommitted changes (incl. untracked)."""
+    rc, out, _ = git(path, "status", "--porcelain", check=False)
+    return rc == 0 and bool(out.strip())
+
+
+def worktree_unpushed(path, base_commit):
+    """True if the branch has commits beyond base_commit that NO remote ref
+    contains. A never-pushed branch has no upstream, so an `@{u}` comparison
+    would error or report 'nothing' and wrongly call it safe — instead we
+    check remote-containment directly, so unpushed work is never silently lost.
+    """
+    if not base_commit:
+        return True  # unknown base -> can't prove pushed -> fail closed
+    rc, ahead, _ = git(path, "rev-list", "HEAD", f"^{base_commit}", check=False)
+    if rc != 0:
+        return True  # can't compute -> assume unpushed (fail closed; git won't
+        #              backstop "unpushed" the way it does a dirty tree)
+    if not ahead.strip():
+        return False  # no commits beyond base -> nothing to lose
+    rc, head, _ = git(path, "rev-parse", "HEAD", check=False)
+    if rc != 0:
+        return True
+    rc, contained, _ = git(path, "for-each-ref", "--contains", head,
+                          "refs/remotes/", check=False)
+    if rc != 0:
+        return True
+    return not contained.strip()  # commits beyond base AND on no remote = unpushed
+
+
+def path_under(child, parent):
+    """True if `child` is `parent` or nested within it (both absolutised)."""
+    child = os.path.abspath(child)
+    parent = os.path.abspath(parent)
+    return child == parent or child.startswith(parent + os.sep)
+
+
+# ---- message plumbing ------------------------------------------------------
+
+SHUTDOWN = "__SHUTDOWN__"  # a message with this exact body means "stop"
+
+# exit codes shared with the shell drivers (stop-hook.sh, agent-loop.sh)
+RC_DELIVERED = 0   # messages for the agent were printed
+RC_NONE = 10       # nothing addressed to the agent (empty poll / wait timeout)
+RC_SHUTDOWN = 11   # a delivered message was the shutdown sentinel
+
+
+def make_fields(frm, to, body, kind="msg", topic="", reply_to=""):
+    """The single source of truth for the on-stream message schema (write side,
+    mirror of fields_to_msg on the read side)."""
+    return {"from": frm, "to": to, "topic": topic,
+            "reply_to": reply_to, "kind": kind, "body": body}
+
+
+def read_result_code(delivered):
+    if not delivered:
+        return RC_NONE
+    if any(m["body"].strip() == SHUTDOWN for m in delivered):
+        return RC_SHUTDOWN
+    return RC_DELIVERED
+
+
+def terminal_text(value):
+    """Escape terminal control characters in untrusted display text."""
+    out = []
+    for ch in str(value):
+        code = ord(ch)
+        if ch in "\n\t" or (code >= 32 and code != 127 and not 0x80 <= code <= 0x9F):
+            out.append(ch)
+        else:
+            out.append(f"\\x{code:02x}")
+    return "".join(out)
+
+
+def terminal_line(value):
+    return terminal_text(value).replace("\n", " ")
+
+
+def emit(msg, as_json):
+    if as_json:
+        print(json.dumps(msg, ensure_ascii=False))
+    else:
+        who = terminal_line(msg["from"])
+        to = terminal_line(msg.get("to", "all"))
+        arrow = "" if to == "all" else f" -> {to}"
+        topic = f" [{terminal_line(msg['topic'])}]" if msg.get("topic") else ""
+        reply = f" (re {terminal_line(msg['reply_to'])})" if msg.get("reply_to") else ""
+        print(f"{terminal_line(msg['id'])}  {who}{arrow}{topic}{reply}\n  {terminal_text(msg['body'])}")
+
+
+def fields_to_msg(msg_id, fields):
+    return {
+        "id": msg_id,
+        "from": fields.get("from", "?"),
+        "to": fields.get("to", "all"),
+        "topic": fields.get("topic", ""),
+        "reply_to": fields.get("reply_to", ""),
+        "kind": fields.get("kind", "msg"),
+        "body": fields.get("body", ""),
+    }
+
+
+def deliverable(msg, agent, topic=None, reply_to=None):
+    """True if this message should be shown to `agent`.
+
+    `topic` / `reply_to`, if given, narrow delivery (exact match) — but NEITHER
+    filters the shutdown signal. A scoped listener (one topic, or awaiting one
+    reply) must never let its own scoping swallow a `--to all __SHUTDOWN__`
+    kill-switch, so __SHUTDOWN__ always passes both filters.
+    """
+    addressed = msg["to"] == "all" or msg["to"] == agent
+    if not addressed:
+        return False
+    is_shutdown = msg["body"].strip() == SHUTDOWN
+    if msg["from"] == agent and not is_shutdown:
+        return False  # suppress self-echo, except a self-addressed shutdown
+    if is_shutdown:
+        return True   # stop signal bypasses every narrowing filter
+    if topic and msg["topic"] != topic:
+        return False  # topic narrows chatter, never the stop signal
+    if reply_to and msg["reply_to"] != reply_to:
+        return False  # awaiting a specific reply, never the stop signal
+    return True
+
+
+# ---- commands --------------------------------------------------------------
+
+def cmd_send(r, args):
+    body = args.body
+    if body == "-" or (body is None and not sys.stdin.isatty()):
+        body = sys.stdin.read()
+    if not body:
+        sys.stderr.write("bus send: empty body\n")
+        return 2
+    fields = make_fields(args.frm, args.to, body.strip(),
+                         kind=args.kind, topic=args.topic or "",
+                         reply_to=args.reply_to or "")
+    msg_id = r.xadd(k_stream(args.room), fields)
+    touch_presence(r, args.room, args.frm)
+    if args.json:
+        print(json.dumps({"id": msg_id, "room": args.room}))
+    else:
+        print(f"sent {msg_id} to room={args.room} to={args.to}")
+    return 0
+
+
+def read_from_cursor(r, room, agent, block_ms=None, count=100, topic=None, reply_to=None):
+    """One XREAD from the agent's cursor. Returns (delivered, last_seen_id).
+
+    The cursor advances past EVERY entry seen (last_seen), so a topic filter
+    only narrows what's delivered — non-matching messages are consumed, not
+    re-read on the next poll.
+    """
+    cur = r.get(k_cursor(room, agent)) or "0-0"
+    kwargs = {"count": count}
+    if block_ms is not None:
+        kwargs["block"] = block_ms
+    resp = r.xread({k_stream(room): cur}, **kwargs)
+    delivered, last_seen = [], None
+    if resp:
+        _, entries = resp[0]
+        for msg_id, fields in entries:
+            last_seen = msg_id
+            msg = fields_to_msg(msg_id, fields)
+            if deliverable(msg, agent, topic, reply_to):
+                delivered.append(msg)
+    return delivered, last_seen
+
+
+def cmd_poll(r, args):
+    touch_presence(r, args.room, args.as_agent)
+    delivered, last_seen = read_from_cursor(
+        r, args.room, args.as_agent, topic=args.topic)
+    if last_seen:
+        r.set(k_cursor(args.room, args.as_agent), last_seen)
+    for m in delivered:
+        emit(m, args.json)
+    if not delivered and not args.json:
+        print("(no new messages)")
+    return read_result_code(delivered)
+
+
+def cmd_wait(r, args):
+    """Block up to --timeout seconds for a message addressed to us.
+
+    We advance the cursor past every message we see (even ones not for us),
+    then keep blocking on the remaining time budget so unrelated traffic
+    doesn't make us return empty.
+    """
+    import time
+    touch_presence(r, args.room, args.as_agent)
+    deadline = time.monotonic() + args.timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            if not args.json:
+                print("(timeout, no messages)")
+            return RC_NONE
+        # Block in chunks under SOCKET_TIMEOUT (a longer single block would trip
+        # the client socket read timeout and crash). Floor at 1ms; XREAD BLOCK 0
+        # would block forever. The outer loop re-blocks on the remaining budget.
+        block_ms = max(1, min(BLOCK_CHUNK_MS, int(remaining * 1000)))
+        delivered, last_seen = read_from_cursor(
+            r, args.room, args.as_agent, block_ms=block_ms,
+            topic=args.topic, reply_to=args.reply_to
+        )
+        if last_seen:
+            r.set(k_cursor(args.room, args.as_agent), last_seen)
+        if delivered:
+            for m in delivered:
+                emit(m, args.json)
+            return read_result_code(delivered)
+        # saw only traffic not addressed to us (or nothing) -> keep waiting
+
+
+TOPIC_SCAN_CAP = 1000  # how far `watch --topic` scans back for context matches
+
+
+def emit_recent(r, room, n, as_json, topic=None):
+    """Print up to the last n messages (oldest-first) and return the newest
+    message id in the stream (for follow continuation), or None if empty.
+
+    With `topic`, print the last n messages *matching* that topic — scanning
+    back a bounded window so a filtered follow shows real matches, not "last n
+    raw then filtered to maybe zero" (per the ratified spec). Still returns the
+    newest RAW id so the caller's follow cursor advances correctly.
+    """
+    if not topic:
+        entries = r.xrevrange(k_stream(room), count=n)
+        for msg_id, fields in reversed(entries):
+            emit(fields_to_msg(msg_id, fields), as_json)
+        return entries[0][0] if entries else None
+    window = r.xrevrange(k_stream(room), count=TOPIC_SCAN_CAP)  # newest-first
+    newest = window[0][0] if window else None
+    matches = [(mid, f) for mid, f in window if f.get("topic") == topic]
+    for msg_id, fields in reversed(matches[:n]):  # the n newest matches, oldest-first
+        emit(fields_to_msg(msg_id, fields), as_json)
+    return newest
+
+
+def cmd_tail(r, args):
+    emit_recent(r, args.room, args.n, args.json)
+    return 0
+
+
+def cmd_history(r, args):
+    entries = r.xrange(k_stream(args.room), count=args.n)
+    for msg_id, fields in entries:
+        emit(fields_to_msg(msg_id, fields), args.json)
+    return 0
+
+
+def _id_key(sid):
+    """Sort key for a Redis stream id 'ms-seq' (numeric, not lexicographic —
+    '9-0' must sort before '10-0')."""
+    ms, _, seq = sid.partition("-")
+    return (int(ms), int(seq or 0))
+
+
+def cmd_thread(r, args):
+    """Print the full reply_to thread containing message <id>: walk up to the
+    root, then print every message reachable down the reply_to tree, in order."""
+    byid = {mid: fields_to_msg(mid, f)
+            for mid, f in r.xrange(k_stream(args.room))}
+    if args.id not in byid:
+        sys.stderr.write(f"bus thread: message {args.id} not in room {args.room}\n")
+        return 1
+    children = {}
+    for mid, m in byid.items():
+        rt = m["reply_to"]
+        if rt and rt in byid:
+            children.setdefault(rt, []).append(mid)
+    root, seen = args.id, set()          # walk up to the thread root
+    while byid[root]["reply_to"] in byid and root not in seen:
+        seen.add(root)
+        root = byid[root]["reply_to"]
+    thread, stack = set(), [root]        # collect the whole subtree from root
+    while stack:
+        x = stack.pop()
+        if x in thread:
+            continue
+        thread.add(x)
+        stack.extend(children.get(x, []))
+    for mid in sorted(thread, key=_id_key):
+        emit(byid[mid], args.json)
+    return 0
+
+
+def cmd_inbox(r, args):
+    """PEEK (does NOT advance the cursor) the unread messages that need your
+    attention: directed to you, or questions. Cursor is left untouched so a
+    later poll/wait still delivers them."""
+    touch_presence(r, args.room, args.as_agent)
+    cur = r.get(k_cursor(args.room, args.as_agent)) or "0-0"
+    peek_cap = 1000
+    resp = r.xread({k_stream(args.room): cur}, count=peek_cap)  # bounded peek, no block
+    entries = resp[0][1] if resp else []
+    items = []
+    for mid, f in entries:
+        m = fields_to_msg(mid, f)
+        if m["from"] == args.as_agent:
+            continue
+        directed = m["to"] == args.as_agent
+        # a question counts only if it's actually addressed to me (or broadcast);
+        # a question aimed at another agent is not my inbox.
+        if directed or (m["kind"] == "question" and m["to"] == "all"):
+            items.append(m)
+    if len(entries) == peek_cap:
+        sys.stderr.write(f"bus inbox: showing the oldest {peek_cap} unread; more remain — poll to advance\n")
+    if args.json:
+        for m in items:
+            emit(m, True)  # JSONL, consistent with poll/wait/tail/history
+    elif not items:
+        print("(inbox empty — no unread directed messages or questions)")
+    else:
+        for m in items:
+            tag = "Q" if m["kind"] == "question" else "@"
+            topic = f" [{terminal_line(m['topic'])}]" if m["topic"] else ""
+            body = terminal_line(m["body"])[:100]
+            print(f"{tag} {terminal_line(m['id'])}  {terminal_line(m['from'])}{topic}: {body}")
+    return 0
+
+
+def xtrim_minid(r, stream, minid):
+    return r.execute_command("XTRIM", stream, "MINID", minid)
+
+
+def cursor_has_unread_before(r, stream, cursor, boundary):
+    return bool(r.xrange(stream, f"({cursor}", f"({boundary}", count=1))
+
+
+def cmd_prune(r, args):
+    """Trim a room's stream to the newest --keep messages. DESTRUCTIVE. Refuses
+    if any agent's cursor is behind the keep-window (would drop unread), unless
+    --force. Never auto-runs; operator-invoked only."""
+    stream = k_stream(args.room)
+    total = r.xlen(stream)
+    if total <= args.keep:
+        print(f"room {args.room}: {total} messages <= keep {args.keep}; nothing to trim")
+        return 0
+    boundary = r.xrevrange(stream, count=args.keep)[-1][0]  # oldest id we'd keep
+    behind = []
+    for key in r.scan_iter(match=k_cursor(args.room, "*")):
+        cval = r.get(key)
+        if cval and cursor_has_unread_before(r, stream, cval, boundary):
+            behind.append((key.rsplit(":", 1)[-1], cval))
+    if behind and not args.force:
+        who = ", ".join(f"{terminal_line(a)}@{terminal_line(c)}" for a, c in behind)
+        sys.stderr.write(
+            f"bus prune: REFUSING — {len(behind)} agent cursor(s) behind the keep-window "
+            f"boundary {terminal_line(boundary)}; trimming would drop unread messages ({who}). "
+            f"Re-run with --force to override.\n")
+        return 1
+    if behind:
+        sys.stderr.write(f"bus prune: --force: dropping unread for {len(behind)} lagging agent(s)\n")
+    # Trim by the checked boundary, not by MAXLEN. If a writer appends between
+    # the cursor scan and trim, MINID may keep more than --keep, but it cannot
+    # move the deletion boundary forward and drop unread messages we did not
+    # check.
+    removed = xtrim_minid(r, stream, boundary)
+    print(f"pruned room {args.room}: removed {removed}, kept {r.xlen(stream)} (was {total})")
+    return 0
+
+
+def _is_huddle_lock(holder):
+    """A huddle session lock (holder `huddle:issue-N`, see huddle_holder) is held
+    by the shared co-work session, not by any single agent — it has no presence
+    key, so presence-based staleness never applies. Treat it as a live session."""
+    return bool(holder) and holder.startswith("huddle:")
+
+
+def _holder_present(r, holder):
+    """True if `holder` has a presence key in ANY room (locks are global, an
+    agent may be live in a different room than the one reap was invoked for)."""
+    return bool(holder) and any(True for _ in r.scan_iter(match=f"bus:presence:*:{holder}"))
+
+
+def stale_lock_info(r, issue, present_set=None):
+    """Return (holder, ttl) if the lock is held by an absent agent, else None.
+    Pass `present_set` (a snapshot of present agent ids) to avoid a per-call
+    keyspace scan when checking many locks; omit it for a single fresh check."""
+    holder = r.get(k_lock(issue))
+    if not holder:
+        return None
+    if _is_huddle_lock(holder):
+        return None  # a live huddle session, never a dead-agent lock
+    present = holder in present_set if present_set is not None else _holder_present(r, holder)
+    if present:
+        return None
+    return holder, r.ttl(k_lock(issue))
+
+
+def compare_delete_lock(r, issue, holder):
+    return r.eval(
+        """
+        if redis.call('GET', KEYS[1]) == ARGV[1] then
+            return redis.call('DEL', KEYS[1])
+        end
+        return 0
+        """,
+        1, k_lock(issue), holder,
+    )
+
+
+def cmd_reap(r, args):
+    """List issue locks whose holder has no presence anywhere (possibly a dead
+    agent). ADVISORY — the 8h lock TTL is the real death-expiry, and a turn-based
+    agent idle past its 90s presence TTL is NOT dead. Absent presence is a weak
+    death signal, so there is deliberately NO blanket release: `--release <issue>`
+    frees exactly ONE lock the operator has verified is genuinely dead."""
+    present_set = {k.rsplit(":", 1)[-1] for k in r.scan_iter(match="bus:presence:*")}
+    stale = []
+    for key in r.scan_iter(match="bus:lock:issue:*"):
+        issue = key.rsplit(":", 1)[-1]
+        info = stale_lock_info(r, issue, present_set)
+        if info:
+            holder, ttl = info
+            stale.append((issue, holder, ttl))
+    stale.sort(key=lambda s: int(s[0]) if s[0].isdigit() else 0)
+    if args.json:
+        print(json.dumps([{"issue": i, "holder": h, "ttl": t} for i, h, t in stale]))
+    elif not stale:
+        print("no stale locks (every lock holder is present)")
+    else:
+        for i, h, t in stale:
+            print(f"issue #{terminal_line(i)}\tholder={terminal_line(h)}\tttl={t}s\tpresent=no")
+    # advisory: worktrees whose holder is absent (possible dead agent). Never
+    # auto-removed — operator verifies the work is captured, then ws remove --force.
+    if not args.json:
+        orphans = [m for m in _iter_ws_meta(r) if m["agent"] not in present_set]
+        if orphans:
+            print("orphan worktrees (holder absent — verify work captured, then `ws remove --force`):")
+            for m in sorted(orphans, key=lambda x: int(x["issue"]) if str(x["issue"]).isdigit() else 0):
+                print(f"  #{terminal_line(str(m['issue']))}\t{terminal_line(m['agent'])}\t{terminal_line(m['path'])}")
+    if args.release is not None:
+        target = str(args.release)
+        current = stale_lock_info(r, target)
+        if not current:
+            sys.stderr.write(f"bus reap --release {target}: not a stale lock "
+                             f"(holder present, or not locked) — refusing to release\n")
+            return 1
+        holder, _ = current
+        if not compare_delete_lock(r, target, holder):
+            sys.stderr.write(f"bus reap --release {target}: lock changed while releasing — refusing\n")
+            return 1
+        print(f"released stale lock on #{target} (was {terminal_line(holder)})")
+    return 0
+
+
+def cmd_board(r, args):
+    """One table: every status-labelled gh issue + its status + Redis lock
+    holder + whether that holder is present. Composes gh + Redis; read-only."""
+    if not GH_REPO:
+        sys.stderr.write("bus board: set BUS_GH_REPO=owner/repo\n")
+        return 2
+    rc, out, err = gh(["issue", "list", "--state", "all", "--limit", "1000",
+                       "--json", "number,title,labels"], check=False)
+    gh_rows = {}
+    try:
+        issues = json.loads(out) if (rc == 0 and out) else []
+    except json.JSONDecodeError:
+        issues = []
+        rc = 1
+    if rc != 0:
+        sys.stderr.write(f"bus board: gh issue list unavailable; showing Redis locks only: {err}\n")
+    else:
+        for it in issues:
+            labels = [l["name"] for l in (it.get("labels") or [])]
+            status = next((l for l in labels if l.startswith("status:")), None)
+            if status:
+                gh_rows[str(it["number"])] = {
+                    "issue": str(it["number"]),
+                    "status": status,
+                    "title": it.get("title", ""),  # raw; escaped only for the human table
+                }
+    lock_rows = {}
+    for key in r.scan_iter(match="bus:lock:issue:*"):
+        issue = key.rsplit(":", 1)[-1]
+        lock_rows[issue] = r.get(key)
+    present_set = {k.rsplit(":", 1)[-1] for k in r.scan_iter(match="bus:presence:*")}
+    rows = []
+    for issue in sorted(set(gh_rows) | set(lock_rows),
+                        key=lambda x: int(x) if x.isdigit() else 0):
+        holder = lock_rows.get(issue)
+        meta = gh_rows.get(issue, {})
+        if not holder:
+            present = "-"
+        elif _is_huddle_lock(holder):
+            present = "sesh"  # a shared huddle session, not a single-agent presence
+        else:
+            present = "yes" if holder in present_set else "no"
+        rows.append((issue, meta.get("status", "unknown"), holder or "-",
+                     present, meta.get("title", "unknown")))
+    # rows are already built in numeric issue order above; a re-sort by the
+    # string issue id would put #10 before #2, so don't.
+    if args.json:
+        print(json.dumps([{"issue": n, "status": s, "holder": h, "present": p, "title": t}
+                          for n, s, h, p, t in rows]))
+        return 0
+    if not rows:
+        print("(board empty — no status-labelled or claimed issues)")
+        return 0
+    print(f"{'ISSUE':<6} {'STATUS':<16} {'HOLDER':<14} {'PRES':<4} TITLE")
+    for n, s, h, p, t in rows:
+        print(f"#{terminal_line(n):<5} {terminal_line(s):<16} {terminal_line(h):<14} {p:<4} {terminal_line(t)[:44]}")
+    return 0
+
+
+def cmd_watch(r, args):
+    """Live-follow messages in a room as they arrive (tail -f style).
+
+    Read-only OBSERVER: it never registers presence or moves any agent's cursor,
+    so watching a room doesn't perturb the agents working in it. Shows the last
+    -n messages for context, then blocks for new ones until Ctrl-C. With
+    --topic, only messages with that topic are shown (context and live).
+    """
+    topic = args.topic
+    last = "$"  # "$" = only messages added after we start blocking
+    if args.n > 0:
+        newest = emit_recent(r, args.room, args.n, args.json, topic=topic)
+        if newest:
+            last = newest  # continue strictly after the newest RAW message
+    sys.stdout.flush()
+    try:
+        while True:
+            # block in chunks under SOCKET_TIMEOUT (block=0 would block forever
+            # and trip the client socket read timeout); loop on empty returns.
+            resp = r.xread({k_stream(args.room): last}, block=BLOCK_CHUNK_MS)
+            if not resp:
+                continue
+            _, entries = resp[0]
+            for msg_id, fields in entries:
+                last = msg_id  # advance past every raw message, matched or not
+                if topic and fields.get("topic") != topic:
+                    continue   # filter live-follow before emitting
+                emit(fields_to_msg(msg_id, fields), args.json)
+            # a follow tool must flush per batch or a piped consumer sees nothing
+            # until the buffer fills (stdout is block-buffered when not a tty).
+            sys.stdout.flush()
+    except KeyboardInterrupt:
+        return 0
+
+
+def cmd_join(r, args):
+    # start reading from "now": don't replay the whole room on first join.
+    info_id = "0-0"
+    try:
+        last = r.xrevrange(k_stream(args.room), count=1)
+        if last:
+            info_id = last[0][0]
+    except redis.ResponseError:
+        pass
+    r.set(k_cursor(args.room, args.as_agent), info_id)
+    touch_presence(r, args.room, args.as_agent)
+    if args.json:
+        print(json.dumps({"joined": args.as_agent, "room": args.room, "cursor": info_id}))
+    else:
+        print(f"{args.as_agent} joined room={args.room} (cursor at {info_id})")
+    return 0
+
+
+def cmd_agents(r, args):
+    keys = list(r.scan_iter(match=k_presence(args.room, "*")))
+    vals = r.mget(keys) if keys else []
+    present = [{"agent": k.rsplit(":", 1)[-1], "last_seen": v}
+               for k, v in zip(keys, vals)]
+    present.sort(key=lambda a: a["agent"])
+    if args.json:
+        print(json.dumps(present))
+    else:
+        if not present:
+            print(f"(no agents present in room={args.room})")
+        for a in present:
+            print(f"{a['agent']}\tlast_seen={a['last_seen']}")
+    return 0
+
+
+def announce(r, room, frm, body, topic=""):
+    r.xadd(k_stream(room), make_fields(frm, "all", body, kind="system", topic=topic))
+
+
+def cmd_claim(r, args):
+    """Atomic claim: Redis SET NX wins the race, gh label is the durable record."""
+    lock = k_lock(args.issue)
+    # Defense against an expired Redis lock: if gh already shows the issue
+    # claimed, refuse even though SET NX would succeed. The label outlives the
+    # lock TTL, so this stops a second agent double-claiming a long-running task.
+    labels = issue_labels(args.issue)
+    if labels is None:
+        # couldn't read labels -> the cross-check can't run; fall back to the
+        # Redis lock alone (the baseline race arbiter) and say so.
+        sys.stderr.write(f"warning: could not read labels on #{args.issue}; "
+                         f"relying on the Redis lock only for this claim\n")
+    elif "status:claimed" in labels:
+        held = r.get(lock)
+        if held and held != args.as_agent:
+            sys.stderr.write(f"issue #{args.issue} already claimed by {held} (label set)\n")
+            return 1
+        if not held:
+            sys.stderr.write(
+                f"issue #{args.issue} is labelled status:claimed but the lock expired; "
+                f"resolve manually (bus release/status) before reclaiming\n")
+            return 1
+    won = r.set(lock, args.as_agent, nx=True, ex=args.ttl)
+    if not won:
+        holder = r.get(lock)
+        if holder == args.as_agent:
+            print(f"you ({args.as_agent}) already hold issue #{args.issue}")
+            return 0
+        sys.stderr.write(f"issue #{args.issue} already claimed by {holder}\n")
+        return 1
+    # If --worktree, set up isolation BEFORE writing the gh label, so a failure
+    # rolls the claim back cleanly — an agent must never hold a claim with no
+    # worktree and then silently work the coordinator's main tree.
+    if getattr(args, "worktree", False):
+        rc, path = ws_create(r, args.room, args.as_agent, args.issue, base=args.base)
+        if rc != 0:
+            r.delete(lock)
+            sys.stderr.write(f"bus claim: worktree setup failed; rolled back the claim on #{args.issue}\n")
+            return 1
+    # We won the lock. Reflect to gh + announce. If gh fails, keep the lock
+    # (the announce still tells others), but surface the error.
+    err = None
+    try:
+        set_status_label(args.issue, "status:claimed")
+        gh(["issue", "comment", str(args.issue),
+            "--body", f"Claimed by `{args.as_agent}` via bus at {now_iso()}."], check=False)
+    except Exception as e:  # noqa: BLE001 - report and continue
+        err = str(e)
+    announce(r, args.room, args.as_agent,
+             f"claimed issue #{args.issue}", topic=f"issue-{args.issue}")
+    print(f"{args.as_agent} claimed issue #{args.issue}")
+    if err:
+        sys.stderr.write(f"warning: lock held but gh update failed: {err}\n")
+    return 0
+
+
+def require_holder(r, issue, agent, verb):
+    """Return the lock key if `agent` holds the claim, else write an error and
+    return None. Shared ownership guard for release/renew."""
+    lock = k_lock(issue)
+    holder = r.get(lock)
+    if holder != agent:
+        sys.stderr.write(
+            f"cannot {verb} #{issue}: held by {holder or '(nobody)'}, not {agent}\n")
+        return None
+    return lock
+
+
+def cmd_release(r, args):
+    lock = require_holder(r, args.issue, args.as_agent, "release")
+    if not lock:
+        return 1
+    r.delete(lock)
+    # We drop the lock but intentionally leave the status label as-is: releasing
+    # gives up ownership without erasing the progress already recorded on the issue.
+    announce(r, args.room, args.as_agent,
+             f"released issue #{args.issue}", topic=f"issue-{args.issue}")
+    print(f"{args.as_agent} released issue #{args.issue}")
+    return 0
+
+
+def cmd_status(r, args):
+    set_status_label(args.issue, args.set)
+    gh(["issue", "comment", str(args.issue),
+        "--body", f"Status -> `{args.set}` by `{args.as_agent}` at {now_iso()}."], check=False)
+    # a status update is a sign of life -> renew the claim lock if we hold it
+    lock = k_lock(args.issue)
+    if r.get(lock) == args.as_agent:
+        r.expire(lock, args.ttl)
+    announce(r, args.room, args.as_agent,
+             f"issue #{args.issue} -> {args.set}", topic=f"issue-{args.issue}")
+    print(f"issue #{args.issue} -> {args.set}")
+    return 0
+
+
+def cmd_renew(r, args):
+    """Extend the claim lock TTL. Only the holder may renew. Guards long tasks."""
+    lock = require_holder(r, args.issue, args.as_agent, "renew")
+    if not lock:
+        return 1
+    r.expire(lock, args.ttl)
+    print(f"{args.as_agent} renewed claim on #{args.issue} (+{args.ttl}s)")
+    return 0
+
+
+# distinct colors so the six phases are visually separable in the gh UI
+_LABEL_COLORS = {
+    "status:open": "ededed", "status:claimed": "fbca04",
+    "status:pr-open": "1d76db", "status:merged": "5319e7",
+    "status:deployed": "0e8a16", "status:verified": "0052cc",
+}
+
+
+def cmd_init(args):
+    """Create the status:* labels in the target repo (idempotent via --force)."""
+    if not GH_REPO:
+        sys.stderr.write("bus init: set BUS_GH_REPO=owner/repo first\n")
+        return 2
+    for label in STATUS_LABELS:
+        gh(["label", "create", label, "--color", _LABEL_COLORS[label],
+            "--description", "bus task state", "--force"], check=False)
+        print(f"ensured label {label}")
+    return 0
+
+
+def cmd_doctor(r_url):
+    ok = True
+    # Redis
+    try:
+        r = connect(r_url)
+        print(f"redis: OK ({r_url})")
+    except Exception as e:  # noqa: BLE001
+        print(f"redis: FAIL ({r_url}) -> {e}")
+        print("  start it: ./scripts/start-redis.sh   (or: brew services start redis)")
+        ok = False
+    # gh
+    rc, out, err = gh(["auth", "status"], check=False)
+    if rc == 0:
+        print("gh: OK (authenticated)")
+    else:
+        print(f"gh: FAIL -> {err or out}")
+        ok = False
+    try:
+        print(f"worktree root: {worktree_root(main_repo_dir())}")
+    except Exception:  # noqa: BLE001
+        print("worktree root: unavailable")
+    try:
+        p = subprocess.run(["git", "--version"], capture_output=True, text=True)
+        git_version = p.stdout.splitlines()[0] if p.returncode == 0 and p.stdout else "not found"
+    except Exception:  # noqa: BLE001
+        git_version = "not found"
+    print(f"git: {git_version}")
+    return 0 if ok else 1
+
+
+# ---- worktree commands -----------------------------------------------------
+
+def _ws_meta(r, issue):
+    raw = r.get(k_worktree(issue))
+    return json.loads(raw) if raw else None
+
+
+def _iter_ws_meta(r):
+    """Yield every registered worktree's metadata dict, skipping malformed or
+    legacy entries (missing required keys). Shared by ws list and reap."""
+    for key in r.scan_iter(match="bus:worktree:issue:*"):
+        raw = r.get(key)
+        try:
+            m = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if all(k in m for k in ("issue", "agent", "path", "branch", "base_commit")):
+            yield m
+
+
+def ws_create(r, room, agent, issue, base="dev", branch_type="feat",
+              allow_stale=False, allow_nested=False):
+    """Core of `ws create` / `claim --worktree`. Returns (rc, path_or_None)."""
+    if r.get(k_lock(issue)) != agent:
+        sys.stderr.write(f"bus ws create: you ({agent}) must hold the claim on #{issue} "
+                         f"(run `bus claim --as {agent} --issue {issue}`) first\n")
+        return 1, None
+    meta = _ws_meta(r, issue)
+    if meta:
+        if meta["agent"] == agent and os.path.isdir(meta["path"]):
+            return 0, meta["path"]  # resume
+        if meta["agent"] != agent:
+            sys.stderr.write(f"bus ws create: #{issue} worktree belongs to {meta['agent']} at "
+                             f"{meta['path']}; resolve (ws remove) before reclaiming\n")
+            return 1, None
+        # same agent but the dir is gone -> stale metadata, fall through to recreate
+    try:
+        main = main_repo_dir()
+    except RuntimeError as e:
+        sys.stderr.write(f"bus ws create: {e}\n")
+        return 1, None
+    root = worktree_root(main)
+    if path_under(root, main) and not allow_nested:
+        sys.stderr.write(f"bus ws create: worktree root {root} is inside the repo {main}; "
+                         f"use a sibling dir or pass --allow-nested\n")
+        return 1, None
+    # A leading '-' would be parsed as a git flag (e.g. base='-p' -> `git fetch
+    # origin -p` prunes refs). `ident` and check-ref-format both allow it, so
+    # reject it explicitly here — never let base/type become an option token.
+    if base.startswith("-") or branch_type.startswith("-"):
+        sys.stderr.write(f"bus ws create: base/type must not start with '-' (base={base}, type={branch_type})\n")
+        return 1, None
+    branch = f"{branch_type}/issue-{issue}-{agent}"
+    if not valid_git_ref(main, base) or not valid_git_ref(main, branch):
+        sys.stderr.write(f"bus ws create: invalid base/branch ref (base={base}, branch={branch})\n")
+        return 1, None
+    rc, _, err = git(main, "fetch", "origin", base, check=False)
+    if rc != 0 and not allow_stale:
+        sys.stderr.write(f"bus ws create: `git fetch origin {base}` failed ({err}); refusing to "
+                         f"cut from a possibly-stale base. Fix the network or pass --allow-stale.\n")
+        return 1, None
+    rc, base_commit, _ = git(main, "rev-parse", "--verify", f"origin/{base}", check=False)
+    if rc != 0:
+        sys.stderr.write(f"bus ws create: base origin/{base} not found\n")
+        return 1, None
+    rc, _, _ = git(main, "rev-parse", "--verify", f"refs/heads/{branch}", check=False)
+    if rc == 0:
+        sys.stderr.write(f"bus ws create: branch {branch} already exists (leftover worktree?); "
+                         f"remove it first\n")
+        return 1, None
+    os.makedirs(root, exist_ok=True)
+    path = os.path.abspath(os.path.join(root, f"issue-{issue}-{agent}"))
+    rc, _, err = git(main, "worktree", "add", path, "-b", branch, f"origin/{base}", check=False)
+    if rc != 0:
+        sys.stderr.write(f"bus ws create: git worktree add failed: {err}\n")
+        return 1, None
+    r.set(k_worktree(issue), json.dumps({
+        "issue": issue, "agent": agent, "path": path, "branch": branch,
+        "base": base, "base_commit": base_commit, "created_at": now_iso()}))
+    announce(r, room, agent, f"created worktree for #{issue} at {path} (branch {branch})",
+             topic=f"issue-{issue}")
+    return 0, path
+
+
+def cmd_ws_create(r, args):
+    rc, path = ws_create(r, args.room, args.as_agent, args.issue, base=args.base,
+                         branch_type=args.type, allow_stale=args.allow_stale,
+                         allow_nested=args.allow_nested)
+    if rc == 0:
+        print(path)
+    return rc
+
+
+def cmd_ws_path(r, args):
+    meta = _ws_meta(r, args.issue)
+    if not meta:
+        sys.stderr.write(f"bus ws path: no worktree for #{args.issue}\n")
+        return 1
+    print(meta["path"])
+    return 0
+
+
+def cmd_ws_list(r, args):
+    present_set = {k.rsplit(":", 1)[-1] for k in r.scan_iter(match="bus:presence:*")}
+    rows = []
+    for m in _iter_ws_meta(r):
+        path, exists = m["path"], os.path.isdir(m["path"])
+        dirty = "gone" if not exists else ("yes" if worktree_dirty(path) else "-")
+        unpushed = "yes" if exists and worktree_unpushed(path, m["base_commit"]) else "-"
+        present = "yes" if m["agent"] in present_set else "no"
+        rows.append((m["issue"], m["agent"], m["branch"], path, dirty, unpushed, present))
+    rows.sort(key=lambda x: int(x[0]) if str(x[0]).isdigit() else 0)
+    if args.json:
+        print(json.dumps([{"issue": i, "agent": a, "branch": b, "path": p,
+                           "dirty": d, "unpushed": u, "present": pr}
+                          for i, a, b, p, d, u, pr in rows]))
+        return 0
+    if not rows:
+        print("(no agent worktrees)")
+        return 0
+    print(f"{'ISSUE':<6} {'AGENT':<12} {'BRANCH':<26} {'DIRTY':<6} {'UNPUSH':<7} {'PRES':<4} PATH")
+    for i, a, b, p, d, u, pr in rows:
+        print(f"#{str(i):<5} {terminal_line(a):<12} {terminal_line(b):<26} "
+              f"{d:<6} {u:<7} {pr:<4} {terminal_line(p)}")
+    return 0
+
+
+def cmd_ws_remove(r, args):
+    meta = _ws_meta(r, args.issue)
+    if not meta:
+        sys.stderr.write(f"bus ws remove: no worktree for #{args.issue}\n")
+        return 1
+    if meta["agent"] != args.as_agent and not args.force:
+        sys.stderr.write(f"bus ws remove: #{args.issue} worktree belongs to {meta['agent']}, "
+                         f"not {args.as_agent}; --force to override\n")
+        return 1
+    path = meta["path"]
+    try:
+        main = main_repo_dir()
+        root = worktree_root(main)
+    except RuntimeError as e:
+        sys.stderr.write(f"bus ws remove: {e}\n")
+        return 1
+    # only ever remove a registered path under our own worktree root
+    if not path_under(path, root):
+        sys.stderr.write(f"bus ws remove: refusing — {path} is not under the worktree root {root}\n")
+        return 1
+    if path_under(os.getcwd(), path):
+        sys.stderr.write(f"bus ws remove: you are inside {path}; run from the main tree\n")
+        return 1
+    if os.path.isdir(path) and not args.force:
+        if worktree_dirty(path):
+            sys.stderr.write(f"bus ws remove: #{args.issue} has uncommitted changes; "
+                             f"commit/stash or --force to discard\n")
+            return 1
+        if worktree_unpushed(path, meta["base_commit"]):
+            sys.stderr.write(f"bus ws remove: #{args.issue} has unpushed commits; "
+                             f"push first or --force to discard\n")
+            return 1
+    rm = ["worktree", "remove", path] + (["--force"] if args.force else [])
+    rc, _, err = git(main, *rm, check=False)
+    if rc != 0 and os.path.isdir(path):
+        sys.stderr.write(f"bus ws remove: git worktree remove failed: {err}\n")
+        return 1
+    r.delete(k_worktree(args.issue))
+    announce(r, args.room, args.as_agent, f"removed worktree for #{args.issue}",
+             topic=f"issue-{args.issue}")
+    print(f"removed worktree for #{args.issue} ({path})")
+    return 0
+
+
+def cmd_ws(r, args):
+    return {"create": cmd_ws_create, "path": cmd_ws_path,
+            "list": cmd_ws_list, "remove": cmd_ws_remove}[args.ws_cmd](r, args)
+
+
+# ---- huddle commands (stage 1 of #22) --------------------------------------
+# A huddle is collaborative co-work on ONE issue (many agents, one branch). This
+# stage is session lifecycle ONLY: open/join/status/close + metadata. Pen
+# adjudication, critique, signoff and the done-gate are deferred to later stages.
+
+def huddle_holder(issue):
+    """Lock value the huddle holds bus:lock:issue:N as. Deliberately NOT an agent
+    id: it makes a solo `bus claim` refuse (cmd_claim sees status:claimed + a lock
+    held by someone other than the claimer) while the huddle session is alive."""
+    return f"huddle:issue-{issue}"
+
+
+def huddle_branch(issue):
+    return f"huddle/issue-{issue}"
+
+
+def _huddle_meta(r, issue):
+    raw = r.get(k_huddle(issue))
+    return json.loads(raw) if raw else None
+
+
+def create_shared_branch(main, base, branch, allow_stale=False):
+    """Push an empty `branch` at origin/`base`'s tip. Returns (rc, base_commit_or_err).
+    No worktree is created here — per-driver worktrees are a later (pen) stage."""
+    if base.startswith("-"):
+        return 1, "base must not start with '-'"
+    if not valid_git_ref(main, base) or not valid_git_ref(main, branch):
+        return 1, f"invalid base/branch ref (base={base}, branch={branch})"
+    rc, _, err = git(main, "fetch", "origin", base, check=False)
+    if rc != 0 and not allow_stale:
+        return 1, (f"`git fetch origin {base}` failed ({err}); refusing to cut from a "
+                   f"possibly-stale base. Fix the network or pass --allow-stale.")
+    rc, base_commit, _ = git(main, "rev-parse", "--verify", f"origin/{base}", check=False)
+    if rc != 0:
+        return 1, f"base origin/{base} not found"
+    rc, out, _ = git(main, "ls-remote", "--heads", "origin", branch, check=False)
+    if rc == 0 and out.strip():
+        return 1, f"remote branch {branch} already exists (leftover huddle?); remove it first"
+    rc, _, err = git(main, "push", "origin", f"{base_commit}:refs/heads/{branch}", check=False)
+    if rc != 0:
+        return 1, f"git push {branch} failed: {err}"
+    return 0, base_commit
+
+
+def cmd_huddle_open(r, args):
+    """Open a huddle: take the issue lock as the huddle session, create the shared
+    branch off origin/<base>, mark the issue claimed, record metadata, announce."""
+    issue = args.issue
+    lock = k_lock(issue)
+    branch = huddle_branch(issue)
+    # Metadata has no TTL and outlives the lock; if it's present a huddle already
+    # exists (or a prior one wasn't closed) — refuse before touching the lock.
+    if _huddle_meta(r, issue):
+        sys.stderr.write(f"bus huddle open: #{issue} already has an active huddle "
+                         f"(run `bus huddle close` to end it)\n")
+        return 1
+    try:
+        main = main_repo_dir()
+    except RuntimeError as e:
+        sys.stderr.write(f"bus huddle open: {e}\n")
+        return 1
+    # Defense against an expired solo lock: if gh already shows the issue
+    # claimed but the Redis lock has lapsed, refuse — the durable label outlives
+    # the TTL, so a solo `bus claim` in flight must not be stolen by a huddle
+    # (mirrors cmd_claim's cross-check).
+    labels = issue_labels(issue)
+    if labels is None:
+        sys.stderr.write(f"warning: could not read labels on #{issue}; relying on "
+                         f"the Redis lock only for this huddle open\n")
+    elif "status:claimed" in labels:
+        held = r.get(lock)
+        if held and not is_session_holder(held):
+            sys.stderr.write(f"bus huddle open: #{issue} already claimed by {held} "
+                             f"(label set)\n")
+            return 1
+        if not held:
+            sys.stderr.write(
+                f"bus huddle open: #{issue} is labelled status:claimed but the lock "
+                f"expired; resolve manually (bus release/status) before opening a huddle\n")
+            return 1
+    # UNIQUE session token, not the deterministic huddle:issue-N — so a lock
+    # re-taken by a *different* session after our TTL lapses is distinguishable
+    # (the deterministic value would look identical and defeat compare-and-delete).
+    session = f"huddle:issue-{issue}:{os.urandom(4).hex()}"
+    won = r.set(lock, session, nx=True, ex=args.ttl)
+    if not won:
+        sys.stderr.write(f"bus huddle open: issue #{issue} already locked by {r.get(lock)}\n")
+        return 1
+    # Set up the shared branch BEFORE the gh label, so a failure rolls the lock
+    # back cleanly — no huddle should hold the issue lock with no branch.
+    rc, val = create_shared_branch(main, args.base, branch, allow_stale=args.allow_stale)
+    if rc != 0:
+        # Compare-and-delete, not a blind delete: if our short TTL already lapsed
+        # and another session re-took the lock, a plain delete would nuke THEIRS.
+        compare_delete_lock(r, issue, session)
+        sys.stderr.write(f"bus huddle open: {val}; rolled back the lock on #{issue}\n")
+        return 1
+    # create_shared_branch does slow network I/O (fetch/push). If our short TTL
+    # lapsed during it and another session took the lock, we must NOT write our
+    # metadata over theirs. Re-verify we still hold our OWN session token first.
+    if r.get(lock) != session:
+        sys.stderr.write(f"bus huddle open: lost the #{issue} lock during branch setup "
+                         f"(TTL lapsed, re-taken by {r.get(lock)}); aborting without "
+                         f"clobbering — retry. (branch {branch} may be an orphan)\n")
+        return 1
+    base_commit = val
+    r.set(k_huddle(issue), json.dumps({
+        "issue": issue, "opener": args.as_agent, "participants": [args.as_agent],
+        "driver": args.as_agent, "branch": branch, "base": args.base,
+        "base_commit": base_commit, "session": session, "status": "open",
+        "created_at": now_iso()}))
+    r.set(k_pen(issue), args.as_agent)  # opener holds the write pen initially
+    touch_presence(r, args.room, args.as_agent)
+    # gh is best-effort: the lock + branch + metadata already exist, so a gh
+    # outage must not abort a live huddle (mirrors cmd_claim).
+    err = None
+    try:
+        set_status_label(issue, "status:claimed")
+        gh(["issue", "comment", str(issue),
+            "--body", f"Huddle opened by `{args.as_agent}` via bus at {now_iso()} "
+                      f"(branch `{branch}`)."], check=False)
+    except Exception as e:  # noqa: BLE001 - report and continue
+        err = str(e)
+    announce(r, args.room, args.as_agent,
+             f"opened huddle on #{issue} (branch {branch}, driver {args.as_agent})",
+             topic=f"issue-{issue}")
+    print(f"{args.as_agent} opened huddle on #{issue} (branch {branch})")
+    if err:
+        sys.stderr.write(f"warning: huddle open but gh update failed: {err}\n")
+    return 0
+
+
+def cmd_huddle_join(r, args):
+    """Add the agent to the huddle participants. Open join for stage 1 (admission
+    rule deferred). A WATCH/MULTI loop makes concurrent joins safe (no lost add)."""
+    issue = args.issue
+    key = k_huddle(issue)
+    # Refuse to append to a zombie: metadata has no TTL, so it can outlive a
+    # lapsed (expired/reaped) session lock. If the lock is gone the huddle is
+    # dead — don't join it. Advisory (pen/write-authority is deferred), so the
+    # benign TOCTOU between this check and the add just appends to metadata.
+    raw0 = r.get(key)
+    if not raw0:
+        sys.stderr.write(f"bus huddle join: no huddle on #{issue}\n")
+        return 1
+    session = json.loads(raw0).get("session", huddle_holder(issue))
+    if r.get(k_lock(issue)) != session:
+        sys.stderr.write(f"bus huddle join: #{issue}'s huddle lock is gone "
+                         f"(expired or reaped); ask the opener to reopen it\n")
+        return 1
+    with r.pipeline() as pipe:
+        while True:
+            try:
+                pipe.watch(key)
+                raw = pipe.get(key)
+                if not raw:
+                    pipe.unwatch()
+                    sys.stderr.write(f"bus huddle join: no huddle on #{issue}\n")
+                    return 1
+                meta = json.loads(raw)
+                if args.as_agent in meta["participants"]:
+                    pipe.unwatch()
+                    break
+                meta["participants"].append(args.as_agent)
+                pipe.multi()
+                pipe.set(key, json.dumps(meta))
+                pipe.execute()
+                break
+            except redis.WatchError:
+                continue  # another join landed between watch and exec; retry
+    touch_presence(r, args.room, args.as_agent)
+    announce(r, args.room, args.as_agent, f"joined huddle on #{issue}",
+             topic=f"issue-{issue}")
+    print(f"{args.as_agent} joined huddle on #{issue}")
+    return 0
+
+
+def cmd_huddle_status(r, args):
+    meta = _huddle_meta(r, args.issue)
+    if not meta:
+        sys.stderr.write(f"bus huddle status: no huddle on #{args.issue}\n")
+        return 1
+    if args.json:
+        print(json.dumps(meta))
+        return 0
+    print(f"huddle #{terminal_line(str(meta['issue']))}  status={terminal_line(meta['status'])}")
+    print(f"  opener:       {terminal_line(meta['opener'])}")
+    print(f"  driver:       {terminal_line(meta['driver'])}")
+    print(f"  branch:       {terminal_line(meta['branch'])}")
+    print(f"  participants: {', '.join(terminal_line(p) for p in meta['participants'])}")
+    return 0
+
+
+def cmd_huddle_close(r, args):
+    """Close the huddle: mark the issue pr-open, drop the lock + metadata. Gated
+    by the DONE-GATE — every present participant signed off at the current tip and
+    no open blocks — unless --force. Participant-only (stops a bystander closing)."""
+    issue = args.issue
+    meta = _huddle_meta(r, issue)
+    if not meta:
+        sys.stderr.write(f"bus huddle close: no huddle on #{issue}\n")
+        return 1
+    if args.as_agent not in meta["participants"]:
+        sys.stderr.write(f"bus huddle close: {args.as_agent} is not a participant of "
+                         f"#{issue}'s huddle; only participants may close\n")
+        return 1
+    touch_presence(r, args.room, args.as_agent)
+    # DONE-GATE (stage 3): the GROUP owns "perfect" — refuse to close until the
+    # closer + every present participant has signed off at the current tip and no
+    # block is open.
+    if not getattr(args, "force", False):
+        ok, reasons = donegate(r, issue, meta, args.as_agent)
+        if not ok:
+            sys.stderr.write(f"bus huddle close: #{issue} not done — {len(reasons)} open:\n")
+            for why in reasons:
+                sys.stderr.write(f"  - {why}\n")
+            sys.stderr.write("  resolve, or `--force` to close anyway.\n")
+            return 1
+    # Advance the label ONLY if we still legitimately hold the session lock.
+    # compare_delete_lock returns 1 iff the lock was ours (atomic, no TOCTOU); a
+    # 0 means it already expired or was reaped — possibly re-acquired by someone
+    # else — so advancing status:pr-open would clobber their state. Either way we
+    # ALWAYS clear the metadata: close is the only orphan-cleanup path and must
+    # never leave meta behind (meta has no TTL; the lock does).
+    owned = compare_delete_lock(r, issue, meta.get("session", huddle_holder(issue)))
+    err = None
+    if owned:
+        try:
+            set_status_label(issue, "status:pr-open")
+            gh(["issue", "comment", str(issue),
+                "--body", f"Huddle closed by `{args.as_agent}` via bus at {now_iso()}."],
+               check=False)
+        except Exception as e:  # noqa: BLE001 - report and continue
+            err = str(e)
+    r.delete(k_huddle(issue), k_pen(issue), k_penchal(issue),
+             k_signoff(issue), k_block(issue))  # all huddle state dies with it
+    announce(r, args.room, args.as_agent, f"closed huddle on #{issue}",
+             topic=f"issue-{issue}")
+    print(f"{args.as_agent} closed huddle on #{issue}")
+    if not owned:
+        sys.stderr.write(f"warning: huddle #{issue} lock was already gone (expired or "
+                         f"reaped); cleared metadata but did NOT advance the status "
+                         f"label — set it manually if the issue still needs it\n")
+    elif err:
+        sys.stderr.write(f"warning: huddle closed but gh update failed: {err}\n")
+    return 0
+
+
+def huddle_worktree(main, issue, agent):
+    """Ensure `agent` has a per-driver worktree for the huddle, fast-forwarded to
+    the shared branch's tip. Per-driver worktrees give OS-level isolation (the
+    ratified design); the SHARED source of truth is origin/huddle/issue-N, which
+    only the pen holder pushes to. Returns the path, or None on error."""
+    root = worktree_root(main)
+    shared = huddle_branch(issue)                 # remote shared branch
+    local = f"hw-{issue}-{agent}"                 # this driver's local branch
+    path = os.path.join(root, f"huddle-{issue}-{agent}")
+    git(main, "fetch", "origin", shared, check=False)
+    rc, _, _ = git(main, "rev-parse", "--verify", f"origin/{shared}", check=False)
+    if rc != 0:
+        sys.stderr.write(f"huddle pen: shared branch origin/{shared} not found\n")
+        return None
+    if os.path.isdir(path):
+        # Sync to the shared tip, but NEVER lose work. Reset only when the tree is
+        # clean AND HEAD is an ancestor of the shared tip (a pure fast-forward —
+        # nothing local to lose). A clean tree can still hold committed-but-unpushed
+        # commits (e.g. a prior push failed); those are ahead of shared, so we skip
+        # the reset and warn rather than `reset --hard` them away.
+        rc, out, _ = git(path, "status", "--porcelain", check=False)
+        if not out.strip():
+            rc, _, _ = git(path, "merge-base", "--is-ancestor", "HEAD",
+                          f"origin/{shared}", check=False)
+            if rc == 0:
+                git(path, "reset", "--hard", f"origin/{shared}", check=False)
+            else:
+                sys.stderr.write(f"huddle pen: #{issue} worktree has local commits not "
+                                 f"on origin/{shared}; not resetting (push them first)\n")
+        return path
+    os.makedirs(root, exist_ok=True)
+    rc, _, err = git(main, "worktree", "add", path, "-B", local, f"origin/{shared}", check=False)
+    if rc != 0:
+        sys.stderr.write(f"huddle pen: worktree add failed: {err}\n")
+        return None
+    return path
+
+
+def _require_pen(r, issue, agent, verb):
+    holder = r.get(k_pen(issue))
+    if holder != agent:
+        sys.stderr.write(f"bus pen {verb}: you ({agent}) don't hold the pen on #{issue} "
+                         f"(holder: {holder or '(none)'})\n")
+        return False
+    return True
+
+
+def cmd_pen_status(r, args):
+    issue = args.issue
+    holder = r.get(k_pen(issue))
+    if not holder:
+        sys.stderr.write(f"bus pen status: no pen on #{issue} (no active huddle?)\n")
+        return 1
+    tip = "?"
+    try:
+        main = main_repo_dir()
+        git(main, "fetch", "origin", huddle_branch(issue), check=False)
+        rc, out, _ = git(main, "rev-parse", "--short", f"origin/{huddle_branch(issue)}", check=False)
+        if rc == 0:
+            tip = out
+    except RuntimeError:
+        pass
+    if args.json:
+        print(json.dumps({"issue": issue, "holder": holder, "branch": huddle_branch(issue), "tip": tip}))
+    else:
+        print(f"pen #{issue}: holder={terminal_line(holder)}  branch={huddle_branch(issue)}  tip={tip}")
+    return 0
+
+
+def cmd_pen_checkpoint(r, args):
+    """Pen holder: stage + commit + push WIP to the shared branch (one command —
+    MB-SPEED: no manual git ceremony). Fast-forward push; the pen guarantees a
+    single writer so it stays linear."""
+    issue = args.issue
+    if not _require_pen(r, issue, args.as_agent, "checkpoint"):
+        return 1
+    touch_presence(r, args.room, args.as_agent)  # driving = live (not force-takeable)
+    try:
+        main = main_repo_dir()
+    except RuntimeError as e:
+        sys.stderr.write(f"bus pen checkpoint: {e}\n")
+        return 1
+    path = huddle_worktree(main, issue, args.as_agent)
+    if not path:
+        return 1
+    git(path, "add", "-A", check=False)
+    rc, _, _ = git(path, "diff", "--cached", "--quiet", check=False)
+    if rc != 0:  # staged changes -> commit them
+        git(path, "-c", f"user.email={args.as_agent}@bus", "-c", f"user.name={args.as_agent}",
+            "commit", "-m", f"wip: #{issue} checkpoint by {args.as_agent}", check=False)
+    # nothing to send only if HEAD is already at/behind the shared tip (no new
+    # commit AND no prior committed-but-unpushed work).
+    rc, _, _ = git(path, "merge-base", "--is-ancestor", "HEAD",
+                  f"origin/{huddle_branch(issue)}", check=False)
+    if rc == 0:
+        print(f"pen checkpoint: nothing to commit on #{issue}")
+        return 0
+    # push HEAD to the shared branch (fast-forward — flushes a fresh commit AND
+    # any prior unpushed commits a retry is recovering).
+    rc, _, err = git(path, "push", "origin", f"HEAD:{huddle_branch(issue)}", check=False)
+    if rc != 0:
+        sys.stderr.write(f"bus pen checkpoint: push failed (not fast-forward? another "
+                         f"writer pushed — the pen was violated): {err}\n")
+        return 1
+    rc, tip, _ = git(path, "rev-parse", "--short", "HEAD", check=False)
+    announce(r, args.room, args.as_agent, f"checkpointed #{issue} (tip {tip})",
+             topic=f"issue-{issue}")
+    print(f"{args.as_agent} checkpointed #{issue} to {huddle_branch(issue)} (tip {tip})")
+    return 0
+
+
+def cmd_pen_pass(r, args):
+    """Hand the pen to another participant. Commit+push our WIP FIRST (no
+    uncommitted work crosses a handoff), then move the pen. Only the current
+    holder may pass; only to a huddle participant."""
+    issue = args.issue
+    if not _require_pen(r, issue, args.as_agent, "pass"):
+        return 1
+    touch_presence(r, args.room, args.as_agent)
+    meta = _huddle_meta(r, issue)
+    if not meta:
+        sys.stderr.write(f"bus pen pass: no huddle on #{issue}\n")
+        return 1
+    if args.to not in meta["participants"]:
+        sys.stderr.write(f"bus pen pass: {args.to} is not a participant of #{issue}'s "
+                         f"huddle (they must `bus huddle join` first)\n")
+        return 1
+    # checkpoint our work before the handoff; ABORT if it fails to push, so we
+    # never move the pen with committed work stranded off the shared branch.
+    if cmd_pen_checkpoint(r, args) != 0:
+        sys.stderr.write(f"bus pen pass: checkpoint failed to push; keeping the pen with "
+                         f"{args.as_agent}. Fix the push, then retry the pass.\n")
+        return 1
+    r.set(k_pen(issue), args.to)
+    meta["driver"] = args.to
+    r.set(k_huddle(issue), json.dumps(meta))
+    r.delete(k_penchal(issue))  # a pass settles any open challenge (concession)
+    announce(r, args.room, args.as_agent, f"passed the pen on #{issue} to {args.to}",
+             topic=f"issue-{issue}")
+    print(f"{args.as_agent} passed the pen on #{issue} to {args.to}")
+    return 0
+
+
+def cmd_pen_take(r, args):
+    """Challenge for the pen (dynamic lead). `--reason` is required evidence.
+    If the current driver is ABSENT (no presence anywhere), take it over now at
+    the last pushed tip — a vanished driver never blocks progress. If the driver
+    is PRESENT, this only RECORDS the challenge (never a hostile steal — the reap
+    lesson: idle≠dead); the driver must `pen pass` (concede) or `pen deny`."""
+    issue = args.issue
+    meta = _huddle_meta(r, issue)
+    if not meta:
+        sys.stderr.write(f"bus pen take: no huddle on #{issue}\n")
+        return 1
+    if args.as_agent not in meta["participants"]:
+        sys.stderr.write(f"bus pen take: you must be a huddle participant first "
+                         f"(`bus huddle join`)\n")
+        return 1
+    touch_presence(r, args.room, args.as_agent)  # taking part keeps you live
+    driver = r.get(k_pen(issue))
+    if driver == args.as_agent:
+        print(f"you ({args.as_agent}) already hold the pen on #{issue}")
+        return 0
+    raw = r.get(k_penchal(issue))
+    chal = json.loads(raw) if raw else None
+    driver_absent = not _holder_present(r, driver)
+    # Force-take ONLY when the driver is absent AND this challenger's challenge has
+    # aged past the grace window. Absent-presence alone is too weak (idle≠dead, the
+    # reap lesson) — and pen ops now refresh presence, so an actively-driving agent
+    # stays live and can't be taken from. The grace gives a driver whose presence
+    # merely lapsed time to reappear (any op re-touches presence).
+    if driver_absent and chal and chal.get("challenger") == args.as_agent:
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(chal["ts"])).total_seconds()
+        if age >= PEN_TAKE_GRACE:
+            r.set(k_pen(issue), args.as_agent)
+            meta["driver"] = args.as_agent
+            r.set(k_huddle(issue), json.dumps(meta))
+            r.delete(k_penchal(issue))
+            announce(r, args.room, args.as_agent,
+                     f"took the pen on #{issue} (driver {driver} absent past grace)",
+                     topic=f"issue-{issue}")
+            print(f"{args.as_agent} took the pen on #{issue} (driver {driver} absent past grace)")
+            return 0
+    # otherwise record/refresh the challenge (never an instant steal)
+    r.set(k_penchal(issue), json.dumps(
+        {"challenger": args.as_agent, "reason": args.reason, "ts": now_iso()}))
+    if driver_absent:
+        announce(r, args.room, args.as_agent,
+                 f"challenges for the pen on #{issue} (driver {driver} absent; reason: "
+                 f"{args.reason}). Re-run `pen take` after {PEN_TAKE_GRACE}s to force if "
+                 f"{driver} doesn't return.", topic=f"issue-{issue}")
+        print(f"{args.as_agent} challenged #{issue}; driver absent — force-take available "
+              f"in {PEN_TAKE_GRACE}s")
+    else:
+        announce(r, args.room, args.as_agent,
+                 f"challenges for the pen on #{issue} (reason: {args.reason}). "
+                 f"driver {driver} must `pen pass --to {args.as_agent}` or `pen deny`.",
+                 topic=f"issue-{issue}")
+        print(f"{args.as_agent} challenged for the pen on #{issue}; driver {driver} must respond")
+    return 0
+
+
+def cmd_pen_deny(r, args):
+    """Current driver rejects an open pen challenge, keeping the pen."""
+    issue = args.issue
+    if not _require_pen(r, issue, args.as_agent, "deny"):
+        return 1
+    touch_presence(r, args.room, args.as_agent)
+    raw = r.get(k_penchal(issue))
+    if not raw:
+        sys.stderr.write(f"bus pen deny: no open challenge on #{issue}\n")
+        return 1
+    chal = json.loads(raw)
+    r.delete(k_penchal(issue))
+    announce(r, args.room, args.as_agent,
+             f"denied {chal['challenger']}'s pen challenge on #{issue} "
+             f"(reason: {args.reason}); keeps the pen.", topic=f"issue-{issue}")
+    print(f"{args.as_agent} denied the pen challenge on #{issue}")
+    return 0
+
+
+def cmd_pen(r, args):
+    return {"status": cmd_pen_status, "checkpoint": cmd_pen_checkpoint,
+            "pass": cmd_pen_pass, "take": cmd_pen_take, "deny": cmd_pen_deny}[args.pen_cmd](r, args)
+
+
+def _shared_tip(issue):
+    """Full SHA of the shared branch tip, or None."""
+    try:
+        main = main_repo_dir()
+    except RuntimeError:
+        return None
+    git(main, "fetch", "origin", huddle_branch(issue), check=False)
+    rc, out, _ = git(main, "rev-parse", f"origin/{huddle_branch(issue)}", check=False)
+    return out if rc == 0 else None
+
+
+def _mutate_json(r, key, fn, default):
+    """WATCH/MULTI read-modify-write of a JSON value at `key`; retries on a
+    concurrent write so a block/signoff isn't lost to a lost-update race."""
+    with r.pipeline() as pipe:
+        while True:
+            try:
+                pipe.watch(key)
+                raw = pipe.get(key)
+                new = fn(json.loads(raw) if raw else default)
+                pipe.multi()
+                pipe.set(key, json.dumps(new))
+                pipe.execute()
+                return new
+            except redis.WatchError:
+                continue
+
+
+def cmd_signoff(r, args):
+    """Sign off on the huddle's current shared tip (or --block it). Sign-offs pin
+    the tip SHA: any later checkpoint (push) makes them stale, so the done-gate
+    can't be gamed by signing good code then pushing a poison commit."""
+    issue = args.issue
+    meta = _huddle_meta(r, issue)
+    if not meta:
+        sys.stderr.write(f"bus signoff: no huddle on #{issue}\n")
+        return 1
+    if args.as_agent not in meta["participants"]:
+        sys.stderr.write(f"bus signoff: you must be a huddle participant\n")
+        return 1
+    touch_presence(r, args.room, args.as_agent)
+    if args.block:
+        _mutate_json(r, k_block(issue),
+                     lambda bl: [b for b in bl if b["agent"] != args.as_agent]
+                                + [{"agent": args.as_agent, "reason": args.block}], [])
+        announce(r, args.room, args.as_agent, f"BLOCKED #{issue}: {args.block}",
+                 topic=f"issue-{issue}")
+        print(f"{args.as_agent} blocked #{issue}: {terminal_line(args.block)}")
+        return 0
+    tip = _shared_tip(issue)
+    if not tip:
+        sys.stderr.write(f"bus signoff: cannot read the shared branch tip\n")
+        return 1
+    _mutate_json(r, k_signoff(issue), lambda s: {**s, args.as_agent: tip}, {})
+    announce(r, args.room, args.as_agent, f"signed off on #{issue} at {tip[:8]}",
+             topic=f"issue-{issue}")
+    print(f"{args.as_agent} signed off on #{issue} (tip {tip[:8]})")
+    return 0
+
+
+def cmd_unblock(r, args):
+    """Remove your own block from a huddle."""
+    issue = args.issue
+    removed = {"any": False}
+
+    def drop(bl):
+        kept = [b for b in bl if b["agent"] != args.as_agent]
+        removed["any"] = len(kept) != len(bl)
+        return kept
+
+    _mutate_json(r, k_block(issue), drop, [])
+    if not removed["any"]:
+        sys.stderr.write(f"bus unblock: you have no block on #{issue}\n")
+        return 1
+    announce(r, args.room, args.as_agent, f"lifted their block on #{issue}",
+             topic=f"issue-{issue}")
+    print(f"{args.as_agent} unblocked #{issue}")
+    return 0
+
+
+def donegate(r, issue, meta, closer):
+    """(ok, reasons). Done iff (a) the closing agent has signed off at the CURRENT
+    shared tip — a floor so a huddle can never close with zero sign-offs — and (b)
+    every OTHER present participant has too, and (c) no block is open. Absent
+    participants (idle≠dead) don't freeze the gate; an active block always counts."""
+    reasons = []
+    braw = r.get(k_block(issue))
+    for b in (json.loads(braw) if braw else []):
+        reasons.append(f"BLOCK by {b['agent']}: {b['reason']}")
+    tip = _shared_tip(issue)
+    if not tip:
+        return False, reasons + ["cannot read the shared branch tip"]
+    sraw = r.get(k_signoff(issue))
+    signs = json.loads(sraw) if sraw else {}
+    if signs.get(closer) != tip:
+        reasons.append(f"the closing agent {closer} must sign off at the current tip "
+                       f"{tip[:8]} (a huddle can't close with no sign-off)")
+    for p in meta["participants"]:
+        if p != closer and _holder_present(r, p) and signs.get(p) != tip:
+            reasons.append(f"{p} has not signed off at the current tip {tip[:8]}")
+    return (len(reasons) == 0), reasons
+
+
+def cmd_huddle(r, args):
+    return {"open": cmd_huddle_open, "join": cmd_huddle_join,
+            "status": cmd_huddle_status, "close": cmd_huddle_close}[args.huddle_cmd](r, args)
+
+
+# ---- argparse --------------------------------------------------------------
+
+TTL_HELP = "lock TTL seconds (default 8h)"
+
+# agent ids and room names become filename and Redis-key components, so keep
+# them to a safe charset (no path separators, no glob/':' key confusion).
+_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def ident(value):
+    if not _ID_RE.match(value):
+        raise argparse.ArgumentTypeError(
+            f"'{value}' must match [A-Za-z0-9._-]+ (no slashes/spaces/':')")
+    return value
+
+
+def positive_int(value):
+    if not value.isdigit() or int(value) < 1:
+        raise argparse.ArgumentTypeError(f"'{value}' must be a positive integer")
+    return int(value)
+
+
+def _as(parser):
+    parser.add_argument("--as", dest="as_agent", type=ident, required=True,
+                        help="your agent id")
+
+
+def _topic(parser):
+    parser.add_argument("--topic", type=ident, default=None,
+                        help="only deliver messages with this exact topic")
+
+
+def _issue(parser):
+    parser.add_argument("--issue", type=positive_int, required=True)
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="bus", description="Tiny durable multi-agent message bus (Redis Streams).")
+    p.add_argument("--url", default=DEFAULT_URL, help=f"Redis URL (default {DEFAULT_URL})")
+    p.add_argument("--room", default=DEFAULT_ROOM, type=ident, help=f"room/topic stream (default {DEFAULT_ROOM})")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.add_argument("--version", action="version", version="bus 0.1.0")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("send", help="publish a message")
+    s.add_argument("--from", dest="frm", type=ident, required=True, help="your agent id")
+    s.add_argument("--to", default="all", type=ident, help="recipient agent id or 'all' (default all)")
+    # default=None (not "") so argparse doesn't run `ident` on the empty default
+    # and reject a plain send with no topic; cmd_send maps None -> "".
+    s.add_argument("--topic", type=ident, default=None, help="optional topic slug, e.g. issue-42 (must be filter-safe: [A-Za-z0-9._-]+)")
+    s.add_argument("--reply-to", default="", help="message id you're replying to")
+    s.add_argument("--kind", default="msg", help="msg|question|answer|system (default msg)")
+    s.add_argument("body", nargs="?", help="message text, or '-' / piped stdin")
+
+    p_poll = sub.add_parser("poll", help="read new messages (non-blocking)")
+    _as(p_poll); _topic(p_poll)
+
+    w = sub.add_parser("wait", help="block until a message for you arrives")
+    _as(w); _topic(w)
+    w.add_argument("--timeout", type=float, default=30.0, help="seconds (default 30)")
+    w.add_argument("--reply-to", dest="reply_to", type=ident, default=None,
+                   help="only wake on a reply to this message id")
+
+    t = sub.add_parser("tail", help="recent messages, no cursor change")
+    t.add_argument("-n", type=int, default=20)
+    h = sub.add_parser("history", help="full room log")
+    h.add_argument("-n", type=int, default=1000)
+
+    wt = sub.add_parser("watch", help="live-follow all messages in a room (observer, Ctrl-C to stop)")
+    wt.add_argument("-n", type=int, default=10, help="show last N for context before following (default 10)")
+    _topic(wt)
+
+    thr = sub.add_parser("thread", help="print the reply_to thread containing a message id")
+    thr.add_argument("id", type=ident, help="a message id somewhere in the thread")
+
+    _as(sub.add_parser("inbox", help="peek unread messages for you (directed or questions); cursor untouched"))
+
+    pr = sub.add_parser("prune", help="trim a room to the newest --keep messages (destructive, guarded)")
+    pr.add_argument("--keep", type=positive_int, default=5000, help="messages to keep (default 5000)")
+    pr.add_argument("--force", action="store_true", help="trim even if it drops unread for lagging agents")
+
+    rp = sub.add_parser("reap", help="list stale issue locks (holder absent); --release <issue> to free ONE")
+    rp.add_argument("--release", type=positive_int, default=None, metavar="ISSUE",
+                    help="release exactly one stale lock you've verified is dead (default: list only)")
+
+    sub.add_parser("board", help="table of gh issues + status + lock holder + presence")
+
+    _as(sub.add_parser("join", help="register presence, cursor to now"))
+    sub.add_parser("agents", help="list present agents")
+
+    c = sub.add_parser("claim", help="atomically claim a gh issue")
+    _as(c); _issue(c)
+    c.add_argument("--ttl", type=int, default=28800, help=TTL_HELP)
+    c.add_argument("--worktree", action="store_true",
+                   help="also create an isolated git worktree for this issue (fail-closed)")
+    c.add_argument("--base", type=ident, default="dev",
+                   help="base branch for --worktree, freshly fetched (default dev)")
+
+    rl = sub.add_parser("release", help="release a claim you hold")
+    _as(rl); _issue(rl)
+
+    rn = sub.add_parser("renew", help="extend the TTL on a claim you hold")
+    _as(rn); _issue(rn)
+    rn.add_argument("--ttl", type=int, default=28800, help=TTL_HELP)
+
+    st = sub.add_parser("status", help="transition a gh issue status label")
+    _as(st); _issue(st)
+    st.add_argument("--set", required=True, choices=STATUS_LABELS)
+    st.add_argument("--ttl", type=int, default=28800, help=TTL_HELP)
+
+    ws = sub.add_parser("ws", help="per-agent git worktrees for isolated parallel building")
+    wsub = ws.add_subparsers(dest="ws_cmd", required=True)
+    wc = wsub.add_parser("create", help="create/resume an isolated worktree for an issue you claimed")
+    _as(wc); _issue(wc)
+    wc.add_argument("--base", type=ident, default="dev", help="base branch, freshly fetched (default dev)")
+    wc.add_argument("--type", type=ident, default="feat", help="branch type prefix (default feat)")
+    wc.add_argument("--allow-stale", action="store_true", help="proceed even if git fetch fails (RISKY)")
+    wc.add_argument("--allow-nested", action="store_true", help="allow a worktree root inside the repo")
+    wp = wsub.add_parser("path", help="print the worktree path for an issue")
+    _issue(wp)
+    wsub.add_parser("list", help="list all agent worktrees (dirty / unpushed / present)")
+    wr = wsub.add_parser("remove", help="remove an issue's worktree (guarded: refuses dirty/unpushed)")
+    _as(wr); _issue(wr)
+    wr.add_argument("--force", action="store_true", help="remove even if dirty/unpushed or not owner")
+
+    hd = sub.add_parser("huddle", help="collaborative co-work on one issue (stage 1: open/join/status/close)")
+    hdsub = hd.add_subparsers(dest="huddle_cmd", required=True)
+    ho = hdsub.add_parser("open", help="open a huddle: lock the issue, create the shared branch, status:claimed")
+    _as(ho); _issue(ho)
+    ho.add_argument("--base", type=ident, default="dev", help="base branch for the shared huddle branch (default dev)")
+    ho.add_argument("--ttl", type=int, default=28800, help=TTL_HELP)
+    ho.add_argument("--allow-stale", action="store_true", help="proceed even if git fetch fails (RISKY)")
+    hj = hdsub.add_parser("join", help="join an open huddle as a participant")
+    _as(hj); _issue(hj)
+    hs = hdsub.add_parser("status", help="print huddle opener/driver/participants/branch/status")
+    _issue(hs)
+    hc = hdsub.add_parser("close", help="close the huddle (done-gate: all present signed off, no blocks)")
+    _as(hc); _issue(hc)
+    hc.add_argument("--force", action="store_true", help="close even if the done-gate isn't met")
+
+    pn = sub.add_parser("pen", help="huddle write pen: who commits to the shared branch")
+    pnsub = pn.add_subparsers(dest="pen_cmd", required=True)
+    ps = pnsub.add_parser("status", help="print the current pen holder + shared branch tip")
+    _issue(ps)
+    pc = pnsub.add_parser("checkpoint", help="pen holder: commit + push your WIP to the shared branch")
+    _as(pc); _issue(pc)
+    pp = pnsub.add_parser("pass", help="hand the pen to another participant (commit+push first)")
+    _as(pp); _issue(pp)
+    pp.add_argument("--to", type=ident, required=True, help="the participant to hand the pen to")
+    pt = pnsub.add_parser("take", help="challenge for the pen (dynamic lead); force-takes from an absent driver")
+    _as(pt); _issue(pt)
+    pt.add_argument("--reason", required=True, help="evidence for taking over (failing test, better patch, plan)")
+    pd = pnsub.add_parser("deny", help="current driver: reject an open pen challenge")
+    _as(pd); _issue(pd)
+    pd.add_argument("--reason", required=True, help="why you keep the pen")
+
+    sg = sub.add_parser("signoff", help="sign off on the huddle's current tip (or --block it)")
+    _as(sg); _issue(sg)
+    sg.add_argument("--block", default=None, help="hard-block the huddle with a reason instead of signing off")
+    ub = sub.add_parser("unblock", help="lift your own block on a huddle")
+    _as(ub); _issue(ub)
+
+    sub.add_parser("init", help="create status:* labels in BUS_GH_REPO")
+    sub.add_parser("doctor", help="check redis + gh")
+    return p
+
+
+# command -> handler. Membership here also means "this command needs Redis".
+DISPATCH = {
+    "send": cmd_send, "poll": cmd_poll, "wait": cmd_wait,
+    "tail": cmd_tail, "history": cmd_history, "watch": cmd_watch, "join": cmd_join,
+    "agents": cmd_agents, "claim": cmd_claim, "release": cmd_release,
+    "renew": cmd_renew, "status": cmd_status,
+    "thread": cmd_thread, "inbox": cmd_inbox, "prune": cmd_prune,
+    "reap": cmd_reap, "board": cmd_board, "ws": cmd_ws,
+    "huddle": cmd_huddle, "pen": cmd_pen,
+    "signoff": cmd_signoff, "unblock": cmd_unblock,
+}
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    if args.cmd == "doctor":
+        return cmd_doctor(args.url)
+    if args.cmd == "init":
+        return cmd_init(args)
+    try:
+        r = connect(args.url)
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write(f"bus: cannot reach Redis at {args.url}: {e}\n")
+        sys.stderr.write("  run `bus doctor` or start Redis: ./scripts/start-redis.sh\n")
+        return 3
+    return DISPATCH[args.cmd](r, args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
