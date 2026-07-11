@@ -1183,7 +1183,7 @@ def cmd_huddle_open(r, args):
                          f"the Redis lock only for this huddle open\n")
     elif "status:claimed" in labels:
         held = r.get(lock)
-        if held and held != huddle_holder(issue):
+        if held and not is_session_holder(held):
             sys.stderr.write(f"bus huddle open: #{issue} already claimed by {held} "
                              f"(label set)\n")
             return 1
@@ -1192,7 +1192,11 @@ def cmd_huddle_open(r, args):
                 f"bus huddle open: #{issue} is labelled status:claimed but the lock "
                 f"expired; resolve manually (bus release/status) before opening a huddle\n")
             return 1
-    won = r.set(lock, huddle_holder(issue), nx=True, ex=args.ttl)
+    # UNIQUE session token, not the deterministic huddle:issue-N — so a lock
+    # re-taken by a *different* session after our TTL lapses is distinguishable
+    # (the deterministic value would look identical and defeat compare-and-delete).
+    session = f"huddle:issue-{issue}:{os.urandom(4).hex()}"
+    won = r.set(lock, session, nx=True, ex=args.ttl)
     if not won:
         sys.stderr.write(f"bus huddle open: issue #{issue} already locked by {r.get(lock)}\n")
         return 1
@@ -1201,15 +1205,24 @@ def cmd_huddle_open(r, args):
     rc, val = create_shared_branch(main, args.base, branch, allow_stale=args.allow_stale)
     if rc != 0:
         # Compare-and-delete, not a blind delete: if our short TTL already lapsed
-        # and another agent re-took the lock, a plain delete would nuke THEIR lock.
-        compare_delete_lock(r, issue, huddle_holder(issue))
+        # and another session re-took the lock, a plain delete would nuke THEIRS.
+        compare_delete_lock(r, issue, session)
         sys.stderr.write(f"bus huddle open: {val}; rolled back the lock on #{issue}\n")
+        return 1
+    # create_shared_branch does slow network I/O (fetch/push). If our short TTL
+    # lapsed during it and another session took the lock, we must NOT write our
+    # metadata over theirs. Re-verify we still hold our OWN session token first.
+    if r.get(lock) != session:
+        sys.stderr.write(f"bus huddle open: lost the #{issue} lock during branch setup "
+                         f"(TTL lapsed, re-taken by {r.get(lock)}); aborting without "
+                         f"clobbering — retry. (branch {branch} may be an orphan)\n")
         return 1
     base_commit = val
     r.set(k_huddle(issue), json.dumps({
         "issue": issue, "opener": args.as_agent, "participants": [args.as_agent],
         "driver": args.as_agent, "branch": branch, "base": args.base,
-        "base_commit": base_commit, "status": "open", "created_at": now_iso()}))
+        "base_commit": base_commit, "session": session, "status": "open",
+        "created_at": now_iso()}))
     touch_presence(r, args.room, args.as_agent)
     # gh is best-effort: the lock + branch + metadata already exist, so a gh
     # outage must not abort a live huddle (mirrors cmd_claim).
@@ -1239,10 +1252,12 @@ def cmd_huddle_join(r, args):
     # lapsed (expired/reaped) session lock. If the lock is gone the huddle is
     # dead — don't join it. Advisory (pen/write-authority is deferred), so the
     # benign TOCTOU between this check and the add just appends to metadata.
-    if not r.get(key):
+    raw0 = r.get(key)
+    if not raw0:
         sys.stderr.write(f"bus huddle join: no huddle on #{issue}\n")
         return 1
-    if r.get(k_lock(issue)) != huddle_holder(issue):
+    session = json.loads(raw0).get("session", huddle_holder(issue))
+    if r.get(k_lock(issue)) != session:
         sys.stderr.write(f"bus huddle join: #{issue}'s huddle lock is gone "
                          f"(expired or reaped); ask the opener to reopen it\n")
         return 1
@@ -1308,7 +1323,7 @@ def cmd_huddle_close(r, args):
     # else — so advancing status:pr-open would clobber their state. Either way we
     # ALWAYS clear the metadata: close is the only orphan-cleanup path and must
     # never leave meta behind (meta has no TTL; the lock does).
-    owned = compare_delete_lock(r, issue, huddle_holder(issue))
+    owned = compare_delete_lock(r, issue, meta.get("session", huddle_holder(issue)))
     err = None
     if owned:
         try:

@@ -59,9 +59,12 @@ wait is a peer thinking. So every rule below minimizes HOPS.
   requesting review; the reviewer does ONE comprehensive pass. Bundle all
   asks/findings into ONE message; answer all in one reply. One item per message
   ONLY when item N+1 depends on the answer to item N.
-- **R3 — CONTRACT FIRST (cheap).** Before a non-trivial stage, the driver posts a
-  short interface/contract note; the navigator acks or objects. Front-loads the
-  one expensive disagreement into a cheap exchange. Skip for trivial stages.
+- **R3 — CONTRACT FIRST, conditionally.** Post a short interface/contract note for
+  the navigator to ack or object to **only** when the stage introduces a new
+  API/CLI contract, a storage/key schema, a concurrency/locking invariant, or a
+  security boundary — or when the reviewer already objects to scope. Otherwise put
+  short assumptions in the pushed handoff; a default pre-contract exchange costs
+  two wakes and prevents no defect for a familiar local change.
 - **R4 — ASYNC REVIEW, pinned to SHA (conditional).** The navigator reviews the
   pushed SHA while the driver does INDEPENDENT next work; findings land as one
   batch tagged to that SHA. Only pays when the next stage is independent of the
