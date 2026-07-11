@@ -70,8 +70,16 @@ def test_create_shared_branch_success_and_existing_branch(bus_module, monkeypatc
             return 0, "base123", ""
         if args == ("ls-remote", "--heads", "origin", "huddle/issue-79"):
             return 0, "", ""
-        if args == ("push", "origin", "base123:refs/heads/huddle/issue-79"):
-            return 0, "", ""
+        # B2 (#82): atomic create is an empty-lease --porcelain push; success is
+        # confirmed by "[new branch]" in stdout, not just rc 0.
+        if args == (
+            "push",
+            "--porcelain",
+            "--force-with-lease=refs/heads/huddle/issue-79:",
+            "origin",
+            "base123:refs/heads/huddle/issue-79",
+        ):
+            return 0, " * [new branch]      base123 -> refs/heads/huddle/issue-79", ""
         raise AssertionError(args)
 
     monkeypatch.setattr(bus_module, "valid_git_ref", lambda _main, _ref: True)
