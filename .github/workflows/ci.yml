@@ -44,10 +44,18 @@ jobs:
       # AOF on: the service container above has no append log and is not ours to
       # kill. They fail rather than skip when this binary is missing, so the
       # restart-survival acceptance can never silently stop running in CI.
+      #
+      # policy-rc.d is what keeps the install from fighting the service container:
+      # Debian's redis postinst starts a system redis on 6379, which the container
+      # already publishes on the host, so it would fail to bind. Exit 101 tells
+      # the maintainer script "do not start services"; we only want the binary.
       - name: Install redis-server (for kill+restart durability tests)
         run: |
+          printf '#!/bin/sh\nexit 101\n' | sudo tee /usr/sbin/policy-rc.d >/dev/null
+          sudo chmod +x /usr/sbin/policy-rc.d
           sudo apt-get update
           sudo apt-get install -y redis-server
+          sudo rm -f /usr/sbin/policy-rc.d
           redis-server --version
 
       - name: Syntax gate

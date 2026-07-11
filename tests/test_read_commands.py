@@ -126,19 +126,31 @@ def test_prune_dry_run_reports_without_writing(bus_module, fake_redis, ns,
     assert fake_redis.xlen(bus_module.k_stream("main")) == before
 
 
-def test_prune_never_uses_maxlen(bus_module, fake_redis, ns, capsys):
+def test_prune_never_uses_maxlen(bus_module, fake_redis, ns, monkeypatch, capsys):
     """A MAXLEN trim drops the oldest N by count with no idea where cursors are.
-    safe_trim_room must only ever trim by the cursor-checked MINID boundary."""
-    calls = []
+    safe_trim_room must only ever trim by the cursor-checked MINID boundary.
+
+    The trim goes out as a raw `execute_command("XTRIM", ...)`, so the argv of
+    THAT is what has to be inspected — an earlier version of this test watched
+    `xadd(maxlen=...)` instead and passed even when xtrim_minid was rewritten to
+    use MAXLEN, i.e. it asserted nothing.
+    """
     ids = [xadd(bus_module, fake_redis, "alice", "all", f"msg-{i}") for i in range(5)]
-    real_xadd = fake_redis.xadd
-    fake_redis.xadd = lambda *a, **kw: calls.append(kw) or real_xadd(*a, **kw)
+    commands = []
+    real_execute = fake_redis.execute_command
+    monkeypatch.setattr(fake_redis, "execute_command",
+                        lambda *a, **kw: commands.append(a) or real_execute(*a, **kw))
 
     res = bus_module.safe_trim_room(fake_redis, "main", 2)
 
     assert res["trimmed"] is True and res["removed"] == 3
     assert res["boundary"] == ids[3]
-    assert all("maxlen" not in kw for kw in calls)  # no writer ever bounds by maxlen
+    trims = [a for a in commands if a and str(a[0]).upper() == "XTRIM"]
+    assert len(trims) == 1
+    argv = [str(x).upper() for x in trims[0]]
+    assert "MINID" in argv          # bounded by the cursor-checked boundary...
+    assert "MAXLEN" not in argv     # ...never blindly by count
+    assert ids[3] in [str(x) for x in trims[0]]
     capsys.readouterr()
 
 

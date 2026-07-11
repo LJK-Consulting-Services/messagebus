@@ -26,9 +26,11 @@ pytestmark = pytest.mark.integration
 ROOT = Path(__file__).resolve().parents[1]
 
 # How long the server stays dead in the end-to-end restart test. Must exceed
-# redis-py's internal retry budget (3 attempts, ~56ms of exponential backoff) so
-# the outage genuinely reaches our reconnect wrapper, and must sit inside the
-# wrapper's own backoff schedule so it still reconnects.
+# redis-py's OWN retry budget so the outage genuinely reaches our reconnect
+# wrapper, and must sit inside the wrapper's backoff schedule so it still
+# reconnects. That budget: Retry(ExponentialBackoff(), 3) = 4 attempts (the
+# initial one + 3 retries), sleeping compute(1..3) = 16+32+64ms ≈ 112ms nominal
+# (measured ~129ms). 1.5s clears it comfortably.
 OUTAGE_SECONDS = 1.5
 
 
@@ -118,11 +120,11 @@ def test_wait_rides_out_a_redis_restart_end_to_end(bus_module, redis_under_test,
     message published afterwards — instead of dying with a ConnectionError.
 
     The outage is held open for OUTAGE_SECONDS on purpose. redis-py's own retry
-    budget is three attempts over ~56ms of backoff, so a sub-100ms restart is
-    absorbed entirely inside the client and never reaches our reconnect wrapper
-    (measured: it delivers the message and emits no event). Staying down past
-    that budget is what forces the wrapper — and therefore EV_RECONNECT — to be
-    the thing under test, rather than a race we'd sometimes win for free.
+    budget is ~112ms (see the constant), so a fast restart is absorbed entirely
+    inside the client and never reaches our reconnect wrapper — measured: it
+    still delivers the message, but emits no event. Staying down past that budget
+    is what forces the wrapper — and therefore EV_RECONNECT — to be the thing
+    under test, rather than a race we'd sometimes win for free.
     """
     r = bus_module.connect(redis_under_test.url)
     r.set(bus_module.k_cursor("main", "bob"), "0-0")

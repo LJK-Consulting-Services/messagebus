@@ -137,13 +137,23 @@ def connect(url):
     return r
 
 
-def reconnect(url, sleep=time.sleep):
+def reconnect(url, sleep=time.sleep, deadline=None):
     """Rebuild a client after the server itself went away (a restart, not a blip
     — redis-py's own retry already covers the blip). Returns a live client, or
-    None once the bounded backoff schedule is exhausted.
+    None once the backoff schedule (or the caller's deadline) is exhausted.
+
+    `deadline` is a time.monotonic() instant. A caller that promised a bounded
+    call — `bus wait --timeout N` — MUST pass it: without it this would happily
+    sleep the whole 30s schedule and blow straight through the caller's budget,
+    hanging every agent's turn on a Redis that is never coming back.
 
     `sleep` is injectable so the retry path is testable without real waits."""
     for delay in RECONNECT_BACKOFF:
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None      # budget spent; the caller's timeout wins
+            delay = min(delay, remaining)
         sleep(delay)
         try:
             return connect(url)
@@ -337,6 +347,11 @@ EV_RECONNECT = "reconnect"                    # B3: agent survived a Redis resta
 EV_RETENTION_BLOCKED = "retention_blocked"    # B3: trim refused, unread would drop
 EV_RETENTION_FORCED = "retention_forced"      # B3: --force dropped unread messages
 EV_DRAIN = "drain"                            # B3: agent handed back state on exit
+# B3 note: B6 (#81) also pencilled in an EV_PERSISTENCE_MODE event. Deliberately
+#   NOT added: persistence is a property of the server, not of anything that
+#   happens on the bus, so there is no event-shaped moment to emit it at — a
+#   periodic emitter would just be a metric pretending to be an event. `bus
+#   doctor` reports the mode instead (see redis_persistence).
 # B6-TODO(#81): B2 (#82) adds EV_LEASE_REJECT + EV_POSTPUSH_MISMATCH here and
 #   emits them from _leased_push on force-with-lease rejection / ls-remote drift.
 # B6-TODO(#81): B4 adds EV_SELFCONTINUE_BUDGET_EXHAUSTED.
@@ -541,11 +556,30 @@ def cmd_wait(r, args):
 
     Survives a Redis restart: a dropped connection rebuilds the client and
     re-blocks from the SAME cursor (which lives in Redis, so it is exactly where
-    we left off, and AOF carries it across the restart). Reconnect time is spent
-    from the caller's timeout budget, so `--timeout` still bounds the call.
+    we left off, and AOF carries it across the restart). Reconnect time is charged
+    against the caller's budget AND capped by it, so `--timeout` still bounds the
+    call even when Redis never comes back.
     """
     touch_presence(r, args.room, args.as_agent)
     deadline = time.monotonic() + args.timeout
+
+    def revive():
+        """Rebuild the client after the server went away. Returns False when it
+        is not coming back inside our budget."""
+        nonlocal r
+        fresh = reconnect(args.url, deadline=deadline)
+        if fresh is None:
+            sys.stderr.write("bus wait: lost Redis and could not reconnect\n")
+            return False
+        r = fresh
+        # Presence expired while we were disconnected; re-register, then say so on
+        # the stream. Both are writes, so they can only run AFTER the reconnect
+        # succeeded — never announce a reconnect to a dead Redis.
+        touch_presence(r, args.room, args.as_agent)
+        announce_event(r, args.room, args.as_agent, EV_RECONNECT,
+                       {"agent": args.as_agent, "room": args.room, "cmd": "wait"})
+        return True
+
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -556,30 +590,30 @@ def cmd_wait(r, args):
         # the client socket read timeout and crash). Floor at 1ms; XREAD BLOCK 0
         # would block forever. The outer loop re-blocks on the remaining budget.
         block_ms = max(1, min(BLOCK_CHUNK_MS, int(remaining * 1000)))
-        # The whole Redis-touching part of the iteration is guarded, not just the
-        # read: a server that dies between the read and the cursor advance must
-        # also be survivable. Re-running the iteration is safe precisely because
-        # the cursor has NOT advanced yet — we re-read and re-deliver the same
-        # messages rather than skipping them.
         try:
             delivered, last_seen = read_from_cursor(
                 r, args.room, args.as_agent, block_ms=block_ms,
                 topic=args.topic, reply_to=args.reply_to
             )
-            if last_seen:
-                r.set(k_cursor(args.room, args.as_agent), last_seen)
         except REDIS_GONE:
-            r = reconnect(args.url)
-            if r is None:
-                sys.stderr.write("bus wait: lost Redis and could not reconnect\n")
+            if not revive():
                 return RC_REDIS_DOWN
-            # Presence expired while we were disconnected; re-register, then say
-            # so on the stream. Both are writes, so they can only run AFTER the
-            # reconnect succeeded — never announce a reconnect to a dead Redis.
-            touch_presence(r, args.room, args.as_agent)
-            announce_event(r, args.room, args.as_agent, EV_RECONNECT,
-                           {"agent": args.as_agent, "room": args.room, "cmd": "wait"})
-            continue
+            continue  # nothing was read; re-block from the same (unmoved) cursor
+        # The messages are in hand. Advancing the cursor is a SEPARATE failure:
+        # it must never be able to discard them. If the server dies on this write
+        # we still deliver — a message re-read on the next turn is at-least-once
+        # (which this bus already is, see connect()), but a swallowed __SHUTDOWN__
+        # would be unrecoverable, and that is exactly what dropping `delivered`
+        # here would do.
+        if last_seen:
+            try:
+                r.set(k_cursor(args.room, args.as_agent), last_seen)
+            except REDIS_GONE:
+                if not delivered:
+                    if not revive():
+                        return RC_REDIS_DOWN
+                    continue
+                # else: fall through and deliver what we already read.
         if delivered:
             for m in delivered:
                 emit(m, args.json)
@@ -979,9 +1013,10 @@ def cmd_drain(r, args):
 
     Releases the write pen on every huddle this agent drives (CAS, so a pen that
     has already moved on is never stolen) and clears the agent's presence keys.
-    Peers can `pen take` at once instead of waiting out PEN_TAKE_GRACE, and
-    clearing presence is exactly what lets `bus reap` see this agent's claim
-    locks as stale.
+    A released pen is unheld, and `pen take` grabs an unheld pen immediately, so
+    peers resume at once instead of waiting out PEN_TAKE_GRACE. The huddle's
+    `driver` metadata is cleared with the pen — leaving it set would make
+    `huddle status` name a driver that `pen status` says does not exist.
 
     Deliberately NOT done:
       * closing the huddle — a unilateral close would drive straight through the
@@ -989,6 +1024,12 @@ def cmd_drain(r, args):
       * releasing claim locks — a claim is durable work state, mirrored on the gh
         issue; dropping it silently invites a second agent to re-claim
         half-finished work. Held claims are reported, not touched.
+
+    Clearing presence is what lets `bus reap` see this agent's claim locks as
+    stale — but note it ALSO drops the agent out of the done-gate's
+    present-participant check, so a huddle can then close without its sign-off.
+    That is why an EV_DRAIN event is always emitted, even when no pen moved: a
+    drain must never be a silent way to disappear from a gate.
 
     Fail-closed: refuses while a pen we hold has committed-but-unpushed work,
     because the next driver would build on a tip that is missing it.
@@ -1006,14 +1047,28 @@ def cmd_drain(r, args):
         return 1
     released = [i for i in pens if compare_delete(r, k_pen(i), agent)]
     for issue in released:
+        # Keep the huddle metadata in step with the pen key, exactly as pen
+        # pass/take do. A stale `driver` here makes `huddle status` lie.
+        meta = _huddle_meta(r, issue)
+        if meta and meta.get("driver") == agent:
+            meta["driver"] = ""
+            r.set(k_huddle(issue), json.dumps(meta))
         announce(r, args.room, agent,
-                 f"draining on shutdown: released the write pen on #{issue}",
+                 f"draining on shutdown: released the write pen on #{issue} "
+                 f"(unheld — any participant may `pen take` it now)",
                  topic=f"issue-{issue}")
         # Scalars only: an issue number and booleans. Nothing free-text.
         announce_event(r, args.room, agent, EV_DRAIN,
                        {"agent": agent, "issue": _issue_sort(issue),
                         "pen_released": True, "unpushed": issue in risky},
                        topic=f"issue-{issue}")
+    # A drain with no pen to release still leaves the gate: dropping presence is
+    # what removes us from the done-gate's present-participant check. Emit the
+    # departure itself so that is never silent (the per-pen events above already
+    # cover the pens; this is the one that fires regardless).
+    announce_event(r, args.room, agent, EV_DRAIN,
+                   {"agent": agent, "pens_released": len(released),
+                    "claims_held": len(locks), "presence_cleared": True})
     # Presence last: while we still hold it, the announces above are attributable
     # to a live agent. Agent ids and room names are charset-checked, so neither
     # can smuggle a glob into this match. DEL is variadic and returns the count,
@@ -1112,6 +1167,16 @@ def cmd_watch(r, args):
         newest = emit_recent(r, args.room, args.n, args.json, topic=topic)
         if newest:
             last = newest  # continue strictly after the newest RAW message
+    if last == "$":
+        # Pin "$" to a concrete id before we ever block. "$" is re-resolved by
+        # whatever client evaluates it, so carrying it across a reconnect would
+        # silently skip everything published during the outage (`-n 0`, or an
+        # empty room at start-up, are the ways to get here). An empty stream has
+        # no id to pin to — and nothing to miss either, since a server that is
+        # down accepts no writes.
+        newest_raw = r.xrevrange(k_stream(args.room), count=1)
+        if newest_raw:
+            last = newest_raw[0][0]
     sys.stdout.flush()
     try:
         while True:
@@ -1202,21 +1267,38 @@ def cmd_claim(r, args):
                 f"resolve manually (bus release/status) before reclaiming\n")
             return 1
     won = r.set(lock, args.as_agent, nx=True, ex=args.ttl)
+    # `not won` does NOT mean "somebody else has it" — it can also mean WE have it.
+    # Connection retries (see connect()) re-send a SET NX whose reply was lost, and
+    # the re-send then finds the key its own first attempt created, reporting a loss
+    # for the attempt that actually won. So the invocation that truly claimed the
+    # issue can land here. Returning early on that path would skip the worktree, the
+    # gh label and the announce — leaving an agent holding a claim with no worktree,
+    # working the coordinator's main tree, which is exactly what the rollback below
+    # exists to prevent. Everything after this is idempotent, so re-running it is
+    # both safe and the fix: a re-sent claim, or an operator re-running `bus claim`,
+    # converges on the fully set-up state instead of a half-claimed one.
+    held_already = False
     if not won:
         holder = r.get(lock)
-        if holder == args.as_agent:
-            print(f"you ({args.as_agent}) already hold issue #{args.issue}")
-            return 0
-        sys.stderr.write(f"issue #{args.issue} already claimed by {holder}\n")
-        return 1
+        if holder != args.as_agent:
+            sys.stderr.write(f"issue #{args.issue} already claimed by {holder}\n")
+            return 1
+        held_already = True
+        print(f"you ({args.as_agent}) already hold issue #{args.issue}; ensuring setup")
     # If --worktree, set up isolation BEFORE writing the gh label, so a failure
     # rolls the claim back cleanly — an agent must never hold a claim with no
     # worktree and then silently work the coordinator's main tree.
     if getattr(args, "worktree", False):
         rc, path = ws_create(r, args.room, args.as_agent, args.issue, base=args.base)
         if rc != 0:
-            r.delete(lock)
-            sys.stderr.write(f"bus claim: worktree setup failed; rolled back the claim on #{args.issue}\n")
+            if held_already:
+                # The lock predates this invocation — rolling it back would drop a
+                # claim we did not create here (and possibly abandon real work).
+                sys.stderr.write(f"bus claim: worktree setup failed on #{args.issue}; "
+                                 f"keeping the claim you already held\n")
+            else:
+                r.delete(lock)
+                sys.stderr.write(f"bus claim: worktree setup failed; rolled back the claim on #{args.issue}\n")
             return 1
     # We won the lock. Reflect to gh + announce. If gh fails, keep the lock
     # (the announce still tells others), but surface the error.
@@ -1708,9 +1790,16 @@ def cmd_huddle_open(r, args):
                 f"expired; resolve manually (bus release/status) before opening a huddle\n")
             return 1
     won = r.set(lock, session, nx=True, ex=args.ttl)
-    if not won:
+    if not won and r.get(lock) != session:
         sys.stderr.write(f"bus huddle open: issue #{issue} already locked by {r.get(lock)}\n")
         return 1
+    # `not won` but the lock already holds OUR session token: a connection retry
+    # re-sent this very SET NX after its reply was lost, so our own first attempt
+    # is what's in there. The token is 16 random bytes, so nobody else can be
+    # holding it — proceed as the winner. Bailing out here instead would strand the
+    # issue under a phantom huddle lock with no metadata and no branch, which
+    # `bus reap` deliberately refuses to free (_is_huddle_lock) and `bus release`
+    # cannot touch — an unrecoverable lock short of a manual redis-cli DEL.
     # Set up the shared branch BEFORE the gh label, so a failure rolls the lock
     # back cleanly — no huddle should hold the issue lock with no branch.
     rc, val = create_shared_branch(main, args.base, branch, allow_stale=args.allow_stale)
@@ -2119,6 +2208,20 @@ def cmd_pen_take(r, args):
     driver = r.get(k_pen(issue))
     if driver == args.as_agent:
         print(f"you ({args.as_agent}) already hold the pen on #{issue}")
+        return 0
+    if not driver:
+        # Nobody holds the pen — a driver drained on shutdown, or the key lapsed.
+        # There is no incumbent to protect, so the grace window has nothing to
+        # protect: an unheld pen is simply free. Without this, an unheld pen still
+        # costs a challenger the full PEN_TAKE_GRACE and the huddle can't make a
+        # single write until it expires.
+        r.set(k_pen(issue), args.as_agent)
+        meta["driver"] = args.as_agent
+        r.set(k_huddle(issue), json.dumps(meta))
+        r.delete(k_penchal(issue))
+        announce(r, args.room, args.as_agent,
+                 f"took the unheld pen on #{issue}", topic=f"issue-{issue}")
+        print(f"{args.as_agent} took the unheld pen on #{issue}")
         return 0
     raw = r.get(k_penchal(issue))
     chal = json.loads(raw) if raw else None

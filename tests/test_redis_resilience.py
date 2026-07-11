@@ -120,12 +120,12 @@ def test_wait_advances_the_cursor_past_traffic_not_for_us(bus_module, fake_redis
     assert fake_redis.get(bus_module.k_cursor("main", "bob")) == newest
 
 
-def test_wait_survives_a_redis_death_during_the_cursor_advance(bus_module, fake_redis, ns,
-                                                               monkeypatch, capsys):
-    """The reconnect guard covers the whole Redis-touching iteration, not just the
-    read: a server that dies between the XREAD and the cursor SET is survivable
-    too. Safe to re-run the iteration precisely because the cursor never moved —
-    we re-read and re-deliver the same message rather than skipping it."""
+def test_wait_delivers_even_when_the_cursor_advance_dies(bus_module, fake_redis, ns,
+                                                         monkeypatch, capsys):
+    """A server that dies on the cursor write must not cost us the messages we had
+    already read. We deliver them and leave the cursor behind — they get re-read
+    next turn (at-least-once, which this bus already is). Discarding them instead
+    would silently eat a __SHUTDOWN__."""
     bus_module.cmd_send(fake_redis, ns(frm="alice", to="bob", topic=None,
                                        reply_to="", kind="msg", body="delivered once"))
     capsys.readouterr()
@@ -151,9 +151,71 @@ def test_wait_survives_a_redis_death_during_the_cursor_advance(bus_module, fake_
                                             timeout=5.0, url="redis://x"))
 
     assert rc == bus_module.RC_DELIVERED
-    assert "delivered once" in capsys.readouterr().out  # re-read after the reconnect
-    newest = fake_redis.xrevrange(bus_module.k_stream("main"), count=1)[0][0]
-    assert fake_redis.get(bus_module.k_cursor("main", "bob")) == newest
+    assert "delivered once" in capsys.readouterr().out  # NOT swallowed
+    # the cursor never advanced, so the message is simply re-read next turn
+    assert fake_redis.get(bus_module.k_cursor("main", "bob")) is None
+
+
+def test_wait_never_swallows_messages_when_the_cursor_write_dies(bus_module, fake_redis, ns,
+                                                                 monkeypatch, capsys):
+    """The cursor write LANDED server-side but its reply was lost. The cursor is
+    therefore already advanced, so a re-read would skip the message — meaning if
+    we discarded `delivered` here it would be gone for good. For a __SHUTDOWN__
+    that is unrecoverable: the agent would never stop. Deliver what we read."""
+    bus_module.cmd_send(fake_redis, ns(frm="operator", to="bob", topic=None, reply_to="",
+                                       kind="msg", body=bus_module.SHUTDOWN))
+    capsys.readouterr()
+
+    cursor_key = bus_module.k_cursor("main", "bob")
+    real_set = fake_redis.set
+
+    def apply_then_lose_the_reply(key, *a, **kw):
+        out = real_set(key, *a, **kw)
+        if key == cursor_key:
+            # the write is committed; only the ACK is lost
+            raise redis.exceptions.ConnectionError("reply lost after the write landed")
+        return out
+
+    monkeypatch.setattr(fake_redis, "set", apply_then_lose_the_reply)
+    monkeypatch.setattr(bus_module, "connect", lambda _url: fake_redis)
+    monkeypatch.setattr(bus_module.time, "sleep", lambda _s: None)
+
+    rc = bus_module.cmd_wait(fake_redis, ns(as_agent="bob", topic=None, reply_to=None,
+                                            timeout=5.0, url="redis://x"))
+
+    assert rc == bus_module.RC_SHUTDOWN  # NOT RC_NONE — the kill-switch got through
+    assert bus_module.SHUTDOWN in capsys.readouterr().out
+
+
+def test_wait_stays_inside_its_timeout_when_redis_never_returns(bus_module, fake_redis, ns,
+                                                                monkeypatch, capsys):
+    """`--timeout N` is a promise. reconnect() sleeps a 30s schedule, so without a
+    deadline a dead Redis would hang every agent's turn ~30s past its budget."""
+    monkeypatch.setattr(bus_module, "read_from_cursor", lambda *a, **kw: (_ for _ in ()).throw(
+        redis.exceptions.ConnectionError("gone")))
+    monkeypatch.setattr(bus_module, "connect", lambda _url: (_ for _ in ()).throw(
+        redis.exceptions.ConnectionError("still gone")))
+
+    slept = []
+    monkeypatch.setattr(bus_module.time, "sleep", slept.append)
+
+    rc = bus_module.cmd_wait(fake_redis, ns(as_agent="bob", topic=None, reply_to=None,
+                                            timeout=2.0, url="redis://x"))
+
+    assert rc == bus_module.RC_REDIS_DOWN
+    # never sleeps past the caller's 2s budget, even though the schedule sums to 30s
+    assert sum(slept) <= 2.0
+    assert sum(bus_module.RECONNECT_BACKOFF) == 30  # the budget it would have burned
+
+
+def test_reconnect_honours_a_deadline(bus_module, monkeypatch):
+    monkeypatch.setattr(bus_module, "connect", lambda _url: (_ for _ in ()).throw(
+        redis.exceptions.ConnectionError("down")))
+    slept = []
+    # a deadline already in the past: give up immediately, sleep not at all
+    assert bus_module.reconnect("redis://x", sleep=slept.append,
+                                deadline=bus_module.time.monotonic() - 1) is None
+    assert slept == []
 
 
 def test_wait_reports_a_redis_that_never_returns(bus_module, fake_redis, ns, monkeypatch, capsys):
@@ -200,6 +262,28 @@ def test_watch_resumes_from_its_local_cursor_not_from_now(bus_module, fake_redis
     assert not fake_redis.get(bus_module.k_presence("main", "watch"))
 
 
+def test_watch_pins_dollar_to_a_real_id_before_blocking(bus_module, fake_redis, ns, capsys):
+    """`-n 0` (or an empty room) leaves `last` as "$", which each client re-resolves
+    to ITS current tail. Carried across a reconnect that would skip everything
+    published during the outage. Pin it to a concrete id up front."""
+    existing = fake_redis.xadd(bus_module.k_stream("main"),
+                               bus_module.make_fields("alice", "all", "already here"))
+    starts = []
+    real_xread = fake_redis.xread
+
+    def capture(streams, **kw):
+        starts.append(list(streams.values())[0])
+        raise KeyboardInterrupt  # one look, then stop the follow loop
+
+    fake_redis.xread = capture
+
+    assert bus_module.cmd_watch(fake_redis, ns(n=0, topic=None, url="redis://x")) == 0
+
+    assert starts == [existing]  # a real id, not "$"
+    fake_redis.xread = real_xread
+    capsys.readouterr()
+
+
 # ---- graceful drain --------------------------------------------------------
 
 def test_held_by_selects_only_this_agents_keys(bus_module, fake_redis):
@@ -237,10 +321,62 @@ def test_drain_releases_pens_and_presence_but_keeps_claims(bus_module, fake_redi
     assert fake_redis.get(bus_module.k_presence("main", "claude-2")) is None
     assert fake_redis.get(bus_module.k_huddle(44)) is None    # huddle not closed
 
+    # two events: one for the pen that moved, plus the always-emitted departure
+    # (presence going away is itself gate-relevant, so it is never silent).
+    drains = events_of(fake_redis, bus_module.EV_DRAIN)
+    assert [d["fields"] for d in drains] == [
+        {"agent": "claude-2", "issue": 44, "pen_released": True, "unpushed": False},
+        {"agent": "claude-2", "pens_released": 1, "claims_held": 1,
+         "presence_cleared": True},
+    ]
+
+
+def test_drain_leaves_the_pen_takeable_at_once_and_syncs_huddle_meta(
+        bus_module, fake_redis, ns, monkeypatch, capsys):
+    """drain's whole purpose: peers resume NOW, not after PEN_TAKE_GRACE. And the
+    huddle metadata must not keep naming a driver who has left — `huddle status`
+    would say `driver: claude-2` while `pen status` says nobody holds it."""
+    monkeypatch.setattr(bus_module, "_ws_meta", lambda *_a, **_kw: None)
+    fake_redis.set(bus_module.k_pen(44), "claude-2")
+    fake_redis.set(bus_module.k_huddle(44), json.dumps({
+        "issue": 44, "opener": "claude-2", "participants": ["claude-2", "codex-1"],
+        "driver": "claude-2", "branch": "huddle/issue-44", "status": "open"}))
+    bus_module.touch_presence(fake_redis, "main", "claude-2")
+
+    assert bus_module.cmd_drain(fake_redis, ns(as_agent="claude-2", force=False)) == 0
+
+    assert json.loads(fake_redis.get(bus_module.k_huddle(44)))["driver"] == ""
+
+    # a peer takes the now-unheld pen immediately — no challenge, no 120s grace
+    rc = bus_module.cmd_pen_take(fake_redis, ns(as_agent="codex-1", issue=44,
+                                                reason="driver drained"))
+
+    assert rc == 0
+    assert fake_redis.get(bus_module.k_pen(44)) == "codex-1"
+    assert json.loads(fake_redis.get(bus_module.k_huddle(44)))["driver"] == "codex-1"
+    assert not fake_redis.get(bus_module.k_penchal(44))  # not a pending challenge
+    out = capsys.readouterr().out
+    assert "took the unheld pen" in out
+    assert "force-take available" not in out  # the old 120s-wait path
+
+
+def test_drain_is_never_silent_even_with_no_pen(bus_module, fake_redis, ns, events_of,
+                                                monkeypatch, capsys):
+    """Clearing presence drops the agent out of the done-gate's present-participant
+    check, so a huddle can then close without its sign-off. A drain that emitted
+    nothing would be a silent way to vanish from a gate."""
+    monkeypatch.setattr(bus_module, "_ws_meta", lambda *_a, **_kw: None)
+    bus_module.touch_presence(fake_redis, "main", "claude-2")
+
+    assert bus_module.cmd_drain(fake_redis, ns(as_agent="claude-2", force=False,
+                                               json=True)) == 0
+
+    assert fake_redis.get(bus_module.k_presence("main", "claude-2")) is None
     drains = events_of(fake_redis, bus_module.EV_DRAIN)
     assert len(drains) == 1
-    assert drains[0]["fields"] == {"agent": "claude-2", "issue": 44,
-                                   "pen_released": True, "unpushed": False}
+    assert drains[0]["fields"] == {"agent": "claude-2", "pens_released": 0,
+                                   "claims_held": 0, "presence_cleared": True}
+    capsys.readouterr()
 
 
 def test_drain_refuses_to_strand_unpushed_work(bus_module, fake_redis, ns, events_of,

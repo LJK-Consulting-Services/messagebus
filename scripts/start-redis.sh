@@ -23,6 +23,19 @@ PY
 # save point.
 ensure_aof() {
   local mode
+  # ONLY ever reconfigure a loopback Redis. BUS_REDIS_URL can point at a shared or
+  # remote server this script did not start; turning on AOF there would force a
+  # background rewrite on someone else's live instance, and CONFIG REWRITE would
+  # persist that into their redis.conf. Not ours to change.
+  case "$HOST" in
+    127.0.0.1|::1|localhost) ;;
+    *)
+      echo "redis persistence: ${HOST} is not loopback — not touching its config." >&2
+      echo "  (enable appendonly on that server yourself; the bus keeps live" >&2
+      echo "   coordination state — locks, pen, huddle — that a restart would drop)" >&2
+      return 0
+      ;;
+  esac
   mode="$(redis-cli -h "$HOST" -p "$PORT" config get appendonly 2>/dev/null | tail -1)"
   if [ "$mode" = "yes" ]; then
     echo "redis persistence: appendonly already on"
@@ -58,7 +71,11 @@ else
   # process's cwd, so without it the append log lands in whatever directory this
   # script was invoked from — usually the repo.
   DATA_DIR="${BUS_REDIS_DIR:-$HOME/.bus/redis}"
-  mkdir -p "$DATA_DIR"
+  # AOF means every message body the bus has ever carried is now written to disk,
+  # and those bodies are untrusted agent chatter (see README security). Keep the
+  # append log owner-only rather than the 0755/0644 the default umask would give.
+  (umask 077 && mkdir -p "$DATA_DIR")
+  chmod 700 "$DATA_DIR"
   echo "starting redis-server (daemonized, loopback only, data in ${DATA_DIR})..."
   redis-server --daemonize yes --bind 127.0.0.1 --port "$PORT" \
     --dir "$DATA_DIR" --appendonly yes --appendfsync everysec
