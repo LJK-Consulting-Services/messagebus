@@ -262,6 +262,82 @@ def make_fields(frm, to, body, kind="msg", topic="", reply_to=""):
             "reply_to": reply_to, "kind": kind, "body": body}
 
 
+# ---- structured observability (B6, #81) ------------------------------------
+# A machine-readable event layer that rides the existing room stream alongside
+# the human announce() line. An event is a kind='event' message whose body is a
+# compact JSON envelope. EVENT_SCHEMA_VERSION versions THIS envelope and is
+# deliberately independent of the message-envelope schema_version (#80) — the
+# two compose. Events ride the room stream as kind='event' messages the same way
+# announce() emits kind='system'; `bus events` is the structured, queryable view.
+EVENT_SCHEMA_VERSION = 1
+
+# Stable event type names — the only values allowed in the envelope's "event"
+# field. Add a new type here (and its emit site) when a reliability fix wants to
+# surface a structured signal. Only EV_DONEGATE_BLOCK is wired on `dev` today.
+EV_DONEGATE_BLOCK = "donegate_block"
+# B6-TODO(#81): B2 (#82) adds EV_LEASE_REJECT + EV_POSTPUSH_MISMATCH here and
+#   emits them from _leased_push on force-with-lease rejection / ls-remote drift.
+# B6-TODO(#81): B3 adds EV_RECONNECT + EV_RETENTION_BLOCKED + EV_PERSISTENCE_MODE.
+# B6-TODO(#81): B4 adds EV_SELFCONTINUE_BUDGET_EXHAUSTED.
+EVENT_TYPES = {EV_DONEGATE_BLOCK}
+
+_EVENT_VALUE_MAX = 200
+# Anything URL/URI-shaped is treated as potentially sensitive (tokens ride in
+# query strings, presigned URLs, etc.) and dropped — events carry only scalars.
+_EVENT_REDACT_RE = re.compile(r"://")
+_EVENT_REDACTED = "<redacted>"
+
+
+def redact_event_fields(fields):
+    """Backstop for the event payload: events are meant to carry only
+    non-sensitive scalars (agent ids, issue numbers, short shas, counts,
+    booleans). Callers should pass an allowlisted dict; this coerces each value
+    to a safe scalar and replaces anything non-scalar, over-long, or URL-shaped
+    with '<redacted>' so a careless caller can't leak a secret/URL/token or dump
+    a raw exception onto the bus."""
+    safe = {}
+    for k, v in fields.items():
+        if v is None or isinstance(v, int):  # bool is an int subclass
+            safe[k] = v
+        elif isinstance(v, str):
+            safe[k] = _EVENT_REDACTED if (
+                len(v) > _EVENT_VALUE_MAX or _EVENT_REDACT_RE.search(v)) else v
+        else:
+            safe[k] = _EVENT_REDACTED
+    return safe
+
+
+def announce_event(r, room, frm, event, fields, topic=""):
+    """Emit a structured event onto the room stream. `event` must be a known
+    EVENT_TYPES member; `fields` is an allowlisted scalar map (passed through
+    redact_event_fields as defence-in-depth). The event lives in a kind='event'
+    message body as a JSON envelope — it broadcasts like a kind='system'
+    announce() (so it shows in poll/tail) and `bus events` is the structured,
+    type-filterable view of the same records."""
+    if event not in EVENT_TYPES:
+        raise ValueError(f"unknown event type {event!r}")
+    payload = {"schema_version": EVENT_SCHEMA_VERSION, "event": event,
+               "fields": redact_event_fields(fields)}
+    r.xadd(k_stream(room),
+           make_fields(frm, "all", json.dumps(payload, ensure_ascii=False),
+                       kind="event", topic=topic))
+
+
+def parse_event(msg):
+    """Decode a kind='event' message body into its event envelope dict, or None
+    if the message isn't a well-formed event (wrong kind / bad JSON / missing
+    the required "event" field)."""
+    if msg.get("kind") != "event":
+        return None
+    try:
+        payload = json.loads(msg["body"])
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict) or "event" not in payload:
+        return None
+    return payload
+
+
 def read_result_code(delivered):
     if not delivered:
         return RC_NONE
@@ -457,6 +533,47 @@ def cmd_history(r, args):
     entries = r.xrange(k_stream(args.room), count=args.n)
     for msg_id, fields in entries:
         emit(fields_to_msg(msg_id, fields), args.json)
+    return 0
+
+
+EVENT_SCAN_CAP = 2000  # how far `bus events` scans back to find matching events
+
+
+def cmd_events(r, args):
+    """List recent structured events (kind='event') on the room stream, oldest
+    -first, optionally filtered to a single --type. Human table by default; one
+    JSON object per line with --json. Scans back a bounded window so a filtered
+    view shows real matches, not "last n raw then filtered to maybe zero"."""
+    if args.type and args.type not in EVENT_TYPES:
+        sys.stderr.write(f"bus events: unknown --type {args.type!r}; "
+                         f"known: {', '.join(sorted(EVENT_TYPES))}\n")
+        return 1
+    window = r.xrevrange(k_stream(args.room), count=EVENT_SCAN_CAP)  # newest-first
+    rows = []
+    for mid, fields in window:
+        if fields.get("kind") != "event":  # cheap skip before building the msg dict
+            continue
+        msg = fields_to_msg(mid, fields)
+        payload = parse_event(msg)
+        if payload is None:
+            continue
+        if args.type and payload.get("event") != args.type:
+            continue
+        rows.append((mid, msg, payload))
+        if len(rows) >= args.n:
+            break
+    for mid, msg, payload in reversed(rows):  # oldest-first
+        if args.json:
+            # Explicit stream fields last so the authoritative id/from/topic win
+            # over any id/from/topic a raw event body might carry.
+            print(json.dumps({**payload, "id": mid, "from": msg["from"],
+                              "topic": msg["topic"]}, ensure_ascii=False))
+        else:
+            flat = " ".join(f"{terminal_line(k)}={terminal_line(v)}"
+                            for k, v in payload.get("fields", {}).items())
+            print(f"{terminal_line(mid)}  {terminal_line(msg['from'])}  "
+                  f"{terminal_line(payload.get('event', '?'))}"
+                  f"{'  ' + flat if flat else ''}")
     return 0
 
 
@@ -1445,6 +1562,13 @@ def cmd_huddle_close(r, args):
     if not getattr(args, "force", False):
         ok, reasons = donegate(r, issue, meta, args.as_agent)
         if not ok:
+            # Structured signal (B6, #81): surface the blocked close for tooling.
+            # Emit the COUNT of open reasons only — the reason strings embed
+            # untrusted user --block text and must never ride the event layer.
+            announce_event(r, args.room, args.as_agent, EV_DONEGATE_BLOCK,
+                           {"issue": issue, "closer": args.as_agent,
+                            "open_reasons": len(reasons)},
+                           topic=f"issue-{issue}")
             sys.stderr.write(f"bus huddle close: #{issue} not done — {len(reasons)} open:\n")
             for why in reasons:
                 sys.stderr.write(f"  - {why}\n")
@@ -1990,6 +2114,11 @@ def build_parser():
     h = sub.add_parser("history", help="full room log")
     h.add_argument("-n", type=int, default=1000)
 
+    ev = sub.add_parser("events", help="recent structured events (JSON observability layer)")
+    ev.add_argument("-n", type=int, default=20, help="max events to show (default 20)")
+    ev.add_argument("--type", type=ident, default=None,
+                    help="only this event type, e.g. donegate_block")
+
     wt = sub.add_parser("watch", help="live-follow all messages in a room (observer, Ctrl-C to stop)")
     wt.add_argument("-n", type=int, default=10, help="show last N for context before following (default 10)")
     _topic(wt)
@@ -2095,7 +2224,8 @@ def build_parser():
 # command -> handler. Membership here also means "this command needs Redis".
 DISPATCH = {
     "send": cmd_send, "poll": cmd_poll, "wait": cmd_wait,
-    "tail": cmd_tail, "history": cmd_history, "watch": cmd_watch, "join": cmd_join,
+    "tail": cmd_tail, "history": cmd_history, "events": cmd_events,
+    "watch": cmd_watch, "join": cmd_join,
     "agents": cmd_agents, "claim": cmd_claim, "release": cmd_release,
     "renew": cmd_renew, "status": cmd_status,
     "thread": cmd_thread, "inbox": cmd_inbox, "prune": cmd_prune,
