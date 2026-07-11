@@ -47,6 +47,7 @@ import argparse
 import json
 import os
 import re
+import secrets
 import sys
 from datetime import datetime, timezone
 
@@ -67,7 +68,9 @@ def k_stream(room):   return f"bus:stream:{room}"
 def k_cursor(room, a): return f"bus:cursor:{room}:{a}"
 def k_presence(room, a): return f"bus:presence:{room}:{a}"
 def k_lock(issue):    return f"bus:lock:issue:{issue}"
-def k_worktree(issue): return f"bus:worktree:issue:{issue}"
+def k_worktree(issue, agent=None):
+    base = f"bus:worktree:issue:{issue}"
+    return f"{base}:agent:{agent}" if agent else base
 def k_huddle(issue):  return f"bus:huddle:issue:{issue}"
 def k_pen(issue):     return f"bus:pen:issue:{issue}"
 def k_penchal(issue): return f"bus:penchal:issue:{issue}"
@@ -609,6 +612,19 @@ def compare_delete_lock(r, issue, holder):
     )
 
 
+def compare_set_huddle_meta(r, issue, holder, meta_json):
+    return r.eval(
+        """
+        if redis.call('GET', KEYS[1]) == ARGV[1] then
+            redis.call('SET', KEYS[2], ARGV[2])
+            return 1
+        end
+        return 0
+        """,
+        2, k_lock(issue), k_huddle(issue), holder, meta_json,
+    )
+
+
 def cmd_reap(r, args):
     """List issue locks whose holder has no presence anywhere (possibly a dead
     agent). ADVISORY — the 8h lock TTL is the real death-expiry, and a turn-based
@@ -636,9 +652,11 @@ def cmd_reap(r, args):
     if not args.json:
         orphans = [m for m in _iter_ws_meta(r) if m["agent"] not in present_set]
         if orphans:
-            print("orphan worktrees (holder absent — verify work captured, then `ws remove --force`):")
+            print("orphan worktrees (holder absent — verify work captured, then `ws remove --as <agent> --issue N --force`):")
             for m in sorted(orphans, key=lambda x: int(x["issue"]) if str(x["issue"]).isdigit() else 0):
-                print(f"  #{terminal_line(str(m['issue']))}\t{terminal_line(m['agent'])}\t{terminal_line(m['path'])}")
+                kind = m.get("kind", "solo")
+                print(f"  #{terminal_line(str(m['issue']))}\t{terminal_line(kind)}\t"
+                      f"{terminal_line(m['agent'])}\t{terminal_line(m['path'])}")
     if args.release is not None:
         target = str(args.release)
         current = stale_lock_info(r, target)
@@ -943,22 +961,40 @@ def cmd_doctor(r_url):
 
 # ---- worktree commands -----------------------------------------------------
 
-def _ws_meta(r, issue):
-    raw = r.get(k_worktree(issue))
-    return json.loads(raw) if raw else None
+def _decode_ws_meta(raw):
+    try:
+        m = json.loads(raw) if raw else None
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if m and all(k in m for k in ("issue", "agent", "path", "branch", "base_commit")):
+        return m
+    return None
+
+
+def _ws_meta(r, issue, agent=None, with_key=False):
+    keys = []
+    if agent:
+        keys.append(k_worktree(issue, agent))
+    keys.append(k_worktree(issue))
+    for key in keys:
+        m = _decode_ws_meta(r.get(key))
+        if m:
+            return (m, key) if with_key else m
+    return (None, None) if with_key else None
+
+
+def _iter_ws_meta_with_keys(r):
+    for key in r.scan_iter(match="bus:worktree:issue:*"):
+        m = _decode_ws_meta(r.get(key))
+        if m:
+            yield key, m
 
 
 def _iter_ws_meta(r):
     """Yield every registered worktree's metadata dict, skipping malformed or
     legacy entries (missing required keys). Shared by ws list and reap."""
-    for key in r.scan_iter(match="bus:worktree:issue:*"):
-        raw = r.get(key)
-        try:
-            m = json.loads(raw)
-        except (TypeError, json.JSONDecodeError):
-            continue
-        if all(k in m for k in ("issue", "agent", "path", "branch", "base_commit")):
-            yield m
+    for _, m in _iter_ws_meta_with_keys(r):
+        yield m
 
 
 def ws_create(r, room, agent, issue, base="dev", branch_type="feat",
@@ -1019,7 +1055,8 @@ def ws_create(r, room, agent, issue, base="dev", branch_type="feat",
         return 1, None
     r.set(k_worktree(issue), json.dumps({
         "issue": issue, "agent": agent, "path": path, "branch": branch,
-        "base": base, "base_commit": base_commit, "created_at": now_iso()}))
+        "base": base, "base_commit": base_commit, "kind": "solo",
+        "detached": False, "created_at": now_iso()}))
     announce(r, room, agent, f"created worktree for #{issue} at {path} (branch {branch})",
              topic=f"issue-{issue}")
     return 0, path
@@ -1051,27 +1088,42 @@ def cmd_ws_list(r, args):
         dirty = "gone" if not exists else ("yes" if worktree_dirty(path) else "-")
         unpushed = "yes" if exists and worktree_unpushed(path, m["base_commit"]) else "-"
         present = "yes" if m["agent"] in present_set else "no"
-        rows.append((m["issue"], m["agent"], m["branch"], path, dirty, unpushed, present))
+        kind = m.get("kind", "solo")
+        detached = bool(m.get("detached", False))
+        rows.append((m["issue"], kind, detached, m["agent"], m["branch"],
+                     path, dirty, unpushed, present))
     rows.sort(key=lambda x: int(x[0]) if str(x[0]).isdigit() else 0)
     if args.json:
-        print(json.dumps([{"issue": i, "agent": a, "branch": b, "path": p,
-                           "dirty": d, "unpushed": u, "present": pr}
-                          for i, a, b, p, d, u, pr in rows]))
+        print(json.dumps([{"issue": i, "kind": k, "detached": dt, "agent": a,
+                           "branch": b, "path": p, "dirty": d,
+                           "unpushed": u, "present": pr}
+                          for i, k, dt, a, b, p, d, u, pr in rows]))
         return 0
     if not rows:
         print("(no agent worktrees)")
         return 0
-    print(f"{'ISSUE':<6} {'AGENT':<12} {'BRANCH':<26} {'DIRTY':<6} {'UNPUSH':<7} {'PRES':<4} PATH")
-    for i, a, b, p, d, u, pr in rows:
-        print(f"#{str(i):<5} {terminal_line(a):<12} {terminal_line(b):<26} "
+    print(f"{'ISSUE':<6} {'KIND':<8} {'AGENT':<12} {'BRANCH':<26} {'DIRTY':<6} {'UNPUSH':<7} {'PRES':<4} PATH")
+    for i, k, dt, a, b, p, d, u, pr in rows:
+        label = f"{k}{'*' if dt else ''}"
+        print(f"#{str(i):<5} {terminal_line(label):<8} {terminal_line(a):<12} {terminal_line(b):<26} "
               f"{d:<6} {u:<7} {pr:<4} {terminal_line(p)}")
     return 0
 
 
 def cmd_ws_remove(r, args):
-    meta = _ws_meta(r, args.issue)
+    meta, meta_key = _ws_meta(r, args.issue, agent=args.as_agent, with_key=True)
+    if not meta and args.force:
+        matches = [(k, m) for k, m in _iter_ws_meta_with_keys(r)
+                   if str(m["issue"]) == str(args.issue)]
+        if len(matches) == 1:
+            meta_key, meta = matches[0]
+        elif len(matches) > 1:
+            owners = ", ".join(sorted(m["agent"] for _, m in matches))
+            sys.stderr.write(f"bus ws remove: #{args.issue} has multiple worktrees "
+                             f"({owners}); rerun with --as <owner> --force\n")
+            return 1
     if not meta:
-        sys.stderr.write(f"bus ws remove: no worktree for #{args.issue}\n")
+        sys.stderr.write(f"bus ws remove: no worktree for #{args.issue} owned by {args.as_agent}\n")
         return 1
     if meta["agent"] != args.as_agent and not args.force:
         sys.stderr.write(f"bus ws remove: #{args.issue} worktree belongs to {meta['agent']}, "
@@ -1105,7 +1157,7 @@ def cmd_ws_remove(r, args):
     if rc != 0 and os.path.isdir(path):
         sys.stderr.write(f"bus ws remove: git worktree remove failed: {err}\n")
         return 1
-    r.delete(k_worktree(args.issue))
+    r.delete(meta_key)
     announce(r, args.room, args.as_agent, f"removed worktree for #{args.issue}",
              topic=f"issue-{args.issue}")
     print(f"removed worktree for #{args.issue} ({path})")
@@ -1123,10 +1175,18 @@ def cmd_ws(r, args):
 # adjudication, critique, signoff and the done-gate are deferred to later stages.
 
 def huddle_holder(issue):
-    """Lock value the huddle holds bus:lock:issue:N as. Deliberately NOT an agent
-    id: it makes a solo `bus claim` refuse (cmd_claim sees status:claimed + a lock
-    held by someone other than the claimer) while the huddle session is alive."""
+    """Legacy deterministic huddle holder kept for old metadata compatibility."""
     return f"huddle:issue-{issue}"
+
+
+def new_huddle_holder(issue):
+    """Unique holder for one huddle session, recognizable by _is_huddle_lock."""
+    return f"{huddle_holder(issue)}:{secrets.token_urlsafe(16)}"
+
+
+def huddle_meta_holder(meta, issue):
+    """Session holder from metadata, falling back to pre-token huddle metadata."""
+    return meta.get("session") or meta.get("holder") or huddle_holder(issue)
 
 
 def huddle_branch(issue):
@@ -1161,12 +1221,46 @@ def create_shared_branch(main, base, branch, allow_stale=False):
     return 0, base_commit
 
 
+def cleanup_shared_branch(main, branch, expected_commit):
+    """Delete remote huddle branch only if still at expected_commit."""
+    if not expected_commit:
+        return 1, "missing expected branch commit"
+    if not valid_git_ref(main, branch):
+        return 1, f"invalid branch ref {branch}"
+    rc, out, err = git(main, "ls-remote", "--heads", "origin", branch, check=False)
+    if rc != 0:
+        return 1, f"could not inspect remote branch {branch}: {err}"
+    if not out.strip():
+        return 0, f"remote branch {branch} already absent"
+    remote_commit = out.split()[0]
+    if remote_commit != expected_commit:
+        return 1, (f"remote branch {branch} moved to {remote_commit}; "
+                   f"left it intact")
+    lease = f"refs/heads/{branch}:{expected_commit}"
+    rc, _, err = git(main, "push", f"--force-with-lease={lease}",
+                     "origin", f":refs/heads/{branch}", check=False)
+    if rc != 0:
+        return 1, f"could not delete remote branch {branch}: {err}"
+    return 0, f"deleted remote branch {branch}"
+
+
+def cleanup_lost_huddle_branch(r, issue, main, branch, expected_commit):
+    """Clean up an orphan branch only when no newer huddle owns this issue."""
+    holder = r.get(k_lock(issue))
+    if holder:
+        return 1, f"left remote branch {branch} intact; issue lock now held by {holder}"
+    if r.get(k_huddle(issue)):
+        return 1, f"left remote branch {branch} intact; huddle metadata now exists"
+    return cleanup_shared_branch(main, branch, expected_commit)
+
+
 def cmd_huddle_open(r, args):
     """Open a huddle: take the issue lock as the huddle session, create the shared
     branch off origin/<base>, mark the issue claimed, record metadata, announce."""
     issue = args.issue
     lock = k_lock(issue)
     branch = huddle_branch(issue)
+    session = new_huddle_holder(issue)
     # Metadata has no TTL and outlives the lock; if it's present a huddle already
     # exists (or a prior one wasn't closed) — refuse before touching the lock.
     if _huddle_meta(r, issue):
@@ -1197,10 +1291,6 @@ def cmd_huddle_open(r, args):
                 f"bus huddle open: #{issue} is labelled status:claimed but the lock "
                 f"expired; resolve manually (bus release/status) before opening a huddle\n")
             return 1
-    # UNIQUE session token, not the deterministic huddle:issue-N — so a lock
-    # re-taken by a *different* session after our TTL lapses is distinguishable
-    # (the deterministic value would look identical and defeat compare-and-delete).
-    session = f"huddle:issue-{issue}:{os.urandom(4).hex()}"
     won = r.set(lock, session, nx=True, ex=args.ttl)
     if not won:
         sys.stderr.write(f"bus huddle open: issue #{issue} already locked by {r.get(lock)}\n")
@@ -1214,20 +1304,18 @@ def cmd_huddle_open(r, args):
         compare_delete_lock(r, issue, session)
         sys.stderr.write(f"bus huddle open: {val}; rolled back the lock on #{issue}\n")
         return 1
-    # create_shared_branch does slow network I/O (fetch/push). If our short TTL
-    # lapsed during it and another session took the lock, we must NOT write our
-    # metadata over theirs. Re-verify we still hold our OWN session token first.
-    if r.get(lock) != session:
-        sys.stderr.write(f"bus huddle open: lost the #{issue} lock during branch setup "
-                         f"(TTL lapsed, re-taken by {r.get(lock)}); aborting without "
-                         f"clobbering — retry. (branch {branch} may be an orphan)\n")
-        return 1
     base_commit = val
-    r.set(k_huddle(issue), json.dumps({
+    meta_json = json.dumps({
         "issue": issue, "opener": args.as_agent, "participants": [args.as_agent],
         "driver": args.as_agent, "branch": branch, "base": args.base,
         "base_commit": base_commit, "session": session, "status": "open",
-        "created_at": now_iso()}))
+        "created_at": now_iso()})
+    if not compare_set_huddle_meta(r, issue, session, meta_json):
+        rc, cleanup_msg = cleanup_lost_huddle_branch(r, issue, main, branch, base_commit)
+        sys.stderr.write(
+            f"bus huddle open: lost lock on #{issue} after branch creation; "
+            f"aborted before metadata/GitHub writes. {cleanup_msg}\n")
+        return 1
     r.set(k_pen(issue), args.as_agent)  # opener holds the write pen initially
     touch_presence(r, args.room, args.as_agent)
     # gh is best-effort: the lock + branch + metadata already exist, so a gh
@@ -1258,25 +1346,42 @@ def cmd_huddle_join(r, args):
     # lapsed (expired/reaped) session lock. If the lock is gone the huddle is
     # dead — don't join it. Advisory (pen/write-authority is deferred), so the
     # benign TOCTOU between this check and the add just appends to metadata.
-    raw0 = r.get(key)
-    if not raw0:
+    raw = r.get(key)
+    if not raw:
         sys.stderr.write(f"bus huddle join: no huddle on #{issue}\n")
         return 1
-    session = json.loads(raw0).get("session", huddle_holder(issue))
-    if r.get(k_lock(issue)) != session:
+    try:
+        meta = json.loads(raw)
+    except json.JSONDecodeError:
+        sys.stderr.write(f"bus huddle join: corrupt huddle metadata on #{issue}\n")
+        return 1
+    holder = huddle_meta_holder(meta, issue)
+    if r.get(k_lock(issue)) != holder:
         sys.stderr.write(f"bus huddle join: #{issue}'s huddle lock is gone "
                          f"(expired or reaped); ask the opener to reopen it\n")
         return 1
+    lock_key = k_lock(issue)
     with r.pipeline() as pipe:
         while True:
             try:
-                pipe.watch(key)
+                pipe.watch(key, lock_key)
                 raw = pipe.get(key)
                 if not raw:
                     pipe.unwatch()
                     sys.stderr.write(f"bus huddle join: no huddle on #{issue}\n")
                     return 1
-                meta = json.loads(raw)
+                try:
+                    meta = json.loads(raw)
+                except json.JSONDecodeError:
+                    pipe.unwatch()
+                    sys.stderr.write(f"bus huddle join: corrupt huddle metadata on #{issue}\n")
+                    return 1
+                holder = huddle_meta_holder(meta, issue)
+                if pipe.get(lock_key) != holder:
+                    pipe.unwatch()
+                    sys.stderr.write(f"bus huddle join: #{issue}'s huddle lock is gone "
+                                     f"(expired or reaped); ask the opener to reopen it\n")
+                    return 1
                 if args.as_agent in meta["participants"]:
                     pipe.unwatch()
                     break
@@ -1341,7 +1446,7 @@ def cmd_huddle_close(r, args):
     # else — so advancing status:pr-open would clobber their state. Either way we
     # ALWAYS clear the metadata: close is the only orphan-cleanup path and must
     # never leave meta behind (meta has no TTL; the lock does).
-    owned = compare_delete_lock(r, issue, meta.get("session", huddle_holder(issue)))
+    owned = compare_delete_lock(r, issue, huddle_meta_holder(meta, issue))
     err = None
     if owned:
         try:
@@ -1365,7 +1470,18 @@ def cmd_huddle_close(r, args):
     return 0
 
 
-def huddle_worktree(main, issue, agent):
+def register_huddle_worktree(r, issue, agent, path, branch, shared):
+    huddle = _huddle_meta(r, issue) or {}
+    old = _decode_ws_meta(r.get(k_worktree(issue, agent))) or {}
+    r.set(k_worktree(issue, agent), json.dumps({
+        "issue": issue, "agent": agent, "path": os.path.abspath(path),
+        "branch": branch, "base": huddle.get("base", ""),
+        "base_commit": huddle.get("base_commit", ""),
+        "kind": "huddle", "detached": True, "shared_branch": shared,
+        "created_at": old.get("created_at", now_iso())}))
+
+
+def huddle_worktree(r, main, issue, agent):
     """Ensure `agent` has a per-driver worktree for the huddle, fast-forwarded to
     the shared branch's tip. Per-driver worktrees give OS-level isolation (the
     ratified design); the SHARED source of truth is origin/huddle/issue-N, which
@@ -1394,12 +1510,14 @@ def huddle_worktree(main, issue, agent):
             else:
                 sys.stderr.write(f"huddle pen: #{issue} worktree has local commits not "
                                  f"on origin/{shared}; not resetting (push them first)\n")
+        register_huddle_worktree(r, issue, agent, path, local, shared)
         return path
     os.makedirs(root, exist_ok=True)
     rc, _, err = git(main, "worktree", "add", path, "-B", local, f"origin/{shared}", check=False)
     if rc != 0:
         sys.stderr.write(f"huddle pen: worktree add failed: {err}\n")
         return None
+    register_huddle_worktree(r, issue, agent, path, local, shared)
     return path
 
 
@@ -1447,7 +1565,7 @@ def cmd_pen_checkpoint(r, args):
     except RuntimeError as e:
         sys.stderr.write(f"bus pen checkpoint: {e}\n")
         return 1
-    path = huddle_worktree(main, issue, args.as_agent)
+    path = huddle_worktree(r, main, issue, args.as_agent)
     if not path:
         return 1
     git(path, "add", "-A", check=False)
