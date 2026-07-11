@@ -67,10 +67,10 @@ Concurrency is the product's core value *and* its core hazard. The shared-branch
 - Observed 4+ times (project memory): "no commits between" though the commit exists; PR merge/close ops silently reset a tip. Worktree isolation fixed *file* collisions, not *ref* collisions.
 
 ### Chosen approach — detect, refuse, and recover; never silently reset
-1. **Expected-tip leasing on every shared-branch write.** Record the last-pushed tip in Redis (`bus:huddle:tip:<issue>`, already surfaced as `pen status … tip=`). `pen checkpoint` pushes with `--force-with-lease=refs/heads/<branch>:<expected_tip>`. A racing external move makes the lease fail loudly instead of the push either clobbering or being clobbered.
-2. **Post-push verify.** After push, `ls-remote` the branch and assert the remote tip == our new HEAD. Mismatch → do **not** advance the Redis tip; emit a BLOCKING bus event and stop. This converts the current silent-reset failure into a detected, named failure.
+1. **Expected-tip leasing on every shared-branch write.** When `huddle_worktree()` syncs a driver to `origin/huddle/issue-N`, record that integrated tip in worktree/huddle metadata. `pen checkpoint` must use this recorded tip as `expected_tip`; it must **not** fetch and replace the expectation with a newer remote tip just before pushing. Before push, assert `expected_tip` is an ancestor of local `HEAD`, then push with `--force-with-lease=refs/heads/<branch>:<expected_tip>`. If an external actor moved the branch after the driver integrated it, the lease fails instead of clobbering unseen commits.
+2. **Post-push verify.** After push, `ls-remote` the branch and assert the remote tip == our new HEAD. Mismatch → do **not** update huddle metadata/signoff state; emit a BLOCKING bus event and stop. This converts the current silent-reset failure into a detected, named failure.
 3. **Recovery helper `bus huddle recover --issue N`.** Codifies the manual dangling-commit recovery from project memory: find the local commit that "vanished", `git fetch`, compare, and re-push under lease. Turns tribal knowledge into a command with a test.
-4. **Serialize create.** Replace `ls-remote`-then-push in `create_shared_branch` with an atomic create: `git push origin <base_commit>:refs/heads/<branch>` already fails if the ref exists **when** we drop the pre-check and rely on the push's own ref-exists failure — push is atomic server-side. Removing the TOCTOU pre-check is the fix, not adding a lock.
+4. **Make branch creation create-only before mutation.** A plain `git push <sha>:refs/heads/<branch>` is **not** enough: if a racing creator already made the branch at an older commit, Git can fast-forward their branch before we parse the output; if they made it at the same SHA, Git returns success with `[up to date]`. Keep the `ls-remote` pre-check only as a friendly early error, then run `git push --porcelain --force-with-lease=refs/heads/<branch>: origin <base_commit>:refs/heads/<branch>` and require the porcelain status to be `* ... [new branch]`. The empty expected lease rejects any existing ref before mutation; the porcelain check still catches same-SHA no-ops.
 
 ### Rejected alternatives
 - **A global Redis "git mutex" around all pushes** — rejected: does nothing about *external* (non-bus) pushers, which are the actual observed cause; gives false confidence and adds a new deadlock/expiry surface.
@@ -78,16 +78,18 @@ Concurrency is the product's core value *and* its core hazard. The shared-branch
 - **Retry-on-reset without leasing** — rejected: a blind retry can re-apply work onto a ref that legitimately moved, corrupting history.
 
 ### Concrete changes
-- `cmd_pen_checkpoint` (`bus:1585`): push with `--force-with-lease=<branch>:<expected_tip>`, read expected_tip from Redis, post-push `ls-remote` verify, update `bus:huddle:tip:<issue>` only on verified success.
-- `create_shared_branch` (`bus:1201`): drop the `ls-remote` pre-check; rely on atomic push failure; parse "already exists" from stderr for a clean message.
+- `huddle_worktree` / `register_huddle_worktree` (`bus:1484`/`bus:1473`): persist the exact shared-branch tip the driver integrated before editing.
+- `cmd_pen_checkpoint` (`bus:1585`): use that integrated tip as `expected_tip`; assert it is an ancestor of `HEAD`; push with `--force-with-lease=refs/heads/<branch>:<expected_tip>`; post-push `ls-remote` verify; update cached huddle tip metadata only on verified success.
+- `create_shared_branch` (`bus:1201`): keep `ls-remote` as a diagnostic pre-check, but use empty-expect `--force-with-lease=refs/heads/<branch>:` plus push porcelain as authoritative; success requires `[new branch]`, while `[up to date]`/`[rejected] (stale info)` means "branch already existed" and rolls back the lock without moving the ref.
 - New `cmd_huddle_recover` + subparser.
 
 ### Acceptance criteria
 - A test that starts two writers against one bare-origin branch: exactly one push succeeds; the loser gets a lease-rejection and a BLOCKING bus event, **no silent reset**, no lost commit.
+- Branch-create race tests: pre-create `huddle/issue-N` at the same `base_commit` and at an older commit. Same-SHA must reject `[up to date]`; older-commit must reject via empty lease before mutation.
 - `bus huddle recover` re-attaches a dangling commit in a scripted reproduction of the "no commits between" failure.
 
 ### Test strategy
-Bare-repo fixture with two worktrees; drive concurrent `pen checkpoint` calls; assert ref state + Redis tip + emitted event. This is the highest-value integration test in the suite.
+Bare-repo fixture with two worktrees; drive concurrent `pen checkpoint` calls; assert remote ref state + cached huddle-tip metadata + emitted event. This is the highest-value integration test in the suite.
 
 ---
 
@@ -103,7 +105,7 @@ Bare-repo fixture with two worktrees; drive concurrent `pen checkpoint` calls; a
 1. **Connection resilience** in `connect()`: pass `retry=Retry(ExponentialBackoff(), 3)`, `retry_on_error=[ConnectionError, TimeoutError]`, and `health_check_interval=30`. Keep `socket_timeout=5` (load-bearing for the chunked-block invariant) — retries wrap the chunk loop, they don't lengthen a single block.
 2. **A `with_redis` reconnect wrapper** for the long-lived loops (`cmd_wait`/`cmd_watch`): on `ConnectionError`, back off and re-`connect()` rather than exit. The agent survives a Redis restart instead of dying (mirrors `agent-loop.sh`'s own bus-error backoff at the shell layer).
 3. **Enable persistence** in `start-redis.sh`: `--appendonly yes --appendfsync everysec`. Locks/pen/huddle survive a restart; the message log is durable. Document the AOF file location and that prod should use a managed/replicated Redis.
-4. **Bound the stream:** `xadd(..., maxlen=N, approximate=True)` (N configurable, default generous). Prevents unbounded memory; `bus prune` remains for tighter operator control. **Caveat to weigh (codex-1):** a `maxlen` cap can drop a message an agent hasn't read yet — must be set well above the busiest cursor lag, or gated by the same cursor-behind check `cmd_prune` already implements.
+4. **Bound the stream only through cursor-aware retention.** Do **not** put `maxlen` on normal `cmd_send`: `xadd(..., maxlen=N, approximate=True)` can silently drop messages behind a lagging cursor, exactly what `cmd_prune` (`bus:542`) is written to prevent. Extract `safe_trim_room()` from `cmd_prune`, add JSON/dry-run output, and run it as a scheduled/operator retention job. If lagging cursors block trimming, emit a structured `retention_blocked` event naming the agents and boundary instead of dropping unread messages. Add an explicit stale-cursor policy: report absent agents whose cursor pins retention, require operator-driven cursor retirement/quarantine before destructive trim, and emit a `retention_forced` event if `--force` drops unread messages.
 
 ### Rejected alternatives
 - **Client-side retry only, no persistence** — rejected: survives blips but still loses all state on restart; the pen/lock loss is the more dangerous failure.
@@ -114,15 +116,17 @@ Bare-repo fixture with two worktrees; drive concurrent `pen checkpoint` calls; a
 - `connect()` (`bus:91`): `Retry`, `retry_on_error`, `health_check_interval`.
 - `cmd_wait` (`bus:393`) / `cmd_watch` (`bus:734`): wrap the block loop in reconnect-on-`ConnectionError`.
 - `scripts/start-redis.sh:30`: `--appendonly yes --appendfsync everysec`.
-- `cmd_send` (`bus:338`): `xadd(..., maxlen=BUS_STREAM_MAXLEN, approximate=True)` with cursor-safety note.
+- `cmd_prune` (`bus:542`): extract cursor-aware trim into a reusable helper; add `--json`/`--dry-run` so CI and operators can assert retention state; include lagging cursor details and a stale-cursor retirement path.
+- Optional scheduled retention wrapper: call the same helper with `BUS_STREAM_KEEP`, never `XADD MAXLEN`, and fail loudly if lagging cursors prevent trim.
 
 ### Acceptance criteria
 - Kill+restart Redis mid-session: an agent in `bus wait` reconnects and continues; claims/pen/huddle metadata are still present after restart.
 - A `ConnectionError` injected into a `cmd_send` retries and succeeds without crashing.
 - `socket_timeout` chunked-block behavior unchanged (regression test).
+- Retention with a lagging cursor refuses to trim, preserves the unread message, and emits machine-readable lag detail.
 
 ### Test strategy
-fakeredis for retry-path unit tests (inject `ConnectionError`); one integration test that actually SIGKILLs and restarts a real `redis-server` and asserts state survival + reconnect.
+fakeredis for retry-path unit tests (inject `ConnectionError`); one integration test that actually SIGKILLs and restarts a real `redis-server` and asserts state survival + reconnect; retention test seeds old messages plus a behind cursor and proves no unread drop.
 
 ---
 
@@ -132,24 +136,27 @@ fakeredis for retry-path unit tests (inject `ConnectionError`); one integration 
 `scripts/agent-loop.sh` already re-invokes an agent until it touches `$BUS_DONE_MARKER` (the codex/CLI path). The Claude Code Stop-hook path does **not** have this: `hooks/stop-hook.sh` only blocks-and-re-invokes when a *peer message* arrives (`RC_DELIVERED`); on `RC_NONE` it calls `allow_stop`. So a Claude worker that finishes step 1 (e.g. `claim`) and stops with no inbound message goes idle mid-task — the "one-step-per-wake, needs coordinator nudges" stall. "Autonomous" is therefore half-built for exactly the Claude workers we run most.
 
 ### Chosen approach
-Teach `stop-hook.sh` the same terminal-marker contract as `agent-loop.sh`:
-- On `RC_NONE` (no new messages), before `allow_stop`, check `$BUS_DIR/turn-done-$AGENT`. **Absent** → the agent has not signaled terminal → emit a `{"decision":"block"}` with the same CONTINUE prompt `agent-loop.sh` uses, decrementing a per-turn budget (`BUS_MAX_CONTINUE`, reuse the existing `turns-$AGENT` counter). **Present** → clear it and `allow_stop`.
-- The agent-system prompt already tells agents to `touch "$BUS_DONE_MARKER"` at a terminal handoff; wire `stop-hook.sh` to set/advertise `BUS_DONE_MARKER` so both paths share one contract.
+Teach `stop-hook.sh` the same terminal-marker contract as `agent-loop.sh`, with one extra state bit so idle Claude sessions are not trapped:
+- On `RC_DELIVERED`, set `ACTIVE_FILE="$BUS_DIR/active-$AGENT"`, compute `DONE_MARKER="$BUS_DIR/turn-done-$AGENT"`, remove any stale marker, and feed the bus message to the model with the exact marker path in the block reason (`When terminal, run: touch "<DONE_MARKER>"`). Do not rely on `export BUS_DONE_MARKER` inside the hook process; that environment does not propagate into an already-running Claude Code session.
+- On later `RC_NONE`, if `ACTIVE_FILE` is absent, `allow_stop` (no active bus turn). If active and marker is **absent**, emit `{"decision":"block"}` with the same CONTINUE prompt `agent-loop.sh` uses. If active and marker is **present**, clear marker + active file and `allow_stop`.
+- Use a separate `continue-$AGENT` counter for self-continues. Do not reuse `turns-$AGENT`: message-delivery runaway protection and MB-SPEED self-continue budget are different failure modes and must not starve each other.
+- Treat unexpected bus rc / Redis errors as retryable stop-hook failures (bounded backoff/block) rather than silent idle; B3 makes those rare, but Stop-hook should not hide them.
 
 ### Rejected alternatives
 - **Only fix `agent-loop.sh`, tell users to prefer it** — rejected: Claude Code users run the Stop-hook; leaving it message-driven means the most common worker still stalls.
 - **Always block until MAX_TURNS** — rejected: reintroduces runaway loops the marker was designed to stop; the marker is the whole point.
 
 ### Concrete changes
-- `hooks/stop-hook.sh`: after the `RC_NONE`/`allow_stop` branch, add the done-marker check + CONTINUE-block emission, capped by `BUS_MAX_CONTINUE` (reuse `COUNT_FILE`).
+- `hooks/stop-hook.sh`: add `ACTIVE_FILE`, add a separate continue counter, include the concrete done-marker path in every delivered/continue block reason, and gate `RC_NONE` through active+marker state before `allow_stop`.
 - `prompts/agent-system.md`: confirm the terminal-marker instruction is present and identical to the `agent-loop.sh` CONTINUE text (single contract).
 
 ### Acceptance criteria
 - A scripted Claude-Code Stop-hook run: agent claims, stops with no inbound message, is re-invoked via `decision:block` and continues to a pushed/blocked terminal state, then is allowed to stop.
+- A no-active-turn Stop-hook run with no messages stops normally; this prevents the self-continue logic from trapping an idle Claude session.
 - The continue budget caps at `BUS_MAX_CONTINUE`; a genuinely-done agent (marker present) stops immediately.
 
 ### Test strategy
-BATS/shell test invoking `stop-hook.sh` with a fake `bus` returning `RC_NONE` and a present/absent marker; assert stdout JSON (`decision:block` vs empty) and counter behavior.
+BATS/shell test invoking `stop-hook.sh` with a fake `bus` returning `RC_DELIVERED`, `RC_NONE`, and an unexpected rc; assert active-file creation, marker handling, stdout JSON (`decision:block` vs empty), and separate counter behavior.
 
 ---
 
@@ -178,36 +185,47 @@ The issue explicitly asks each author to name missed blockers. Assessed:
 
 | Candidate | Verdict | Rationale / where it lands |
 |-----------|---------|----------------------------|
-| **Observability** | **Fold into B1/B3** | No structured logs/metrics; failures are stderr prints. Minimum viable: a `--json` structured-event mode on `announce`/errors so an operator can tail machine-readable state. Not a standalone blocker at this scale, but the B2/B3 "emit a BLOCKING event on detected failure" work should emit *structured* events. |
+| **Observability** | **Promote to B6** | No structured logs/metrics; failures are stderr prints or prose bus messages. Unattended production needs machine-readable state for alerting: detected ref lease failures, Redis reconnects, retention blocked by lagging cursors, done-gate blocks, and stop-hook self-continue exhaustion. |
 | **Config / secrets** | **Low, note in B5** | Only config today is `BUS_REDIS_URL` / `BUS_GH_REPO` env (`bus:42`,`bus:114`); no secrets until B5's `requirepass`/HMAC. When B5 lands, secrets handling (no secret in argv, env or file only) becomes real. |
 | **Graceful shutdown** | **Fold into B3** | `__SHUTDOWN__` + stop-files exist (`agent-loop.sh`, `stop-hook.sh`), but there's no "drain in-flight pen/huddle state" on shutdown. The B3 durability work (AOF) covers the crash case; a clean `bus huddle close`-on-shutdown for the driver is a small add-on to B3/B4. |
 | **Versioning / release safety** | **New — small child issue** | `--version` exists but there's no changelog discipline, no schema-version stamp on Redis keys/envelope, and no migration story if an envelope field changes. Recommend: stamp an envelope/schema version in `make_fields`, and a `CHANGELOG.md` gated by CI (B1). Cheap insurance against a format change silently breaking live agents. |
 
-None of these outranks B1–B4; the two worth an explicit child issue are **structured observability** (rider on B2/B3) and **envelope schema-versioning** (rider on B1).
+### B6 — Structured observability  ·  effort **M**  ·  **cross-cutting, after B1**
+
+Unattended production cannot rely on a human watching prose. Add a small structured event layer, not a full telemetry stack:
+- `announce_event(r, room, frm, event_type, payload, topic="")` writes JSON in a reserved `kind="event"` envelope while preserving the human `announce()` path.
+- Emit events for B2 lease rejection / post-push mismatch, B3 reconnect / retention blocked / Redis persistence mode, B4 self-continue budget exhausted, and done-gate open blocks (`donegate`, `bus:1792`).
+- Add `bus events --topic issue-N --type lease_rejected --json` or extend `watch --json` with a kind/type filter. Keep the first version Redis-native; exporters to Prometheus/OpenTelemetry can wait.
+- Treat event payloads as untrusted advisory data just like message bodies. Use allowlisted fields and redaction for secrets/URLs/tokens; never emit raw exception dumps, Redis URLs with credentials, HMAC material, or environment values.
+
+Acceptance: every reliability failure introduced by B2–B4 has a JSON event with stable `type`, `issue`, `agent`, `severity`, and `action_required` fields, and tests assert those fields. This is a child issue because it changes the on-stream envelope semantics and should ride after B1's schema tests.
+
+**Envelope schema-versioning** remains a small child issue: add `schema_version` in `make_fields` (`bus:258`) and compatibility tests before any event-envelope change ships.
 
 ---
 
 ## Sequencing — reasoned, not a list
 
 1. **B1 first (tests + CI).** It is the multiplier: every subsequent change to `bus` — especially the concurrency-sensitive B2 and the restart-sensitive B3 — is only *verifiable* once there's a hermetic test harness and a CI gate. Landing B2/B3 without B1 means proving reliability fixes by hand, which is exactly the "human watching" posture we're trying to leave. Highest safety-per-effort; unblocks the rest.
-2. **B2 + B3 next, in parallel** (different surfaces: B2 = git push path, B3 = redis layer + start script). Both are "core reliability" and both now have tests to land against. B2 is **L** and the trickiest (adversarial concurrency tests); B3 is **M**. They don't touch the same functions, so two child issues can proceed concurrently without ref/file collision.
-3. **B4 after B1** (needs the shell-test harness; independent of B2/B3). **S** effort — can slot in anytime after B1, ideally alongside B2/B3.
-4. **B5 deferred.** Boundary documented now; build only when multi-host is a real requirement.
-5. **Riders:** structured observability rides B2/B3; envelope schema-versioning rides B1.
+2. **Schema-versioning next (small rider on B1).** B6 events and any future auth fields change the stream envelope; stamp `make_fields` first so old/new agents fail visibly instead of silently misreading messages.
+3. **B6 observability skeleton before B2/B3 are complete.** B2/B3 should not invent ad hoc prose errors and then retrofit alerts later; define the event helper and stable fields once, then have the reliability fixes emit through it.
+4. **B2 + B3 next, in parallel** (different surfaces: B2 = git push path, B3 = redis layer + start script). Both are "core reliability" and both now have tests to land against. B2 is **L** and high-variance (lease/recover/concurrency tests); B3 is **M**. They don't touch the same functions, so two child issues can proceed concurrently without ref/file collision.
+5. **B4 after B1** (needs the shell-test harness; independent of B2/B3). **S** effort — can slot in anytime after B1, ideally alongside B2/B3.
+6. **B5 deferred.** Boundary documented now; build only when multi-host is a real requirement.
 
 ```
-B1 (tests+CI) ──┬──> B2 (git-ref lease)  ─┐
-                ├──> B3 (redis resilience)─┼──> production-ready
-                └──> B4 (stop-hook parity)─┘
+B1 (tests+CI) ──> schema version ──> B6 (events) ─┬──> B2 (git-ref lease)  ─┐
+                                                   ├──> B3 (redis resilience)─┼──> production-ready
+                                                   └──> B4 (stop-hook parity)─┘
 B5 (trust) ...................... deferred (doc boundary now)
 ```
 
 ---
 
-## Adversarial notes for codex-1 (challenge these — they are my weakest)
+## Codex-1 adversarial review findings incorporated
 
-1. **B2 create-branch fix.** I claim dropping the `ls-remote` pre-check and relying on atomic push failure removes the TOCTOU. Verify `git push <sha>:refs/heads/<new>` actually fails atomically server-side when the ref exists (it should — non-fast-forward / already-exists), and that we parse the right stderr. If a force-push could still clobber, my fix is wrong.
-2. **B3 `maxlen` vs unread cursors.** A `maxlen` cap can silently drop a message a lagging agent hasn't read — the exact failure `cmd_prune` guards against with a cursor-behind check. Is `approximate=True maxlen` safe at all here, or must stream trimming *always* go through the cursor-aware prune path? I lean toward "maxlen only as a catastrophic backstop, real trim via prune" — challenge that.
-3. **B4 counter reuse.** I reuse `turns-$AGENT` (`COUNT_FILE`) for both the peer-message runaway guard and the new self-continue budget. Are those two budgets actually the same thing, or does conflating them let one starve the other? Separate counters may be correct.
-4. **Effort on B2.** I sized B2 as **L**. If the lease + recover + concurrency tests are as fiddly as project memory suggests, is it under-sized? Name the sub-task you'd expect to blow the estimate.
-5. **Missed blocker I may have under-weighted:** structured observability. I folded it into B1/B3 as a rider. Argue whether unattended-prod actually needs it as a first-class blocker (an operator who isn't watching needs machine-readable state to alert on).
+1. **B2 branch write safety needed two corrections.** A lease against a freshly fetched remote tip can still clobber unseen commits; the plan now leases against the driver's last integrated tip and requires that tip to be an ancestor of `HEAD`. Local bare-repo reproduction also showed plain `git push <sha>:refs/heads/<new>` can mutate or no-op against existing refs; the plan now uses empty-expect `--force-with-lease` plus porcelain `[new branch]`.
+2. **B3 `XADD MAXLEN` is unsafe for this bus model.** Per-agent cursors mean approximate maxlen can drop unread messages. The plan now forbids normal-send maxlen and routes retention through cursor-aware `cmd_prune` semantics.
+3. **B4 needs active-turn state, visible marker path, and separate counters.** A raw "marker absent means continue" rule would trap idle Claude sessions, and an `export` inside Stop-hook does not reach the Claude process. The plan now adds `ACTIVE_FILE`, includes the concrete marker path in the block reason, and separates message-runaway from self-continue budgets.
+4. **B2 remains L but high variance.** The risk is not the lease flag; it is building deterministic reproductions for vanished commits, same-SHA branch races, and post-push mismatch without network flake.
+5. **Observability is first-class for unattended production.** It is now B6, sequenced before B2/B3/B4 finish so reliability failures have stable JSON events from the start.
