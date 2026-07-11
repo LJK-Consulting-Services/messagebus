@@ -12,6 +12,26 @@ ROOT = Path(__file__).resolve().parents[1]
 _REAL_REDIS_MODULE = redis
 
 
+class BusFakeRedis(fakeredis.FakeRedis):
+    def eval(self, _script, numkeys, *args):
+        keys = args[:numkeys]
+        argv = args[numkeys:]
+        if numkeys == 1:
+            key = keys[0]
+            holder = argv[0]
+            if self.get(key) == holder:
+                return self.delete(key)
+            return 0
+        if numkeys == 2:
+            lock_key, meta_key = keys
+            holder, meta_json = argv
+            if self.get(lock_key) == holder:
+                self.set(meta_key, meta_json)
+                return 1
+            return 0
+        return super().eval(_script, numkeys, *args)
+
+
 @pytest.fixture(scope="session")
 def bus_module():
     loader = importlib.machinery.SourceFileLoader("bus_under_test", str(ROOT / "bus"))
@@ -23,7 +43,7 @@ def bus_module():
 
 @pytest.fixture
 def fake_redis():
-    return fakeredis.FakeRedis(decode_responses=True)
+    return BusFakeRedis(decode_responses=True)
 
 
 @pytest.fixture
