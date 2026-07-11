@@ -1188,7 +1188,7 @@ def cmd_huddle_open(r, args):
                          f"the Redis lock only for this huddle open\n")
     elif "status:claimed" in labels:
         held = r.get(lock)
-        if held and not is_session_holder(held):
+        if held and not _is_huddle_lock(held):
             sys.stderr.write(f"bus huddle open: #{issue} already claimed by {held} "
                              f"(label set)\n")
             return 1
