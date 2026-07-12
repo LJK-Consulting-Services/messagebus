@@ -1839,10 +1839,17 @@ def _huddle_meta(r, issue):
 
 _NO_HUDDLE_SESSION = object()
 
-# "whatever challenge is there, it is moot" — the pen is being moved by an act that
-# resolves any challenge regardless of its contents (a concede, or a take of a pen
-# nobody holds). Spelled as a sentinel rather than a default so that a caller moving
-# the pen away from a PRESENT holder cannot drop the CAS by omission: the MULTI
+# "whatever challenge is there, it is moot." A challenge binds to the CURRENT holder
+# (`_record_pen_challenge` only records against a non-null `expected_driver`, and
+# `pen deny` refuses to act on one that names anyone else), so exactly two acts moot
+# it — for two different reasons, and a caller must match one of them to use this:
+#   - `pen pass`: the agent conceding IS the challenged driver, so any challenge in
+#     flight necessarily names them, and conceding is the protocol's own resolution.
+#   - taking an UNHELD pen: no live challenge can exist against a pen nobody holds, so
+#     anything still there names a driver who is gone.
+# A caller moving the pen off a PRESENT holder is a BYSTANDER to that holder's
+# challenge and must CAS on it (`cmd_pen_take` passes `raw`). Spelled as a sentinel
+# rather than a default so that caller cannot drop the CAS by omission: the MULTI
 # DELETEs the challenge key unconditionally, so a caller with no `challenge_expect`
 # destroys a rival challenge it never read.
 _ANY_CHALLENGE = object()
