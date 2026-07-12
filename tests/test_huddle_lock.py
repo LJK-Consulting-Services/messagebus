@@ -9,6 +9,8 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
+import fakeredis
+
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.modules.setdefault("redis", types.SimpleNamespace(WatchError=Exception))
@@ -18,49 +20,16 @@ bus = importlib.util.module_from_spec(SPEC)
 LOADER.exec_module(bus)
 
 
-class FakeRedis:
-    def __init__(self):
-        self.data = {}
+def FakeRedis():
+    """fakeredis, which runs the bus's REAL Lua (the pinned dev env has `lupa`).
 
-    def get(self, key):
-        return self.data.get(key)
-
-    def set(self, key, value, nx=False, ex=None):
-        if nx and key in self.data:
-            return False
-        self.data[key] = value
-        return True
-
-    def delete(self, key):
-        return self.data.pop(key, None) is not None
-
-    def eval(self, _script, numkeys, *args):
-        keys = args[:numkeys]
-        argv = args[numkeys:]
-        if numkeys == 1:
-            key = keys[0]
-            holder = argv[0]
-            if self.data.get(key) == holder:
-                self.delete(key)
-                return 1
-            return 0
-        if numkeys == 2:
-            lock_key, meta_key = keys
-            holder, meta_json = argv
-            if self.data.get(lock_key) == holder:
-                self.data[meta_key] = meta_json
-                return 1
-            return 0
-        if numkeys == 4:
-            lock_key, meta_key, pen_key, chal_key = keys
-            holder, meta_json, pen_holder = argv
-            if self.data.get(lock_key) == holder:
-                self.data[meta_key] = meta_json
-                self.data[pen_key] = pen_holder
-                self.delete(chal_key)
-                return 1
-            return 0
-        raise AssertionError(f"unexpected eval key count {numkeys}")
+    This used to be a hand-rolled dict with an `eval` that ignored the script text and
+    dispatched on ARITY, so a one-key script was executed as a compare-and-DELETE
+    whatever it actually said. Every CAS test in this file therefore asserted the
+    double's behaviour, not the bus's: corrupting CAS_DELETE_LUA or CAS_SET_META_LUA
+    left the suite green (#116).
+    """
+    return fakeredis.FakeRedis(decode_responses=True)
 
 
 class HuddleLockTest(unittest.TestCase):
