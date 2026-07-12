@@ -681,9 +681,15 @@ def test_real_redis_close_regates_when_the_pen_is_taken_inside_the_gate_window(
     taker = bus_module.connect(redis_url)
 
     def take_the_pen(issue):
+        # `challenge_expect=None` is passed EXPLICITLY, and must stay explicit. #124
+        # (PR #124) makes this argument mandatory and re-points its meaning: today
+        # `None` skips the challenge check, after #124 it asserts "no challenge is
+        # open" — which is true here and is the stricter of the two. Passing it
+        # spells the same intent under both signatures; omitting it is a TypeError
+        # the moment #124 lands.
         assert bus_module._set_driver(
             taker, issue, "agent-b", pen_to="agent-b", pen_expect="agent-a",
-            expected_session=f"huddle:issue-{issue}:session")
+            expected_session=f"huddle:issue-{issue}:session", challenge_expect=None)
 
     _assert_close_refuses_when_the_pen_moves_mid_gate(
         bus_module, ns, redis_url, monkeypatch, take_the_pen)
