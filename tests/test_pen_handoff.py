@@ -1,3 +1,4 @@
+import inspect
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -595,3 +596,35 @@ def test_set_driver_refuses_a_driver_who_is_not_a_participant(bus_module, fake_r
     assert moved is False
     assert fake_redis.get(bus_module.k_pen(79)) == "alice"
     assert json.loads(fake_redis.get(bus_module.k_huddle(79))) == meta
+
+
+# The guards above are enforced by the SIGNATURE, and a signature is invisible to a
+# behavioural test: restore `expected_session=None` / `challenge_expect=_ANY_CHALLENGE`
+# as defaults and every other test in this suite still passes, because they all pass the
+# arguments anyway. Only Python's own arity check stands between the four guards and a
+# silent regression to "defaulted-but-always-overridden" — the exact state #112 was
+# filed to remove. This test IS that enforcement.
+GUARDS_THAT_MUST_NOT_BE_OMITTABLE = (
+    "pen_to", "pen_expect", "expected_session", "challenge_expect",
+)
+
+
+@pytest.mark.parametrize("param", GUARDS_THAT_MUST_NOT_BE_OMITTABLE)
+def test_set_driver_guard_params_are_not_omittable(bus_module, param):
+    """Each guard must be keyword-only AND have no default.
+
+    Keyword-only alone is not enough: a default is what lets a caller drop the CAS by
+    omission. `challenge_expect` is the sharp one — the MULTI DELETEs the challenge key
+    unconditionally, so a caller that omits it destroys a rival challenge it never read.
+    """
+    sig = inspect.signature(bus_module._set_driver)
+
+    assert param in sig.parameters, f"_set_driver lost its `{param}` guard entirely"
+    p = sig.parameters[param]
+    assert p.kind is inspect.Parameter.KEYWORD_ONLY, (
+        f"`{param}` must be keyword-only: a positional guard can be supplied by accident"
+    )
+    assert p.default is inspect.Parameter.empty, (
+        f"`{param}` has a default again — a caller can now omit it and silently disable "
+        f"the guard. That is #112, reintroduced."
+    )
