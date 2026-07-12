@@ -360,3 +360,102 @@ def test_real_redis_pen_pass_keeps_a_join_that_lands_mid_meta_write(
         assert verify.get(bus_module.k_pen(issue)) == "agent-a"
     finally:
         _delete_issue_keys(verify, bus_module, issue)
+
+
+# --- done-gate TOCTOU on the close path (#92) -----------------------------------
+#
+# The sites above lose a participant by OVERWRITING the blob. This one loses one by
+# never re-reading it: the gate ran on a snapshot taken before the join, and the
+# close then deleted the very state the joiner needed in order to sign.
+
+
+PRESENT = ("agent-a", "agent-b", "agent-c")
+
+
+def test_real_redis_close_regates_on_a_join_inside_the_gate_window(
+    bus_module, ns, redis_url, monkeypatch, no_github,
+):
+    """A join landing inside the close's gate window must not slip past the done-gate.
+
+    This is a gate BYPASS, not a cosmetic race. A and B have both signed at the tip,
+    so the gate is legitimately satisfied for the participants the closer read. C
+    joins while the close is in flight; the pre-fix close gated on a participant list
+    that never contained C, passed, and deleted the whole huddle — including the
+    sign-off key C would have signed. C is silently merged over.
+
+    Under the fix the join aborts the EXEC, the close re-gates against the fresh
+    participant list, and C's missing sign-off refuses the close. The abort is what
+    makes this deterministic rather than timing-dependent.
+    """
+    issue = _issue_id()
+    tip = "c" * 40
+    r = bus_module.connect(redis_url)
+    verify = bus_module.connect(redis_url)
+    joiner = bus_module.connect(redis_url)
+
+    try:
+        _seed_huddle(r, bus_module, issue, ["agent-a", "agent-b"], "agent-a")
+        # The shared branch is not what's under test; pin the tip so the gate turns
+        # purely on who has signed it.
+        monkeypatch.setattr(bus_module, "_shared_tip", lambda _issue: tip)
+        # Closer + B have both signed AT THE TIP: without C the gate passes, so a
+        # close that ignores C returns 0 rather than failing for some unrelated reason.
+        r.set(bus_module.k_signoff(issue), json.dumps({"agent-a": tip, "agent-b": tip}))
+        # An ABSENT participant does not hold the gate, so C must be present — else
+        # this would pass for the wrong reason (C skipped, not C checked).
+        for agent in PRESENT:
+            r.set(bus_module.k_presence("integration", agent), "now", ex=60)
+
+        # where="any" on purpose: the fixed close reads the key through the watching
+        # pipeline, the pre-fix close through the client. Hooking only one would fire
+        # against a single version — and the negative control would then fail for want
+        # of a concurrent join rather than for losing it.
+        state = _fire_once_on_huddle_read(
+            monkeypatch, r, bus_module, issue,
+            lambda: bus_module.cmd_huddle_join(
+                joiner, ns(issue=issue, as_agent="agent-c", room="integration")))
+
+        rc = bus_module.cmd_huddle_close(
+            r, ns(issue=issue, as_agent="agent-a", room="integration", force=False))
+
+        assert state["fired"], "the concurrent join never landed — race not exercised"
+        assert rc == 1, "the done-gate passed with a present, unsigned participant"
+        # A refused close must leave the huddle INTACT — C still has to be able to
+        # sign. Asserting rc alone would miss a close that refuses but deletes anyway.
+        meta = json.loads(verify.get(bus_module.k_huddle(issue)))
+        assert "agent-c" in meta["participants"], "the join was lost by the close"
+        assert verify.get(bus_module.k_signoff(issue)) is not None
+        assert verify.get(bus_module.k_lock(issue)) is not None
+    finally:
+        _delete_issue_keys(verify, bus_module, issue)
+        verify.delete(*(bus_module.k_presence("integration", a) for a in PRESENT))
+
+
+def test_real_redis_close_still_closes_when_the_gate_is_genuinely_met(
+    bus_module, ns, redis_url, monkeypatch, no_github,
+):
+    """The WATCH/retry must not break the ordinary close — without this, the test
+    above would also pass against a `cmd_huddle_close` that never closes anything."""
+    issue = _issue_id()
+    tip = "c" * 40
+    r = bus_module.connect(redis_url)
+    verify = bus_module.connect(redis_url)
+
+    try:
+        _seed_huddle(r, bus_module, issue, ["agent-a", "agent-b"], "agent-a")
+        monkeypatch.setattr(bus_module, "_shared_tip", lambda _issue: tip)
+        r.set(bus_module.k_signoff(issue), json.dumps({"agent-a": tip, "agent-b": tip}))
+        for agent in ("agent-a", "agent-b"):
+            r.set(bus_module.k_presence("integration", agent), "now", ex=60)
+
+        assert bus_module.cmd_huddle_close(
+            r, ns(issue=issue, as_agent="agent-a", room="integration", force=False)) == 0
+
+        # Lock released and every huddle key gone — the close's whole contract.
+        assert verify.get(bus_module.k_huddle(issue)) is None
+        assert verify.get(bus_module.k_lock(issue)) is None
+        assert verify.get(bus_module.k_signoff(issue)) is None
+    finally:
+        _delete_issue_keys(verify, bus_module, issue)
+        verify.delete(*(bus_module.k_presence("integration", a)
+                        for a in ("agent-a", "agent-b")))
