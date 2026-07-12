@@ -2312,22 +2312,30 @@ def cmd_huddle_close(r, args):
       * `huddle join` grows `participants` in the metadata blob. A join landing after
         the gate's read added a participant the gate never checked for a sign-off —
         and the delete then destroyed the sign-off key they would have signed.
-      * `signoff --block` writes k_block and NOTHING else. Watching only the metadata
-        key did not help: a block landing after the gate read an empty block list left
-        the WATCH clean, so EXEC committed and the delete threw the block away. The
-        huddle closed over a live objection.
+      * `signoff --block` writes k_block and never touches the metadata blob. Watching
+        only the metadata key did not help: a block landing after the gate read an empty
+        block list left the WATCH clean, so EXEC committed and the delete threw the block
+        away. The huddle closed over a live objection.
     Watching both means such a write either lands before the gate (and is seen) or
     aborts our EXEC (and we re-gate against it).
 
-    k_signoff is deliberately NOT watched. Writes to it only ever ADD a sign-off at
-    the current tip — there is no unsign path, and `--block` writes k_block instead —
-    so a concurrent write can only make the gate MORE satisfied, never turn a refusal
-    into a pass. Watching it would buy nothing and abort the close on every sign-off.
+    k_signoff is deliberately NOT watched. State the property in the direction that
+    matters: a concurrent sign-off cannot turn a PASS into a REFUSAL. It can only add a
+    sign-off at the tip the gate just read, so it can make a REFUSAL stale — the safe
+    direction, and one we have already bailed on by then. An unwatched key can only hurt
+    you if it could invalidate the verdict you ACTED on, and this one cannot. Watching it
+    would abort the close on every sign-off and buy nothing.
+    (`cmd_signoff` is an upsert, `{**s, agent: tip}`, so a re-sign REPLACES that agent's
+    tip. That only subtracts a sign-off the gate counted if the tip moved underneath us —
+    which is #95's hole, below, not a second one.)
 
-    The presence keys (`donegate` -> `_holder_present`) are not watched either. They
-    carry a TTL, and Redis does not reliably abort a WATCH on key EXPIRY, so watching
-    them would be unsound rather than merely expensive — and a participant whose
-    presence lapses mid-gate is anyway indistinguishable from one who lapsed just after.
+    The presence keys (`donegate` -> `_holder_present`) are not watched either, and this
+    one is structural, not a judgement call: `_holder_present` resolves an agent by GLOB
+    — `scan_iter(match="bus:presence:*:{holder}")` — because a lock is global and the
+    agent may be live in any room, so the closer does not know the key's name. WATCH
+    takes literal keys and cannot watch a pattern. Presence is therefore unwatchable,
+    full stop. It is also the gate input we least need frozen: a participant whose
+    presence lapses mid-gate is indistinguishable from one who lapses just after it.
 
     NOT covered, by construction: the shared git tip (`_shared_tip`, read by the gate)
     is not a Redis key, so no WATCH can freeze it. A checkpoint push landing in the

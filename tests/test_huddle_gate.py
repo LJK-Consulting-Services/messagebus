@@ -27,14 +27,20 @@ from unittest import mock
 
 try:
     import fakeredis
+except ImportError:  # pragma: no cover - suite skips cleanly without the dep
+    fakeredis = None
 
+if fakeredis is not None:
     # The shared double, which mirrors the bus's Lua CAS scripts in Python — on the
     # client AND on the pipeline. fakeredis only speaks EVAL when `lupa` is installed,
     # which CI does not install, so a raw FakeStrictRedis dies on the compare-and-delete
     # that `huddle close` now queues inside its MULTI (#92).
+    #
+    # Imported OUTSIDE the try above on purpose: folding it in would turn a broken
+    # conftest into a silent "fakeredis not installed" skip of this whole suite, which is
+    # the same shape of machine-dependent false green that let this file ship without
+    # ever seeding k_lock.
     from conftest import BusFakeRedis
-except ImportError:  # pragma: no cover - suite skips cleanly without the dep
-    fakeredis = None
 
 _BUS_PATH = os.path.join(os.path.dirname(__file__), os.pardir, "bus")
 

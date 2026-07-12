@@ -2,7 +2,6 @@ import argparse
 import functools
 import importlib.machinery
 import importlib.util
-import types
 from pathlib import Path
 
 import fakeredis
@@ -74,7 +73,9 @@ class BusFakeRedis(fakeredis.FakeRedis):
 
     def pipeline(self, transaction=True, shard_hint=None):
         pipe = super().pipeline(transaction=transaction, shard_hint=shard_hint)
-        pipe.eval = types.MethodType(functools.partial(_mirror_cas_eval, client=self), pipe)
+        # An instance attribute, so no descriptor binding happens on lookup — `partial`
+        # supplying `pipe` is all the binding this needs.
+        pipe.eval = functools.partial(_mirror_cas_eval, pipe, client=self)
         return pipe
 
 
