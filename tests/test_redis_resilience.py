@@ -360,6 +360,64 @@ def test_drain_leaves_the_pen_takeable_at_once_and_syncs_huddle_meta(
     assert "force-take available" not in out  # the old 120s-wait path
 
 
+def test_drain_clears_the_driver_when_its_own_del_reply_was_lost(
+        bus_module, fake_redis, ns, monkeypatch, capsys):
+    """#94: the CAS's 0 does not mean "I didn't delete it".
+
+    `retry_on_error` (B3, #83) re-sends an EVAL whose reply was lost. The re-send's
+    GET sees the key its OWN first attempt deleted, so the CAS returns 0 for a delete
+    that landed. Gating the driver-clear on that 0 released the pen but left
+    `meta['driver']` naming the drained agent — `huddle status` then reports a driver
+    that `pen status` says does not exist.
+
+    The stub reproduces exactly that double-execution state: key gone, result 0.
+    """
+    monkeypatch.setattr(bus_module, "_ws_meta", lambda *_a, **_kw: None)
+    fake_redis.set(bus_module.k_pen(44), "claude-2")
+    fake_redis.set(bus_module.k_huddle(44), json.dumps({
+        "issue": 44, "opener": "claude-2", "participants": ["claude-2", "codex-1"],
+        "driver": "claude-2", "branch": "huddle/issue-44", "status": "open"}))
+
+    def lost_reply_delete(r, key, value):
+        assert (key, value) == (bus_module.k_pen(44), "claude-2")
+        r.delete(key)   # attempt 1 landed...
+        return 0        # ...and the re-sent attempt found the key already gone
+
+    monkeypatch.setattr(bus_module, "compare_delete", lost_reply_delete)
+
+    assert bus_module.cmd_drain(fake_redis, ns(as_agent="claude-2", force=False,
+                                               json=True)) == 0
+
+    assert fake_redis.get(bus_module.k_pen(44)) is None
+    assert json.loads(fake_redis.get(bus_module.k_huddle(44)))["driver"] == ""
+    # and the release is still REPORTED — the pen really did go away
+    assert json.loads(capsys.readouterr().out)["pens_released"] == ["44"]
+
+
+def test_drain_neither_releases_nor_clears_a_pen_a_peer_now_holds(
+        bus_module, fake_redis, ns, monkeypatch, capsys):
+    """The negative control on the fix above: "clear the driver for every pen we
+    held" must NOT become "clear the driver for every pen we ever held".
+
+    A peer force-took the pen between our scan and our release, and their take
+    installed driver=peer. Both the CAS and the driver-CAS must refuse, and we must
+    not announce a release we did not perform.
+    """
+    monkeypatch.setattr(bus_module, "_ws_meta", lambda *_a, **_kw: None)
+    monkeypatch.setattr(bus_module, "_held_by", lambda *_a: ["44"])  # our stale scan
+    fake_redis.set(bus_module.k_pen(44), "codex-1")                  # peer holds it now
+    fake_redis.set(bus_module.k_huddle(44), json.dumps({
+        "issue": 44, "opener": "claude-2", "participants": ["claude-2", "codex-1"],
+        "driver": "codex-1", "branch": "huddle/issue-44", "status": "open"}))
+
+    assert bus_module.cmd_drain(fake_redis, ns(as_agent="claude-2", force=False,
+                                               json=True)) == 0
+
+    assert fake_redis.get(bus_module.k_pen(44)) == "codex-1"          # never yanked
+    assert json.loads(fake_redis.get(bus_module.k_huddle(44)))["driver"] == "codex-1"
+    assert json.loads(capsys.readouterr().out)["pens_released"] == []  # nor claimed
+
+
 def test_drain_is_never_silent_even_with_no_pen(bus_module, fake_redis, ns, events_of,
                                                 monkeypatch, capsys):
     """Clearing presence drops the agent out of the done-gate's present-participant

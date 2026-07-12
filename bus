@@ -1045,14 +1045,28 @@ def cmd_drain(r, args):
             f"work. Run `bus pen checkpoint --as {agent} --issue <N>` first, or --force to "
             f"drop the pen and strand it.\n")
         return 1
-    released = [i for i in pens if compare_delete(r, k_pen(i), agent)]
+    # Clear the driver for every pen we HELD, not only the ones the CAS admits to
+    # deleting (#94). `retry_on_error` (B3, #83) re-sends an EVAL whose reply was
+    # lost, and the re-send's GET sees the key its OWN first attempt deleted — so
+    # `compare_delete` reports 0 for a delete that landed. Gating the driver-clear
+    # on that 0 left `meta['driver']` naming an agent who had drained.
+    #
+    # `_set_driver(expect=agent)` is itself a CAS evaluated inside the transaction,
+    # so it is safe to run unconditionally and is the honest tiebreak:
+    #   * reply arrives      -> deleted=1, cleared=True   -> released
+    #   * OUR reply was lost -> deleted=0, driver still us -> cleared=True -> released
+    #   * a peer took the pen-> their take installed driver=peer, so the CAS refuses
+    #                           -> neither -> NOT released, and we never clobber them
+    #   * huddle closed      -> deleted=1, no meta to clear -> released
+    # Reporting stays gated on the pair: announcing a release for a pen a peer
+    # legitimately holds would be a worse lie than the one this fixes.
+    released = []
+    for issue in pens:
+        deleted = compare_delete(r, k_pen(issue), agent)
+        cleared = _set_driver(r, issue, "", expect=agent)
+        if deleted or cleared:
+            released.append(issue)
     for issue in released:
-        # Keep the huddle metadata in step with the pen key, exactly as pen
-        # pass/take do. A stale `driver` here makes `huddle status` lie. The
-        # "still ours?" test is the CAS, so it is evaluated inside the
-        # transaction: a `pen take` that grabbed the freed pen between our read
-        # and our write must not have its driver cleared by our stale view.
-        _set_driver(r, issue, "", expect=agent)
         announce(r, args.room, agent,
                  f"draining on shutdown: released the write pen on #{issue} "
                  f"(unheld — any participant may `pen take` it now)",
@@ -1703,12 +1717,14 @@ def _set_driver(r, issue, driver, expect=None):
     Not `_mutate_json`: that recreates a deleted key from `default` (resurrecting
     a closed huddle as a participant-less stub) and has no abort path.
 
-    Returns True if the driver was written; False if the huddle is gone or
-    `expect` did not match. Corrupt metadata raises (like `_huddle_meta`) rather
-    than silently no-opping — a driver write we can't complete must be loud.
-    (`cmd_huddle_join` instead prints and returns 1 on corrupt metadata; here
-    the callers discard the return value, so raising is the only way the failure
-    surfaces at all.)
+    Returns True if the driver was written; False if the huddle is gone or `expect`
+    did not match — in which case NOTHING was written. That return is LOAD-BEARING
+    and every caller acts on it (#94): `pen pass`/`pen take` abort on False rather
+    than move the pen into a huddle that no longer exists, and `drain` uses it as the
+    tiebreak for whether the pen was really ours to release. Corrupt metadata raises
+    (like `_huddle_meta`) rather than silently no-opping — a driver write we can't
+    complete must be loud. (`cmd_huddle_join` instead prints and returns 1 on corrupt
+    metadata.)
     """
     key = k_huddle(issue)
     with r.pipeline() as pipe:
@@ -2225,8 +2241,18 @@ def cmd_pen_pass(r, args):
         sys.stderr.write(f"bus pen pass: checkpoint failed to push; keeping the pen with "
                          f"{args.as_agent}. Fix the push, then retry the pass.\n")
         return 1
+    # Driver FIRST, and only move the pen if it landed (#94). `_set_driver` returns
+    # False when the huddle is gone — and `huddle close` is exactly what can land in
+    # the window above (the metadata read, then a git push in `pen checkpoint`).
+    # Discarding that False, as this did, meant the blind `r.set` below RESURRECTED a
+    # pen key for a closed huddle — close is the only path that deletes k_pen, so the
+    # stray key then outlives every cleanup — and announced a handoff into a huddle
+    # that no longer exists. Aborting first leaves nothing written.
+    if not _set_driver(r, issue, args.to):
+        sys.stderr.write(f"bus pen pass: the huddle on #{issue} is gone (closed while "
+                         f"passing); the pen was NOT passed. Your work is pushed.\n")
+        return 1
     r.set(k_pen(issue), args.to)
-    _set_driver(r, issue, args.to)
     r.delete(k_penchal(issue))  # a pass settles any open challenge (concession)
     announce(r, args.room, args.as_agent, f"passed the pen on #{issue} to {args.to}",
              topic=f"issue-{issue}")
@@ -2260,8 +2286,13 @@ def cmd_pen_take(r, args):
         # protect: an unheld pen is simply free. Without this, an unheld pen still
         # costs a challenger the full PEN_TAKE_GRACE and the huddle can't make a
         # single write until it expires.
+        # Driver first, abort on False — see `cmd_pen_pass`. Taking an unheld pen
+        # into a huddle that closed under us would leave a pen key with no huddle.
+        if not _set_driver(r, issue, args.as_agent):
+            sys.stderr.write(f"bus pen take: the huddle on #{issue} is gone (closed while "
+                             f"taking); the pen was NOT taken.\n")
+            return 1
         r.set(k_pen(issue), args.as_agent)
-        _set_driver(r, issue, args.as_agent)
         r.delete(k_penchal(issue))
         announce(r, args.room, args.as_agent,
                  f"took the unheld pen on #{issue}", topic=f"issue-{issue}")
@@ -2278,8 +2309,12 @@ def cmd_pen_take(r, args):
     if driver_absent and chal and chal.get("challenger") == args.as_agent:
         age = (datetime.now(timezone.utc) - datetime.fromisoformat(chal["ts"])).total_seconds()
         if age >= PEN_TAKE_GRACE:
+            # Driver first, abort on False — see `cmd_pen_pass`.
+            if not _set_driver(r, issue, args.as_agent):
+                sys.stderr.write(f"bus pen take: the huddle on #{issue} is gone (closed "
+                                 f"while taking); the pen was NOT taken.\n")
+                return 1
             r.set(k_pen(issue), args.as_agent)
-            _set_driver(r, issue, args.as_agent)
             r.delete(k_penchal(issue))
             announce(r, args.room, args.as_agent,
                      f"took the pen on #{issue} (driver {driver} absent past grace)",
