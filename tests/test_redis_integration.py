@@ -808,3 +808,64 @@ def test_real_redis_unblock_with_no_huddle_leaves_no_key_behind(
         assert "no huddle" in capsys.readouterr().err
     finally:
         _delete_issue_keys(verify, bus_module, issue)
+
+
+def test_real_redis_a_close_inside_the_watched_window_aborts_the_block_write(
+    bus_module, ns, redis_url, monkeypatch, capsys,
+):
+    """The close lands INSIDE the guard's own WATCH window — after its MGET read
+    the huddle as live, before EXEC. The other tests fire the close at the
+    command's first meta read, so the guard re-reads a huddle that is ALREADY
+    gone; none of them exercise the WATCH-abort-and-retry path, which is where a
+    concurrency bug would actually hide.
+
+    This is also the case that proves WATCHing the huddle key is load-bearing
+    rather than belt-and-suspenders. It is tempting to think WATCHing `k_block`
+    alone suffices, since the close deletes k_block too — but here k_block DOES
+    NOT EXIST YET (this is the first block on the huddle), and Redis only signals
+    a WATCH when a key is really modified. DEL of an absent key is a no-op, so a
+    k_block-only WATCH would NOT trip, EXEC would commit, and the block would be
+    resurrected onto the closed huddle — exactly the #115 bug. Only the WATCH on
+    the huddle key (which the close really does delete) aborts this.
+    """
+    issue = _issue_id()
+    r = bus_module.connect(redis_url)
+    verify = bus_module.connect(redis_url)
+    closer = bus_module.connect(redis_url)
+
+    try:
+        _seed_huddle(r, bus_module, issue, ["agent-a", "agent-b"], "agent-a")
+        assert verify.get(bus_module.k_block(issue)) is None, "k_block must start ABSENT"
+
+        # Fire the close on the guard's own read: `_mutate_huddle_json` reads both
+        # keys with ONE mget inside the watched window, so hook mget (not get).
+        fired = {"n": 0}
+        orig_pipeline = r.pipeline
+
+        def pipeline(*a, **kw):
+            pipe = orig_pipeline(*a, **kw)
+            orig_mget = pipe.mget
+
+            def mget(*keys, **kw2):
+                val = orig_mget(*keys, **kw2)   # reads the huddle as still LIVE
+                if not fired["n"]:
+                    fired["n"] = 1
+                    _delete_issue_keys(closer, bus_module, issue)   # close commits
+                return val
+
+            pipe.mget = mget
+            return pipe
+
+        monkeypatch.setattr(r, "pipeline", pipeline)
+
+        rc = bus_module.cmd_signoff(r, ns(
+            issue=issue, as_agent="agent-b", room="integration",
+            block="raised just as the close committed"))
+
+        assert fired["n"], "the close never landed inside the window — race not exercised"
+        assert rc == 1
+        assert verify.get(bus_module.k_block(issue)) is None, \
+            "the WATCH did not abort: a block was resurrected onto a closed huddle"
+        assert "closed while you were blocking" in capsys.readouterr().err
+    finally:
+        _delete_issue_keys(verify, bus_module, issue)
