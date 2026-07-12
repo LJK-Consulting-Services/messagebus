@@ -1852,7 +1852,7 @@ def _set_driver(r, issue, driver, *, pen_to, pen_expect,
     present and never signed off. Re-reading the whole dict inside the watched
     window is what keeps the join.
 
-    Not `_mutate_json`: that recreates a deleted key from `default` (resurrecting
+    Not `_mutate_huddle_json`: that recreates a deleted key from `default` (resurrecting
     a closed huddle as a participant-less stub) and has no abort path.
 
     `pen_to`/`pen_expect` are required, not defaulted: every caller is moving the
@@ -2354,7 +2354,7 @@ def cmd_huddle_close(r, args):
     COST, stated honestly: a retry is NOT cheap here. `donegate` re-runs, and it does a
     `git fetch` (via `_shared_tip`) plus a keyspace scan per participant (#96) — so an
     abort costs seconds, not the microseconds an abort costs in `_set_driver` or
-    `_mutate_json`. The retry is uncapped as in those helpers, but the comparison to
+    `_mutate_huddle_json`. The retry is uncapped as in those helpers, but the comparison to
     them ends there. It is tolerable only because a close happens once per huddle and
     the writers that abort it are agent-paced, so retries are rare. The tip is
     deliberately re-read on each pass rather than sampled once: that re-read is the only
@@ -2799,11 +2799,15 @@ def _shared_tip(issue):
     return out if rc == 0 else None
 
 
-def _mutate_json(r, key, fn, default, issue, expected_session):
+def _mutate_huddle_json(r, key, fn, default, issue, expected_session):
     """WATCH/MULTI read-modify-write of a JSON value at `key`; retries on a
     concurrent write so a block/signoff isn't lost to a lost-update race.
     Returns the new value, or None if the huddle is gone / a new session holds
     the issue — in which case nothing is written.
+
+    `key` must be a key of the huddle on `issue` (k_block / k_signoff): the
+    write is refused unless that huddle is still live in `expected_session`, so
+    this is not a general-purpose JSON mutator despite the shape.
 
     The session guard is load-bearing, not defensive. The write is an
     unconditional SET that starts from `default` when the key is absent, so it
@@ -2822,14 +2826,18 @@ def _mutate_json(r, key, fn, default, issue, expected_session):
         while True:
             try:
                 pipe.watch(key, huddle_key)
-                raw_meta = pipe.get(huddle_key)
+                # One MGET, not a GET per key: inside a WATCH (before MULTI) each
+                # read is sent immediately, so two GETs are two round-trips — and
+                # this loop re-runs them on every WatchError. The WATCH above
+                # already covers both keys, so batching the reads observes exactly
+                # the same state.
+                raw_meta, raw = pipe.mget(huddle_key, key)
                 if not raw_meta:
                     pipe.unwatch()
                     return None
                 if huddle_meta_holder(json.loads(raw_meta), issue) != expected_session:
                     pipe.unwatch()
                     return None
-                raw = pipe.get(key)
                 new = fn(json.loads(raw) if raw else default)
                 pipe.multi()
                 pipe.set(key, json.dumps(new))
@@ -2854,7 +2862,7 @@ def cmd_signoff(r, args):
     session = huddle_meta_holder(meta, issue)
     touch_presence(r, args.room, args.as_agent)
     if args.block:
-        if _mutate_json(r, k_block(issue),
+        if _mutate_huddle_json(r, k_block(issue),
                         lambda bl: [b for b in bl if b["agent"] != args.as_agent]
                                    + [{"agent": args.as_agent, "reason": args.block}], [],
                         issue, session) is None:
@@ -2869,7 +2877,7 @@ def cmd_signoff(r, args):
     if not tip:
         sys.stderr.write(f"bus signoff: cannot read the shared branch tip\n")
         return 1
-    if _mutate_json(r, k_signoff(issue), lambda s: {**s, args.as_agent: tip}, {},
+    if _mutate_huddle_json(r, k_signoff(issue), lambda s: {**s, args.as_agent: tip}, {},
                     issue, session) is None:
         sys.stderr.write(f"bus signoff: the huddle on #{issue} closed while you were "
                          f"signing off; nothing recorded\n")
@@ -2900,7 +2908,7 @@ def cmd_unblock(r, args):
         removed["any"] = len(kept) != len(bl)
         return kept
 
-    if _mutate_json(r, k_block(issue), drop, [], issue, session) is None:
+    if _mutate_huddle_json(r, k_block(issue), drop, [], issue, session) is None:
         sys.stderr.write(f"bus unblock: the huddle on #{issue} closed while you were "
                          f"unblocking\n")
         return 1

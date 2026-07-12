@@ -36,7 +36,7 @@ ALLOWED = {
     "_release_pen_driver",       # WATCH/MULTI pen delete + driver clear
     "_record_pen_challenge",     # WATCH/MULTI challenge write bound to session
     "_delete_pen_challenge",     # WATCH/MULTI challenge delete bound to session
-    "_mutate_json",              # WATCH/MULTI; READS meta to bind the block/signoff
+    "_mutate_huddle_json",       # WATCH/MULTI; READS meta to bind the block/signoff
                                  # write to the session, never writes the blob (#115)
     "cmd_huddle_close",          # WATCH/MULTI: done-gate + teardown in one txn (#92)
     "cmd_huddle_join",           # WATCH/MULTI append to participants

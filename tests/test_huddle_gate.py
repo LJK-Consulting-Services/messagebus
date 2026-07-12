@@ -4,7 +4,7 @@ Unlike the other suites (which test pure functions with no I/O), these drive the
 REAL bus functions against an in-memory fakeredis, so the Redis semantics the
 code actually relies on are exercised for real:
 
-  - WATCH/MULTI compare-and-set in `_mutate_json` (lost-update safety)
+  - WATCH/MULTI compare-and-set in `_mutate_huddle_json` (lost-update safety)
   - `scan_iter` presence lookups in `_holder_present`
   - `xadd` announces
 
@@ -302,7 +302,7 @@ class MutateJsonTest(unittest.TestCase):
     """The WATCH/MULTI compare-and-set that guards block/sign-off lists.
 
     Every write is bound to a huddle session (#115), so each case seeds a live
-    huddle first — an unbound `_mutate_json` no longer exists to test.
+    huddle first — an unbound `_mutate_huddle_json` no longer exists to test.
     """
     ISSUE = 4242
     SESSION = "huddle:issue-4242:tok"
@@ -317,9 +317,12 @@ class MutateJsonTest(unittest.TestCase):
             "issue": self.ISSUE, "participants": ["agent-a"], "driver": "agent-a",
             "session": session, "status": "open"}))
 
-    def _mutate(self, fn, default, session=None):
-        return bus._mutate_json(self.r, self.KEY, fn, default, self.ISSUE,
-                                self.SESSION if session is None else session)
+    def _mutate(self, fn, default):
+        """Always carries the session the huddle was opened in — the cases below
+        move the WORLD (close it, reopen it under a new session), never the
+        caller's token, which is exactly the in-flight write being modelled."""
+        return bus._mutate_huddle_json(self.r, self.KEY, fn, default, self.ISSUE,
+                                       self.SESSION)
 
     def test_applies_fn_to_missing_default(self):
         out = self._mutate(lambda d: {**d, "a": 1}, {})
@@ -334,7 +337,7 @@ class MutateJsonTest(unittest.TestCase):
     def test_retries_on_concurrent_write(self):
         # Force exactly one WATCH conflict: the first time fn runs, a *different*
         # client writes the key after WATCH but before EXECUTE, so redis aborts
-        # the transaction and _mutate_json must retry (and see the new value).
+        # the transaction and _mutate_huddle_json must retry (and see the new value).
         state = {"clashed": False}
 
         def fn(d):

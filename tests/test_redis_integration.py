@@ -668,7 +668,7 @@ def test_real_redis_drain_clears_driver_when_release_reply_was_lost(
 
 # ---- #115: a block/sign-off that outlives the close it raced ------------------
 #
-# `_mutate_json` ends in an unconditional SET that starts from `default` when the
+# `_mutate_huddle_json` ends in an unconditional SET that starts from `default` when the
 # key is absent, so it RESURRECTS a key a concurrent close just deleted. Watching
 # only the value key cannot see that — the close deletes the HUDDLE, not this key,
 # so nothing the WATCH covers ever changes and EXEC commits. The leaked key has no
@@ -685,7 +685,7 @@ def test_real_redis_a_block_racing_the_close_it_lands_behind_leaves_no_block(
     bus_module, ns, redis_url, monkeypatch, capsys,
 ):
     """The window is between `cmd_signoff`'s meta read (huddle still live, so the
-    participant check passes) and its `_mutate_json` write. A close committing in
+    participant check passes) and its `_mutate_huddle_json` write. A close committing in
     there used to leave a fully-formed block behind on a dead huddle."""
     issue = _issue_id()
     r = bus_module.connect(redis_url)
