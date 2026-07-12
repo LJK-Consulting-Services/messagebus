@@ -725,9 +725,10 @@ def test_real_redis_take_aborts_on_a_challenge_raised_inside_the_watched_window(
     rival = bus_module.connect(redis_url)
 
     try:
-        # agent-d holds the pen but has NO presence anywhere -> the absent-driver path.
-        _seed_huddle(r, bus_module, issue, ["agent-d", "agent-a", "agent-c"], "agent-d")
-        r.set(bus_module.k_pen(issue), "agent-d", ex=60)
+        # Unique holder with NO presence anywhere -> the absent-driver path.
+        driver = f"driver-{uuid.uuid4().hex}"
+        _seed_huddle(r, bus_module, issue, [driver, "agent-a", "agent-c"], driver)
+        r.set(bus_module.k_pen(issue), driver, ex=60)
         mine = json.dumps({"challenger": "agent-a", "reason": "d is gone"})
         r.set(bus_module.k_penchal(issue), mine)
         theirs = json.dumps({"challenger": "agent-c", "reason": "i want it too"})
@@ -741,7 +742,7 @@ def test_real_redis_take_aborts_on_a_challenge_raised_inside_the_watched_window(
 
         assert state["fired"], "the rival challenge never landed -- race not exercised"
         assert rc == 1, "the take committed against a challenge it never saw"
-        assert verify.get(bus_module.k_pen(issue)) == "agent-d", "pen moved anyway"
+        assert verify.get(bus_module.k_pen(issue)) == driver, "pen moved anyway"
         assert verify.get(bus_module.k_penchal(issue)) == theirs, \
             "the rival challenge was silently deleted by the take's MULTI"
     finally:
@@ -767,8 +768,9 @@ def test_real_redis_take_with_no_prior_challenge_aborts_when_one_is_raised(
     rival = bus_module.connect(redis_url)
 
     try:
-        _seed_huddle(r, bus_module, issue, ["agent-d", "agent-a", "agent-c"], "agent-d")
-        r.set(bus_module.k_pen(issue), "agent-d", ex=60)
+        driver = f"driver-{uuid.uuid4().hex}"
+        _seed_huddle(r, bus_module, issue, [driver, "agent-a", "agent-c"], driver)
+        r.set(bus_module.k_pen(issue), driver, ex=60)
         # NO challenge recorded -> cmd_pen_take passes challenge_expect=None.
         theirs = json.dumps({"challenger": "agent-c", "reason": "i want it too"})
 
@@ -781,7 +783,7 @@ def test_real_redis_take_with_no_prior_challenge_aborts_when_one_is_raised(
 
         assert state["fired"], "the rival challenge never landed -- race not exercised"
         assert rc == 1, "the take committed against a challenge it never saw"
-        assert verify.get(bus_module.k_pen(issue)) == "agent-d", "pen moved anyway"
+        assert verify.get(bus_module.k_pen(issue)) == driver, "pen moved anyway"
         assert verify.get(bus_module.k_penchal(issue)) == theirs, \
             "the rival challenge was silently deleted by the take's MULTI"
     finally:
