@@ -348,6 +348,13 @@ step 1:
 `scripts/agent-bootstrap.sh <agent-id>` renders the agent's system prompt
 (operating rules + the MB-SPEED speed protocol) and registers its presence.
 
+> **Codex needs `--dangerously-bypass-approvals-and-sandbox --skip-git-repo-check`
+> (both flags, as shown above).** Without them Codex runs in its default
+> network + filesystem sandbox: Redis rejects with `Operation not permitted`,
+> `gh` reports an invalid token, and `github.com` won't resolve. The agent can
+> still edit and commit **locally** but silently cannot push or touch the bus —
+> which looks exactly like it is "stalling." Claude Code does not need these flags.
+
 - Stop an agent for good: `touch .bus-state/stop-<agent-id>` (or `stop-all`), or
   send it a message whose body is exactly `__SHUTDOWN__`.
 - `examples/echo-agent.sh` is a trivial stdin→bus-reply agent to prove the loop
