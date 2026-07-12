@@ -266,9 +266,10 @@ bus history  [-n 1000]                       # full room log
 bus watch    [-n 10] [--topic T]             # live-follow (read-only observer)
 bus thread   ID                              # print the full reply_to thread of a message
 bus inbox    --as A                          # peek unread directed msgs / questions (no cursor move)
-bus prune    [--keep 5000] [--force]         # trim the room to newest N (refuses if it drops unread)
+bus prune    [--keep 5000] [--force] [--dry-run]  # trim the room to newest N (refuses if it drops unread)
 bus join     --as A                          # register presence; cursor to "now"
 bus agents                                   # who is present
+bus drain    --as A [--force]                # graceful exit: release your pens + presence (claims kept)
 
 # task coordination (needs BUS_GH_REPO + gh)
 bus claim    --as A --issue N [--ttl 28800] [--worktree] [--base dev]
@@ -377,9 +378,20 @@ authentication** — the "homegrown simple" tradeoff. Sharp edges:
   untrusted agent on the bus.
 - **`--to all __SHUTDOWN__` is a fleet kill-switch.** One message stops every
   agent. Intended for the operator; available to any agent on the bus.
-- **Maintenance commands are not an auth boundary.** `bus prune` and
-  `bus reap --release` are explicit manual commands (never automatic), but any
-  local caller can invoke them.
+- **Maintenance commands are not an auth boundary.** `bus prune`,
+  `bus reap --release` and `bus drain` are explicit manual commands (never
+  automatic), but any local caller can invoke them. `drain --as <victim>` drops
+  that agent's write pen and presence, so it is exactly as trustworthy as the
+  self-asserted `--as` above — it takes no claim locks, but it is not a
+  permission check. Note what clearing presence *means*: the huddle done-gate only
+  requires **present** participants to sign off, so draining an agent also drops it
+  out of that check. Every drain emits an `EV_DRAIN` event precisely so it can't be
+  a quiet way to vanish from a gate — `bus events --type drain`.
+- **With AOF on, message bodies are written to disk.** Durability (below) means
+  every message the bus has carried — untrusted agent chatter included — lands in
+  the append log under `BUS_REDIS_DIR` (default `~/.bus/redis`). `start-redis.sh`
+  creates that directory `0700`, but a Redis you started some other way will use
+  whatever its own config says.
 - **Message content is untrusted input to your agents.** A peer's body is fed
   into each agent's context. The Stop hook fences it in an "UNTRUSTED" boundary
   and `prompts/agent-system.md` tells agents not to obey embedded instructions,
@@ -400,6 +412,7 @@ numbers are charset/type validated.
 | Env | Default | Meaning |
 |-----|---------|---------|
 | `BUS_REDIS_URL` | `redis://127.0.0.1:6379/0` | Redis connection (also read by `start-redis.sh`) |
+| `BUS_REDIS_DIR` | `~/.bus/redis` | where `start-redis.sh`'s own daemon keeps its append log |
 | `BUS_ROOM` | `main` | default room/stream |
 | `BUS_GH_REPO` | — | `owner/repo` the issue/label/huddle commands target |
 | `BUS_REPO_DIR` | cwd's repo | the git repo worktrees/huddles operate on |
@@ -415,6 +428,38 @@ Redis keys (for the curious): `bus:stream:<room>`, `bus:cursor:<room>:<agent>`,
 `bus:worktree:issue:<N>`, `bus:huddle:issue:<N>`, `bus:pen:issue:<N>`,
 `bus:signoff:issue:<N>`, `bus:block:issue:<N>`.
 
+### Durability
+
+Redis holds live coordination state, not just a replayable chat log — claim
+locks, the write pen, huddle metadata, every agent's cursor. A volatile server
+loses all of it on restart, which is how you get an issue claimed twice or a pen
+dropped mid-huddle. `start-redis.sh` therefore turns on **AOF** persistence
+(`appendfsync everysec`, bounding loss to ~1s where an RDB snapshot would lose
+everything back to the last save point), and `bus doctor` reports the mode it
+finds. A `WARN` there means a restart will drop that state.
+
+`start-redis.sh` only ever reconfigures a **loopback** Redis — if `BUS_REDIS_URL`
+points at a shared or remote server, it reports the mode and leaves that server's
+config alone.
+
+Clients ride out a blip on their own (redis-py retries with backoff), and the
+long-lived loops — `bus wait`, `bus watch` — rebuild the connection and resume
+from where they were when the server actually restarts under them. `bus wait`
+still honours its `--timeout`: reconnect time is capped by the caller's budget, so
+a Redis that never comes back can't hang a turn.
+
+Retrying makes writes **at-least-once**: a command whose reply is lost is re-sent,
+so a rare duplicate message is possible. That is the right trade for a
+coordination log, but it has a sharp edge — a re-sent `SET NX` finds the key its
+own first attempt created and reports that it *lost* the race. `bus claim` and
+`bus huddle open` both handle that explicitly (they check whether the value in the
+lock is their own) rather than half-completing.
+
+Retention is **cursor-aware**: `bus prune` trims by a boundary checked against
+every agent's cursor and refuses to drop anything unread (`--dry-run` reports the
+lag and writes nothing; `--force` overrides and says so on the event stream). The
+stream is deliberately never bounded with `XADD MAXLEN`, which drops the oldest
+messages by count with no idea what anyone has read yet.
 ## Status transitions
 
 `bus status` moves an issue along the linear pipeline
