@@ -364,12 +364,22 @@ def test_real_redis_pen_pass_keeps_a_join_that_lands_mid_meta_write(
 
 # --- done-gate TOCTOU on the close path (#92) -----------------------------------
 #
-# The sites above lose a participant by OVERWRITING the blob. This one loses one by
-# never re-reading it: the gate ran on a snapshot taken before the join, and the
-# close then deleted the very state the joiner needed in order to sign.
+# The sites above lose a participant by OVERWRITING the blob. These lose the gate's
+# INPUTS: the gate ran on a snapshot, and the close then deleted the very state a
+# concurrent writer had just added — the joiner's chance to sign, or an open block.
+#
+# Both drive a real concurrent write into the gate->EXEC window on real Redis. The
+# interleave is deterministic (an abort, not a sleep), so neither is timing-flaky.
 
 
-PRESENT = ("agent-a", "agent-b", "agent-c")
+def _seed_presence(r, bus_module, room, agents):
+    """Presence for each agent, and the keys to delete in teardown. An ABSENT
+    participant does not hold the done-gate, so a test that forgets this passes for
+    the wrong reason — the participant is skipped, not checked."""
+    keys = [bus_module.k_presence(room, a) for a in agents]
+    for k in keys:
+        r.set(k, "now", ex=60)
+    return keys
 
 
 def test_real_redis_close_regates_on_a_join_inside_the_gate_window(
@@ -401,10 +411,8 @@ def test_real_redis_close_regates_on_a_join_inside_the_gate_window(
         # Closer + B have both signed AT THE TIP: without C the gate passes, so a
         # close that ignores C returns 0 rather than failing for some unrelated reason.
         r.set(bus_module.k_signoff(issue), json.dumps({"agent-a": tip, "agent-b": tip}))
-        # An ABSENT participant does not hold the gate, so C must be present — else
-        # this would pass for the wrong reason (C skipped, not C checked).
-        for agent in PRESENT:
-            r.set(bus_module.k_presence("integration", agent), "now", ex=60)
+        presence = _seed_presence(r, bus_module, "integration",
+                                  ("agent-a", "agent-b", "agent-c"))
 
         # where="any" on purpose: the fixed close reads the key through the watching
         # pipeline, the pre-fix close through the client. Hooking only one would fire
@@ -428,25 +436,82 @@ def test_real_redis_close_regates_on_a_join_inside_the_gate_window(
         assert verify.get(bus_module.k_lock(issue)) is not None
     finally:
         _delete_issue_keys(verify, bus_module, issue)
-        verify.delete(*(bus_module.k_presence("integration", a) for a in PRESENT))
+        verify.delete(*presence)
+
+
+def test_real_redis_close_regates_on_a_block_raised_inside_the_gate_window(
+    bus_module, ns, redis_url, monkeypatch, no_github,
+):
+    """A block raised after the gate read the block list must not be closed over.
+
+    `signoff --block` writes k_block and NOTHING else, so watching only the metadata
+    key left this wide open: the gate read an empty block list, the WATCH stayed
+    clean, EXEC committed — and the close's own delete destroyed the block. The
+    huddle closed over a live objection, and the objection vanished with it.
+
+    The hook fires on `_shared_tip`, which `donegate` calls AFTER its block read and
+    before its sign-off read — landing the block precisely in the gate->EXEC window.
+    Hooking the huddle read instead would be a weaker test: the block would land
+    BEFORE the gate and be caught by the gate rather than by the WATCH.
+    """
+    issue = _issue_id()
+    tip = "d" * 40
+    r = bus_module.connect(redis_url)
+    verify = bus_module.connect(redis_url)
+    blocker = bus_module.connect(redis_url)
+    presence = []
+
+    try:
+        _seed_huddle(r, bus_module, issue, ["agent-a", "agent-b"], "agent-a")
+        # Everyone has signed: the gate is satisfied but for the block, so a close
+        # that misses the block returns 0 rather than failing for an unrelated reason.
+        r.set(bus_module.k_signoff(issue), json.dumps({"agent-a": tip, "agent-b": tip}))
+        presence = _seed_presence(r, bus_module, "integration", ("agent-a", "agent-b"))
+
+        fired = {"n": 0}
+
+        def tip_then_block(_issue):
+            if not fired["n"]:
+                fired["n"] = 1
+                bus_module.cmd_signoff(blocker, ns(
+                    issue=issue, as_agent="agent-b", room="integration",
+                    block="found a data-loss bug, do NOT merge"))
+            return tip
+
+        monkeypatch.setattr(bus_module, "_shared_tip", tip_then_block)
+
+        rc = bus_module.cmd_huddle_close(
+            r, ns(issue=issue, as_agent="agent-a", room="integration", force=False))
+
+        assert fired["n"], "the concurrent block never landed — race not exercised"
+        assert rc == 1, "the done-gate closed the huddle over an open block"
+        # The block must SURVIVE the refused close — destroying it would silently
+        # discard the objection even though the close itself was turned down.
+        blocks = json.loads(verify.get(bus_module.k_block(issue)))
+        assert [b["agent"] for b in blocks] == ["agent-b"], "the block was destroyed"
+        assert verify.get(bus_module.k_huddle(issue)) is not None
+    finally:
+        _delete_issue_keys(verify, bus_module, issue)
+        if presence:
+            verify.delete(*presence)
 
 
 def test_real_redis_close_still_closes_when_the_gate_is_genuinely_met(
     bus_module, ns, redis_url, monkeypatch, no_github,
 ):
-    """The WATCH/retry must not break the ordinary close — without this, the test
+    """The WATCH/retry must not break the ordinary close — without this, the two tests
     above would also pass against a `cmd_huddle_close` that never closes anything."""
     issue = _issue_id()
     tip = "c" * 40
     r = bus_module.connect(redis_url)
     verify = bus_module.connect(redis_url)
+    presence = []
 
     try:
         _seed_huddle(r, bus_module, issue, ["agent-a", "agent-b"], "agent-a")
         monkeypatch.setattr(bus_module, "_shared_tip", lambda _issue: tip)
         r.set(bus_module.k_signoff(issue), json.dumps({"agent-a": tip, "agent-b": tip}))
-        for agent in ("agent-a", "agent-b"):
-            r.set(bus_module.k_presence("integration", agent), "now", ex=60)
+        presence = _seed_presence(r, bus_module, "integration", ("agent-a", "agent-b"))
 
         assert bus_module.cmd_huddle_close(
             r, ns(issue=issue, as_agent="agent-a", room="integration", force=False)) == 0
@@ -457,5 +522,5 @@ def test_real_redis_close_still_closes_when_the_gate_is_genuinely_met(
         assert verify.get(bus_module.k_signoff(issue)) is None
     finally:
         _delete_issue_keys(verify, bus_module, issue)
-        verify.delete(*(bus_module.k_presence("integration", a)
-                        for a in ("agent-a", "agent-b")))
+        if presence:
+            verify.delete(*presence)
