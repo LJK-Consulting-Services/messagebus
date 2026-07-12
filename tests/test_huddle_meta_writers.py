@@ -33,6 +33,8 @@ ALLOWED = {
     "compare_set_huddle_meta",   # Lua CAS on the lock; creates the blob at open
     "_huddle_meta",              # read-only
     "_set_driver",               # WATCH/MULTI read-modify-write
+    "_release_pen_driver",       # WATCH/MULTI pen delete + driver clear
+    "_record_pen_challenge",     # WATCH/MULTI challenge write bound to session
     "cmd_huddle_join",           # WATCH/MULTI append to participants
     "cmd_huddle_open",           # creates the blob (nothing to lose yet)
     "cmd_huddle_close",          # deletes the blob

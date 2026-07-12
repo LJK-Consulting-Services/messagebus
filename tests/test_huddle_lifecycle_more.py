@@ -112,7 +112,8 @@ def test_pen_status_take_force_and_deny(bus_module, fake_redis, ns, monkeypatch,
     old = (datetime.now(timezone.utc) - timedelta(seconds=bus_module.PEN_TAKE_GRACE + 5)).isoformat()
     fake_redis.set(
         bus_module.k_penchal(79),
-        json.dumps({"challenger": "bob", "reason": "stale", "ts": old}),
+        json.dumps({"challenger": "bob", "reason": "stale", "ts": old,
+                    "session": meta["session"], "driver": "alice"}),
     )
     assert bus_module.cmd_pen_take(fake_redis, ns(as_agent="bob", issue=79, reason="stale")) == 0
     assert fake_redis.get(bus_module.k_pen(79)) == "bob"

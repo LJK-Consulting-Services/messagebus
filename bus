@@ -1687,7 +1687,13 @@ def _huddle_meta(r, issue):
     return json.loads(raw) if raw else None
 
 
-def _set_driver(r, issue, driver, expect=None):
+_NO_PEN_EXPECT = object()
+_NO_HUDDLE_SESSION = object()
+
+
+def _set_driver(r, issue, driver, expect=None, pen_to=None,
+                pen_expect=_NO_PEN_EXPECT, clear_challenge=False,
+                expected_session=None, driver_must_be_participant=False):
     """Rewrite ONLY the huddle's `driver` field, preserving every other field.
 
     The metadata is one JSON blob, so a read-modify-SET of it is a lost-update
@@ -1704,35 +1710,154 @@ def _set_driver(r, issue, driver, expect=None):
     Not `_mutate_json`: that recreates a deleted key from `default` (resurrecting
     a closed huddle as a participant-less stub) and has no abort path.
 
-    Returns True if the driver was written; False if the huddle is gone or `expect`
-    did not match — in which case NOTHING was written. That return is LOAD-BEARING
-    and every caller acts on it (#94): `pen pass`/`pen take` abort on False rather
-    than move the pen into a huddle that no longer exists, and `drain` uses it as the
-    tiebreak for whether the pen was really ours to release. Corrupt metadata raises
-    (like `_huddle_meta`) rather than silently no-opping — a driver write we can't
-    complete must be loud. (`cmd_huddle_join` instead prints and returns 1 on corrupt
-    metadata.)
+    When `pen_to`/`pen_expect` are supplied, the pen key is moved in the same
+    transaction as the metadata write. That makes the result load-bearing: a
+    closed huddle or moved pen aborts before `k_pen` changes.
+
+    `expected_session` binds a stale caller to the exact huddle it read before
+    any checkpoint/presence/race window. Issue numbers are reusable after
+    close+reopen, so checking only the pen holder is not enough.
+
+    Returns True if the driver was written; False if the huddle is gone,
+    `expect` did not match, `expected_session` did not match, `driver` is not a
+    current participant, or `pen_expect` did not match. Corrupt metadata raises
+    (like `_huddle_meta`) rather than silently no-opping — a driver write we
+    can't complete must be loud. (`cmd_huddle_join` instead prints and returns 1
+    on corrupt metadata; here some callers discard the return value, so raising
+    is the only way the failure surfaces at all.)
     """
     key = k_huddle(issue)
+    pen_key = k_pen(issue) if pen_to is not None or pen_expect is not _NO_PEN_EXPECT else None
+    chal_key = k_penchal(issue) if clear_challenge else None
     with r.pipeline() as pipe:
         while True:
             try:
-                pipe.watch(key)
+                watch_keys = [key]
+                if pen_key:
+                    watch_keys.append(pen_key)
+                if chal_key:
+                    watch_keys.append(chal_key)
+                pipe.watch(*watch_keys)
                 raw = pipe.get(key)
                 if not raw:
                     pipe.unwatch()
                     return False
                 meta = json.loads(raw)
+                if expected_session is not None and huddle_meta_holder(meta, issue) != expected_session:
+                    pipe.unwatch()
+                    return False
                 if expect is not None and meta.get("driver") != expect:
                     pipe.unwatch()
                     return False
+                if driver_must_be_participant and driver not in meta.get("participants", []):
+                    pipe.unwatch()
+                    return False
+                current_pen = pipe.get(pen_key) if pen_key else None
+                if pen_expect is not _NO_PEN_EXPECT and current_pen != pen_expect:
+                    already_done = (
+                        pen_to is not None and current_pen == pen_to
+                        and meta.get("driver") == driver
+                        and (not chal_key or pipe.get(chal_key) is None)
+                    )
+                    pipe.unwatch()
+                    return already_done
                 meta["driver"] = driver
                 pipe.multi()
+                if pen_to is not None:
+                    pipe.set(pen_key, pen_to)
                 pipe.set(key, json.dumps(meta))
+                if chal_key:
+                    pipe.delete(chal_key)
                 pipe.execute()
                 return True
             except redis.WatchError:
                 continue  # a join (or another pen op) landed; re-read and retry
+
+
+def _release_pen_driver(r, issue, agent, expected_session):
+    """Release `agent`'s pen and clear huddle.driver in one watched update.
+
+    A drain snapshots pens before it releases them. If the issue closes and
+    reopens in that window, the new huddle may legitimately have the same agent
+    holding the pen; `expected_session` prevents the stale drain from deleting
+    that new pen. The already-released branch is intentional: if Redis lost the
+    EXEC reply and retries the transaction after the first attempt landed, the
+    second pass sees pen gone + driver blank and still reports success.
+    """
+    huddle_key = k_huddle(issue)
+    pen_key = k_pen(issue)
+    with r.pipeline() as pipe:
+        while True:
+            try:
+                pipe.watch(huddle_key, pen_key)
+                raw = pipe.get(huddle_key)
+                current_pen = pipe.get(pen_key)
+                if expected_session is _NO_HUDDLE_SESSION:
+                    if raw:
+                        pipe.unwatch()
+                        return False
+                    if current_pen == agent:
+                        pipe.multi()
+                        pipe.delete(pen_key)
+                        pipe.execute()
+                        return True
+                    pipe.unwatch()
+                    return current_pen is None
+                if not raw:
+                    pipe.unwatch()
+                    return False
+                meta = json.loads(raw)
+                if huddle_meta_holder(meta, issue) != expected_session:
+                    pipe.unwatch()
+                    return False
+                if current_pen == agent and meta.get("driver") == agent:
+                    meta["driver"] = ""
+                    pipe.multi()
+                    pipe.delete(pen_key)
+                    pipe.set(huddle_key, json.dumps(meta))
+                    pipe.execute()
+                    return True
+                pipe.unwatch()
+                return current_pen is None and meta.get("driver") == ""
+            except redis.WatchError:
+                continue
+
+
+def _record_pen_challenge(r, issue, challenger, reason, expected_session, expected_driver):
+    """Record/refresh a challenge only for the huddle and pen holder observed."""
+    huddle_key = k_huddle(issue)
+    pen_key = k_pen(issue)
+    chal_key = k_penchal(issue)
+    with r.pipeline() as pipe:
+        while True:
+            try:
+                pipe.watch(huddle_key, pen_key, chal_key)
+                raw = pipe.get(huddle_key)
+                if not raw:
+                    pipe.unwatch()
+                    return False
+                meta = json.loads(raw)
+                if huddle_meta_holder(meta, issue) != expected_session:
+                    pipe.unwatch()
+                    return False
+                if challenger not in meta.get("participants", []):
+                    pipe.unwatch()
+                    return False
+                if pipe.get(pen_key) != expected_driver:
+                    pipe.unwatch()
+                    return False
+                pipe.multi()
+                pipe.set(chal_key, json.dumps({
+                    "challenger": challenger,
+                    "reason": reason,
+                    "ts": now_iso(),
+                    "session": expected_session,
+                    "driver": expected_driver,
+                }))
+                pipe.execute()
+                return True
+            except redis.WatchError:
+                continue
 
 
 def create_shared_branch(main, base, branch, allow_stale=False):
@@ -2218,6 +2343,7 @@ def cmd_pen_pass(r, args):
     if not meta:
         sys.stderr.write(f"bus pen pass: no huddle on #{issue}\n")
         return 1
+    session = huddle_meta_holder(meta, issue)
     if args.to not in meta["participants"]:
         sys.stderr.write(f"bus pen pass: {args.to} is not a participant of #{issue}'s "
                          f"huddle (they must `bus huddle join` first)\n")
@@ -2228,19 +2354,12 @@ def cmd_pen_pass(r, args):
         sys.stderr.write(f"bus pen pass: checkpoint failed to push; keeping the pen with "
                          f"{args.as_agent}. Fix the push, then retry the pass.\n")
         return 1
-    # Driver FIRST, and only move the pen if it landed (#94). `_set_driver` returns
-    # False when the huddle is gone — and `huddle close` is exactly what can land in
-    # the window above (the metadata read, then a git push in `pen checkpoint`).
-    # Discarding that False, as this did, meant the blind `r.set` below RESURRECTED a
-    # pen key for a closed huddle — close is the only path that deletes k_pen, so the
-    # stray key then outlives every cleanup — and announced a handoff into a huddle
-    # that no longer exists. Aborting first leaves nothing written.
-    if not _set_driver(r, issue, args.to):
-        sys.stderr.write(f"bus pen pass: the huddle on #{issue} is gone (closed while "
-                         f"passing); the pen was NOT passed. Your work is pushed.\n")
+    if not _set_driver(r, issue, args.to, pen_to=args.to, pen_expect=args.as_agent,
+                       clear_challenge=True, expected_session=session,
+                       driver_must_be_participant=True):
+        sys.stderr.write(f"bus pen pass: huddle or pen changed while passing #{issue}; "
+                         "not moving the pen\n")
         return 1
-    r.set(k_pen(issue), args.to)
-    r.delete(k_penchal(issue))  # a pass settles any open challenge (concession)
     announce(r, args.room, args.as_agent, f"passed the pen on #{issue} to {args.to}",
              topic=f"issue-{issue}")
     print(f"{args.as_agent} passed the pen on #{issue} to {args.to}")
@@ -2258,6 +2377,7 @@ def cmd_pen_take(r, args):
     if not meta:
         sys.stderr.write(f"bus pen take: no huddle on #{issue}\n")
         return 1
+    session = huddle_meta_holder(meta, issue)
     if args.as_agent not in meta["participants"]:
         sys.stderr.write(f"bus pen take: you must be a huddle participant first "
                          f"(`bus huddle join`)\n")
@@ -2273,14 +2393,13 @@ def cmd_pen_take(r, args):
         # protect: an unheld pen is simply free. Without this, an unheld pen still
         # costs a challenger the full PEN_TAKE_GRACE and the huddle can't make a
         # single write until it expires.
-        # Driver first, abort on False — see `cmd_pen_pass`. Taking an unheld pen
-        # into a huddle that closed under us would leave a pen key with no huddle.
-        if not _set_driver(r, issue, args.as_agent):
-            sys.stderr.write(f"bus pen take: the huddle on #{issue} is gone (closed while "
-                             f"taking); the pen was NOT taken.\n")
+        if not _set_driver(r, issue, args.as_agent, pen_to=args.as_agent,
+                           pen_expect=None, clear_challenge=True,
+                           expected_session=session,
+                           driver_must_be_participant=True):
+            sys.stderr.write(f"bus pen take: huddle or pen changed while taking #{issue}; "
+                             "not moving the pen\n")
             return 1
-        r.set(k_pen(issue), args.as_agent)
-        r.delete(k_penchal(issue))
         announce(r, args.room, args.as_agent,
                  f"took the unheld pen on #{issue}", topic=f"issue-{issue}")
         print(f"{args.as_agent} took the unheld pen on #{issue}")
@@ -2293,24 +2412,27 @@ def cmd_pen_take(r, args):
     # reap lesson) — and pen ops now refresh presence, so an actively-driving agent
     # stays live and can't be taken from. The grace gives a driver whose presence
     # merely lapsed time to reappear (any op re-touches presence).
-    if driver_absent and chal and chal.get("challenger") == args.as_agent:
+    if (driver_absent and chal and chal.get("challenger") == args.as_agent
+            and chal.get("session") == session and chal.get("driver") == driver):
         age = (datetime.now(timezone.utc) - datetime.fromisoformat(chal["ts"])).total_seconds()
         if age >= PEN_TAKE_GRACE:
-            # Driver first, abort on False — see `cmd_pen_pass`.
-            if not _set_driver(r, issue, args.as_agent):
-                sys.stderr.write(f"bus pen take: the huddle on #{issue} is gone (closed "
-                                 f"while taking); the pen was NOT taken.\n")
+            if not _set_driver(r, issue, args.as_agent, pen_to=args.as_agent,
+                               pen_expect=driver, clear_challenge=True,
+                               expected_session=session,
+                               driver_must_be_participant=True):
+                sys.stderr.write(f"bus pen take: huddle or pen changed while taking #{issue}; "
+                                 "not moving the pen\n")
                 return 1
-            r.set(k_pen(issue), args.as_agent)
-            r.delete(k_penchal(issue))
             announce(r, args.room, args.as_agent,
                      f"took the pen on #{issue} (driver {driver} absent past grace)",
                      topic=f"issue-{issue}")
             print(f"{args.as_agent} took the pen on #{issue} (driver {driver} absent past grace)")
             return 0
     # otherwise record/refresh the challenge (never an instant steal)
-    r.set(k_penchal(issue), json.dumps(
-        {"challenger": args.as_agent, "reason": args.reason, "ts": now_iso()}))
+    if not _record_pen_challenge(r, issue, args.as_agent, args.reason, session, driver):
+        sys.stderr.write(f"bus pen take: huddle or pen changed while challenging #{issue}; "
+                         "not recording challenge\n")
+        return 1
     if driver_absent:
         announce(r, args.room, args.as_agent,
                  f"challenges for the pen on #{issue} (driver {driver} absent; reason: "

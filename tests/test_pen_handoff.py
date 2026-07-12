@@ -247,7 +247,7 @@ def test_pen_pass_into_a_huddle_closed_mid_flight_writes_nothing(
     assert fake_redis.get(bus_module.k_pen(79)) == "alice"   # NOT handed to bob
     assert fake_redis.get(bus_module.k_huddle(79)) is None   # and not resurrected
     assert json.loads(fake_redis.get(bus_module.k_penchal(79))) == {"challenger": "bob"}
-    assert "is gone" in capsys.readouterr().err
+    assert "changed while passing" in capsys.readouterr().err
     assert fake_redis.xlen(bus_module.k_stream("main")) == 0  # no handoff announced
 
 
@@ -276,7 +276,7 @@ def test_pen_take_unheld_into_a_huddle_closed_mid_flight_creates_no_pen_key(
     assert rc == 1
     assert fake_redis.get(bus_module.k_pen(79)) is None   # no pen for a dead huddle
     assert fake_redis.get(bus_module.k_huddle(79)) is None
-    assert "is gone" in capsys.readouterr().err
+    assert "changed while taking" in capsys.readouterr().err
     assert fake_redis.xlen(bus_module.k_stream("main")) == 0
 
 
@@ -284,10 +284,12 @@ def test_pen_take_force_into_a_huddle_closed_mid_flight_writes_nothing(
     bus_module, fake_redis, ns, monkeypatch, capsys
 ):
     """Same for the force-take path (absent driver, challenge past the grace window)."""
+    meta = huddle_meta(bus_module)
     challenge = {"challenger": "bob", "reason": "stale",
                  "ts": (datetime.now(timezone.utc)
-                        - timedelta(seconds=bus_module.PEN_TAKE_GRACE + 5)).isoformat()}
-    fake_redis.set(bus_module.k_huddle(79), json.dumps(huddle_meta(bus_module)))
+                        - timedelta(seconds=bus_module.PEN_TAKE_GRACE + 5)).isoformat(),
+                 "session": meta["session"], "driver": "alice"}
+    fake_redis.set(bus_module.k_huddle(79), json.dumps(meta))
     fake_redis.set(bus_module.k_pen(79), "alice")
     fake_redis.set(bus_module.k_penchal(79), json.dumps(challenge))
 
@@ -304,5 +306,88 @@ def test_pen_take_force_into_a_huddle_closed_mid_flight_writes_nothing(
     assert fake_redis.get(bus_module.k_pen(79)) == "alice"   # not stolen into a void
     assert fake_redis.get(bus_module.k_huddle(79)) is None
     assert json.loads(fake_redis.get(bus_module.k_penchal(79))) == challenge
-    assert "is gone" in capsys.readouterr().err
+    assert "changed while taking" in capsys.readouterr().err
     assert fake_redis.xlen(bus_module.k_stream("main")) == 0
+
+
+def test_pen_pass_close_reopen_race_does_not_move_new_huddle_pen(
+    bus_module, fake_redis, ns, monkeypatch, capsys
+):
+    old_meta = huddle_meta(bus_module)
+    old_meta["session"] = "huddle:issue-79:old"
+    new_meta = huddle_meta(bus_module)
+    new_meta["session"] = "huddle:issue-79:new"
+    new_meta["participants"] = ["alice"]
+    fake_redis.set(bus_module.k_huddle(79), json.dumps(old_meta))
+    fake_redis.set(bus_module.k_pen(79), "alice")
+
+    def checkpoint_then_reopen(_r, _args):
+        fake_redis.set(bus_module.k_huddle(79), json.dumps(new_meta))
+        fake_redis.set(bus_module.k_pen(79), "alice")
+        return 0
+
+    monkeypatch.setattr(bus_module, "cmd_pen_checkpoint", checkpoint_then_reopen)
+
+    rc = bus_module.cmd_pen_pass(fake_redis, ns(as_agent="alice", issue=79, to="bob"))
+
+    assert rc == 1
+    assert fake_redis.get(bus_module.k_pen(79)) == "alice"
+    assert json.loads(fake_redis.get(bus_module.k_huddle(79))) == new_meta
+    assert "changed while passing" in capsys.readouterr().err
+    assert fake_redis.xlen(bus_module.k_stream("main")) == 0
+
+
+def test_pen_take_challenge_close_reopen_race_does_not_seed_new_huddle(
+    bus_module, fake_redis, ns, monkeypatch, capsys
+):
+    old_meta = huddle_meta(bus_module, driver="alice")
+    old_meta["session"] = "huddle:issue-79:old"
+    new_meta = huddle_meta(bus_module, driver="alice")
+    new_meta["session"] = "huddle:issue-79:new"
+    new_meta["participants"] = ["alice"]
+    fake_redis.set(bus_module.k_huddle(79), json.dumps(old_meta))
+    fake_redis.set(bus_module.k_pen(79), "alice")
+
+    def reopen_before_challenge_record(_r, holder):
+        assert holder == "alice"
+        fake_redis.set(bus_module.k_huddle(79), json.dumps(new_meta))
+        fake_redis.set(bus_module.k_pen(79), "alice")
+        return True
+
+    monkeypatch.setattr(bus_module, "_holder_present", reopen_before_challenge_record)
+
+    rc = bus_module.cmd_pen_take(fake_redis, ns(as_agent="bob", issue=79, reason="ask"))
+
+    assert rc == 1
+    assert fake_redis.get(bus_module.k_penchal(79)) is None
+    assert fake_redis.get(bus_module.k_pen(79)) == "alice"
+    assert json.loads(fake_redis.get(bus_module.k_huddle(79))) == new_meta
+    assert "changed while challenging" in capsys.readouterr().err
+    assert fake_redis.xlen(bus_module.k_stream("main")) == 0
+
+
+def test_pen_take_stale_challenge_from_old_huddle_does_not_force_take(
+    bus_module, fake_redis, ns, monkeypatch, capsys
+):
+    meta = huddle_meta(bus_module, driver="alice")
+    meta["session"] = "huddle:issue-79:new"
+    old = (datetime.now(timezone.utc) - timedelta(seconds=bus_module.PEN_TAKE_GRACE + 5))
+    stale_challenge = {
+        "challenger": "bob", "reason": "old huddle", "ts": old.isoformat(),
+        "session": "huddle:issue-79:old", "driver": "alice",
+    }
+    fake_redis.set(bus_module.k_huddle(79), json.dumps(meta))
+    fake_redis.set(bus_module.k_pen(79), "alice")
+    fake_redis.set(bus_module.k_penchal(79), json.dumps(stale_challenge))
+    monkeypatch.setattr(bus_module, "_holder_present", lambda _r, _holder: False)
+
+    rc = bus_module.cmd_pen_take(fake_redis, ns(as_agent="bob", issue=79, reason="new huddle"))
+
+    assert rc == 0
+    assert fake_redis.get(bus_module.k_pen(79)) == "alice"
+    challenge = json.loads(fake_redis.get(bus_module.k_penchal(79)))
+    assert challenge["challenger"] == "bob"
+    assert challenge["reason"] == "new huddle"
+    assert challenge["session"] == meta["session"]
+    assert challenge["driver"] == "alice"
+    assert "force-take available" in capsys.readouterr().out

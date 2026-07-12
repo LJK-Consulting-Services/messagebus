@@ -405,24 +405,20 @@ def test_real_redis_pen_pass_into_a_huddle_closed_mid_flight_leaves_no_pen(
         assert rc == 1                                       # aborts, and says so
         assert verify.get(bus_module.k_huddle(issue)) is None
         assert verify.get(bus_module.k_pen(issue)) is None   # no resurrected pen key
-        assert "is gone" in capsys.readouterr().err
+        assert "changed while passing" in capsys.readouterr().err
     finally:
         _delete_issue_keys(verify, bus_module, issue)
 
 
-def test_real_redis_drain_clears_the_driver_when_its_own_del_reply_was_lost(
+def test_real_redis_drain_clears_driver_when_release_reply_was_lost(
     bus_module, ns, redis_url, monkeypatch,
 ):
-    """#94 item 1, on a real server: real WATCH/MULTI behind `_set_driver`'s CAS.
+    """#94 item 1, against a real server with real WATCH/MULTI semantics.
 
-    `retry_on_error` (B3, #83) re-sends an EVAL whose reply was lost; the re-send's
-    GET sees the key its OWN first attempt deleted, so the CAS reports 0 for a delete
-    that landed. Gating the driver-clear on that 0 released the pen but left
-    `meta['driver']` naming the drained agent.
-
-    Only `compare_delete` is stubbed — to the exact state double execution leaves
-    behind (key gone, result 0). The driver-clear that has to save us, and the CAS
-    inside it, are the real thing against the real server.
+    B3 (#83) made Redis writes retryable, so release code must survive "first
+    execution landed, reply was lost, operation ran again." The second pass sees
+    the pen already gone; it must still report success only when the matching
+    huddle session's driver is already blank.
     """
     issue = _issue_id()
     r = bus_module.connect(redis_url)
@@ -432,13 +428,14 @@ def test_real_redis_drain_clears_the_driver_when_its_own_del_reply_was_lost(
         _seed_huddle(r, bus_module, issue, ["agent-d", "agent-a"], "agent-d")
         r.set(bus_module.k_pen(issue), "agent-d", ex=60)
         monkeypatch.setattr(bus_module, "_unpushed_pen_issues", lambda *_a: [])
+        real_release = bus_module._release_pen_driver
 
-        def lost_reply_delete(client, key, value):
-            assert (key, value) == (bus_module.k_pen(issue), "agent-d")
-            client.delete(key)   # attempt 1 landed...
-            return 0             # ...and the re-sent attempt found it already gone
+        def lost_reply_retry(client, target, agent, expected_session):
+            assert (target, agent) == (str(issue), "agent-d")
+            assert real_release(client, target, agent, expected_session)
+            return real_release(client, target, agent, expected_session)
 
-        monkeypatch.setattr(bus_module, "compare_delete", lost_reply_delete)
+        monkeypatch.setattr(bus_module, "_release_pen_driver", lost_reply_retry)
 
         assert bus_module.cmd_drain(
             r, ns(as_agent="agent-d", force=False, room="integration")) == 0
