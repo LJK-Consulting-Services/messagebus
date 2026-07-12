@@ -151,14 +151,11 @@ def test_real_redis_huddle_open_branch_failure_rolls_back_lock_with_lua(
 # the other field survives. Interleave is deterministic, not timing-dependent.
 
 
-_PEN_IS_DRIVER = object()
-
-
-def _seed_huddle(r, bus_module, issue, participants, driver, pen=_PEN_IS_DRIVER):
+def _seed_huddle(r, bus_module, issue, participants, driver):
     """Seed a huddle as `cmd_huddle_open` would leave it.
 
-    The pen defaults to the DRIVER because that is the real invariant, not a
-    convenience: `cmd_huddle_open` writes `driver` and `pen_holder` in one CAS
+    The pen goes to the DRIVER because that is the real invariant, not a convenience:
+    `cmd_huddle_open` writes `driver` and `pen_holder` in one CAS
     (`compare_set_huddle_meta`) and `_set_driver` rewrites both in one MULTI, so
     `k_pen == meta["driver"]` in every live huddle. Seeding a huddle with no pen at
     all modelled a state the bus cannot produce — and a close test running against it
@@ -169,7 +166,6 @@ def _seed_huddle(r, bus_module, issue, participants, driver, pen=_PEN_IS_DRIVER)
     one transaction, so a drained huddle has neither. Writing an empty-string pen key
     instead would be a state the bus cannot reach, and `_take_unheld_pen` — which
     CAS-expects the key to be ABSENT — would refuse to take a pen nobody holds.
-    `pen=` overrides for the deliberately-inconsistent cases.
     """
     session = f"huddle:issue-{issue}:session"
     r.set(bus_module.k_lock(issue), session, ex=60)
@@ -178,9 +174,8 @@ def _seed_huddle(r, bus_module, issue, participants, driver, pen=_PEN_IS_DRIVER)
         "driver": driver, "branch": bus_module.huddle_branch(issue), "base": "dev",
         "base_commit": "0" * 40, "session": session, "status": "open",
         "created_at": "2026-07-11T00:00:00+00:00"}), ex=60)
-    holder = driver if pen is _PEN_IS_DRIVER else pen
-    if holder:
-        r.set(bus_module.k_pen(issue), holder, ex=60)
+    if driver:
+        r.set(bus_module.k_pen(issue), driver, ex=60)
 
 
 def _fire_once_on_huddle_read(monkeypatch, r, bus_module, issue, action, where="any"):
@@ -576,12 +571,15 @@ def test_real_redis_close_refuses_when_the_closer_does_not_hold_the_pen(
     them stale, so the done-gate can't be gamed by signing good code then pushing a
     poison commit"). Post-fix agent-a never reaches the gate — it does not hold the pen.
 
-    The tip flip is modelled in `_shared_tip` rather than by a real push because the
-    point is precisely that the push leaves no Redis trace to watch: a test that wrote
-    a Redis key to represent it would be testing a race that #92 already closes.
+    `_shared_tip` is stubbed to a COUNTER, not to a tip that flips. A flip would be
+    theatre: `donegate` reads the tip exactly once per pass, so a second, moved value is
+    never returned on any path — pre-fix the close reads T1, passes, and commits, and
+    the tip it commits at is unsigned by construction, not because the stub said so. The
+    counter asserts the property that actually distinguishes fixed from broken: the gate
+    never runs at all, because the pen check refuses ahead of it.
     """
     issue = _issue_id()
-    t1, t2 = "a" * 40, "b" * 40
+    tip = "a" * 40
     r = bus_module.connect(redis_url)
     verify = bus_module.connect(redis_url)
     presence = []
@@ -590,20 +588,18 @@ def test_real_redis_close_refuses_when_the_closer_does_not_hold_the_pen(
         # agent-b drives and therefore holds the pen; agent-a is the closing peer.
         _seed_huddle(r, bus_module, issue, ["agent-a", "agent-b"], "agent-b")
         assert verify.get(bus_module.k_pen(issue)) == "agent-b"
-        # Everyone signed at T1: the gate PASSES on the tip it reads, so a close that
+        # Everyone signed at the tip: the gate PASSES on what it reads, so a close that
         # ignores the pen returns 0 — it does not fail for some unrelated reason.
-        r.set(bus_module.k_signoff(issue), json.dumps({"agent-a": t1, "agent-b": t1}))
+        r.set(bus_module.k_signoff(issue), json.dumps({"agent-a": tip, "agent-b": tip}))
         presence = _seed_presence(r, bus_module, "integration", ("agent-a", "agent-b"))
 
         tips = {"n": 0}
 
-        def tip_moves_after_the_gate_reads_it(_issue):
-            # First read = the gate's: T1, which both agents signed. The driver's push
-            # lands right behind it, so every later read sees T2 — signed by nobody.
+        def count_gate_tip_reads(_issue):
             tips["n"] += 1
-            return t1 if tips["n"] == 1 else t2
+            return tip
 
-        monkeypatch.setattr(bus_module, "_shared_tip", tip_moves_after_the_gate_reads_it)
+        monkeypatch.setattr(bus_module, "_shared_tip", count_gate_tip_reads)
 
         rc = bus_module.cmd_huddle_close(
             r, ns(issue=issue, as_agent="agent-a", room="integration", force=False))
@@ -617,6 +613,54 @@ def test_real_redis_close_refuses_when_the_closer_does_not_hold_the_pen(
         # The gate must never have run: the pen check precedes it, so the tip that
         # could have been closed at was never even read.
         assert tips["n"] == 0, "the gate read the tip before checking the pen"
+    finally:
+        _delete_issue_keys(verify, bus_module, issue)
+        if presence:
+            verify.delete(*presence)
+
+
+def _assert_close_refuses_when_the_pen_moves_mid_gate(
+    bus_module, ns, redis_url, monkeypatch, move_the_pen,
+):
+    """agent-a holds the pen and passes the pen check; `move_the_pen(issue)` then sends
+    it to agent-b from inside the gate window, and the close must refuse.
+
+    `move_the_pen` fires from the stubbed `_shared_tip`, which `donegate` calls INSIDE
+    the watched window and AFTER the pen check — precisely the gate->EXEC gap where a
+    pen move must not go unnoticed. It runs on its own connection, so it is a genuine
+    concurrent writer rather than a re-entrant call on the closing client.
+
+    Callers differ only in HOW the pen moves, which is the whole point: each way it can
+    move exercises a different key in the WATCH set.
+    """
+    issue = _issue_id()
+    tip = "e" * 40
+    r = bus_module.connect(redis_url)
+    verify = bus_module.connect(redis_url)
+    presence = []
+
+    try:
+        _seed_huddle(r, bus_module, issue, ["agent-a", "agent-b"], "agent-a")
+        r.set(bus_module.k_signoff(issue), json.dumps({"agent-a": tip, "agent-b": tip}))
+        presence = _seed_presence(r, bus_module, "integration", ("agent-a", "agent-b"))
+
+        fired = {"n": 0}
+
+        def tip_then_move_the_pen(_issue):
+            if not fired["n"]:
+                fired["n"] = 1
+                move_the_pen(issue)
+            return tip
+
+        monkeypatch.setattr(bus_module, "_shared_tip", tip_then_move_the_pen)
+
+        rc = bus_module.cmd_huddle_close(
+            r, ns(issue=issue, as_agent="agent-a", room="integration", force=False))
+
+        assert fired["n"], "the pen never moved — the race was not exercised"
+        assert rc == 1, "the close committed a gate verdict it no longer held the pen for"
+        assert verify.get(bus_module.k_huddle(issue)) is not None, "the huddle was destroyed"
+        assert verify.get(bus_module.k_pen(issue)) == "agent-b"
     finally:
         _delete_issue_keys(verify, bus_module, issue)
         if presence:
@@ -637,44 +681,15 @@ def test_real_redis_close_regates_when_the_pen_is_taken_inside_the_gate_window(
     finds it is no longer ours, and refuses. Without the re-check inside the loop the
     retry would sail through on a verdict it no longer owns.
     """
-    issue = _issue_id()
-    tip = "e" * 40
-    r = bus_module.connect(redis_url)
-    verify = bus_module.connect(redis_url)
     taker = bus_module.connect(redis_url)
-    presence = []
 
-    try:
-        _seed_huddle(r, bus_module, issue, ["agent-a", "agent-b"], "agent-a")
-        r.set(bus_module.k_signoff(issue), json.dumps({"agent-a": tip, "agent-b": tip}))
-        presence = _seed_presence(r, bus_module, "integration", ("agent-a", "agent-b"))
-        session = f"huddle:issue-{issue}:session"
+    def take_the_pen(issue):
+        assert bus_module._set_driver(
+            taker, issue, "agent-b", pen_to="agent-b", pen_expect="agent-a",
+            expected_session=f"huddle:issue-{issue}:session")
 
-        fired = {"n": 0}
-
-        def tip_then_steal_the_pen(_issue):
-            # `donegate` calls this INSIDE the watched window, after the pen check —
-            # exactly the gate->EXEC gap where a pen move must not go unnoticed.
-            if not fired["n"]:
-                fired["n"] = 1
-                assert bus_module._set_driver(
-                    taker, issue, "agent-b", pen_to="agent-b", pen_expect="agent-a",
-                    expected_session=session)
-            return tip
-
-        monkeypatch.setattr(bus_module, "_shared_tip", tip_then_steal_the_pen)
-
-        rc = bus_module.cmd_huddle_close(
-            r, ns(issue=issue, as_agent="agent-a", room="integration", force=False))
-
-        assert fired["n"], "the pen never moved — the race was not exercised"
-        assert rc == 1, "the close committed a gate verdict it no longer held the pen for"
-        assert verify.get(bus_module.k_huddle(issue)) is not None, "the huddle was destroyed"
-        assert verify.get(bus_module.k_pen(issue)) == "agent-b"
-    finally:
-        _delete_issue_keys(verify, bus_module, issue)
-        if presence:
-            verify.delete(*presence)
+    _assert_close_refuses_when_the_pen_moves_mid_gate(
+        bus_module, ns, redis_url, monkeypatch, take_the_pen)
 
 
 def test_real_redis_close_aborts_on_a_pen_write_that_does_not_touch_the_metadata(
@@ -697,41 +712,14 @@ def test_real_redis_close_aborts_on_a_pen_write_that_does_not_touch_the_metadata
     So the bare write below is deliberate — it is not modelling a command the bus has
     today, it is modelling the one it must not be allowed to grow.
     """
-    issue = _issue_id()
-    tip = "9" * 40
-    r = bus_module.connect(redis_url)
-    verify = bus_module.connect(redis_url)
     poisoner = bus_module.connect(redis_url)
-    presence = []
 
-    try:
-        _seed_huddle(r, bus_module, issue, ["agent-a", "agent-b"], "agent-a")
-        r.set(bus_module.k_signoff(issue), json.dumps({"agent-a": tip, "agent-b": tip}))
-        presence = _seed_presence(r, bus_module, "integration", ("agent-a", "agent-b"))
+    def move_the_pen_and_nothing_else(issue):
+        # No metadata write: the abort can only come from the WATCH on k_pen itself.
+        poisoner.set(bus_module.k_pen(issue), "agent-b", ex=60)
 
-        fired = {"n": 0}
-
-        def tip_then_move_the_pen_alone(_issue):
-            if not fired["n"]:
-                fired["n"] = 1
-                # A pen move with NO metadata write: the abort can only come from the
-                # WATCH on k_pen itself.
-                poisoner.set(bus_module.k_pen(issue), "agent-b", ex=60)
-            return tip
-
-        monkeypatch.setattr(bus_module, "_shared_tip", tip_then_move_the_pen_alone)
-
-        rc = bus_module.cmd_huddle_close(
-            r, ns(issue=issue, as_agent="agent-a", room="integration", force=False))
-
-        assert fired["n"], "the bare pen write never landed — race not exercised"
-        assert rc == 1, "the close committed while the pen moved out from under it"
-        assert verify.get(bus_module.k_huddle(issue)) is not None, "the huddle was destroyed"
-        assert verify.get(bus_module.k_pen(issue)) == "agent-b"
-    finally:
-        _delete_issue_keys(verify, bus_module, issue)
-        if presence:
-            verify.delete(*presence)
+    _assert_close_refuses_when_the_pen_moves_mid_gate(
+        bus_module, ns, redis_url, monkeypatch, move_the_pen_and_nothing_else)
 
 
 def test_real_redis_force_close_still_needs_no_pen(

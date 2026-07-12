@@ -2460,7 +2460,7 @@ def cmd_huddle_close(r, args):
                 # now" into "delete at EXEC". Spelling the eval out keeps that visible.
                 pipe.multi()
                 pipe.eval(CAS_DELETE_LUA, 1, k_lock(issue), session)
-                pipe.delete(key, k_pen(issue), k_penchal(issue),
+                pipe.delete(key, pen_key, k_penchal(issue),
                             k_signoff(issue), block_key)  # all huddle state dies with it
                 owned = bool(pipe.execute()[0])
                 break
