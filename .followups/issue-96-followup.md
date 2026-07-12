@@ -73,13 +73,40 @@ scan_iter(match="bus:presence:*:*", count=_SCAN_COUNT)   # rsplit(":", 1)[-1] as
 matches — parity on all three shapes (canonical, bare-malformed, 5-segment). Not a
 superset, not a subset.
 
-## 3. `count=` batch hint missing on the remaining `scan_iter` sites
+## 3. `count=` batch hint missing on EVERY `scan_iter` site
 
-`_SCAN_COUNT` was introduced in #96 but only applied there. Remaining un-hinted sites on
-`origin/dev`: **884** (`k_cursor(room, "*")` — a retention/cursor scan, *not* a presence
-read; it gets mis-cited as one), **1026** and **1203** (`bus:lock:issue:*`), **1072**,
-**1314** (already correctly room-scoped via the `k_presence` helper), **1603**
-(`bus:worktree:issue:*`).
+`_SCAN_COUNT` was introduced in #96 and applied to exactly one call — its new `_present_set`.
+**All 11 `scan_iter` sites on `origin/dev` pass `count=None`**, so every one of them is
+un-hinted. The full set, AST-derived from `git show origin/dev:bus` (enclosing `def` attributed
+by walking the tree, not by grep — grep cannot attribute a caller):
+
+| line | enclosing `def` | `match=` | presence read? |
+|------|-----------------|----------|----------------|
+| 884  | `safe_trim_room`         | `k_cursor(room, "*")`        | **no** — retention/cursor scan; mis-cited as presence 4× |
+| 954  | `_holder_present`        | `bus:presence:*:{holder}`    | yes (room-segment) — §1 |
+| 1024 | `cmd_reap`               | `bus:presence:*`             | yes (**bare**) — §1 |
+| 1026 | `cmd_reap`               | `bus:lock:issue:*`           | no — global issue glob |
+| 1072 | `_held_by`               | `pattern` (**caller-supplied**) | no — see below |
+| 1162 | `cmd_drain`              | `bus:presence:*:{agent}`     | yes (room-segment) — §1 |
+| 1203 | `cmd_board`              | `bus:lock:issue:*`           | no — global issue glob |
+| 1206 | `cmd_board`              | `bus:presence:*`             | yes (**bare**) — §1 |
+| 1314 | `cmd_agents`             | `k_presence(args.room, "*")` | yes — **the only room-scoped presence scan** |
+| 1603 | `_iter_ws_meta_with_keys`| `bus:worktree:issue:*`       | no — global issue glob |
+| 1700 | `cmd_ws_list`            | `bus:presence:*`             | yes (**bare**) — §1 |
+
+The five §1 rows get their `count=` as part of the §1 rewrite (they are re-globbed anyway);
+the other six take the hint on its own.
+
+**1072 is NOT room-scoped, and has nothing to do with `k_presence`.** `_held_by(r, pattern, agent)`
+(def @1069) scans whatever `match=pattern` its caller hands it, and its only two callers — both in
+`cmd_drain` — pass **global issue globs**: `_held_by(r, "bus:pen:issue:*", agent)` @1123 and
+`_held_by(r, "bus:lock:issue:*", agent)` @1124. `k_presence` is called at exactly two sites in
+the whole file: `touch_presence` @167 (the sole writer) and `cmd_agents` @1314. So **1314 is the only
+site the "room-scoped via `k_presence`" description fits.** An earlier draft of this section grouped
+1072 with 1314 under that description; that was a **false citation**, caught by claude-3's
+claim-verification lens on `8b0ed47` and re-derived independently before this correction landed.
+A document whose stated value is "line numbers re-derived against the blob, because three agents
+already cited the wrong line" cannot itself ship one.
 
 Pure batching hint, no semantic change. Verified against fakeredis + real Redis in #96.
 
