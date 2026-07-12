@@ -536,10 +536,9 @@ def test_real_redis_close_with_a_reaped_lock_clears_state_but_not_the_label(
     #92 moved the lock release from a client-side `compare_delete_lock` into the
     gated transaction as a queued EVAL. The hit path is covered above; this is the
     branch where a Lua CAS and a naive DEL actually differ, so it is the one worth
-    proving against a real server. Since #116 fakeredis does run the real script --
-    but it has no concurrency between `multi()` and `execute()`, so it cannot stage
-    the very thing this branch defends against: another holder taking the lock in
-    that window. Only a real server can.
+    proving against a real server. Since #116 fakeredis runs the real script too and
+    would reproduce this state -- but the guarantee being claimed is Redis's own, so
+    a real server is what proves it.
 
     Contract when the lock is NOT ours (it expired, or was reaped and re-acquired):
     the CAS must return 0 and leave the OTHER holder's lock alone, the huddle state

@@ -3,7 +3,6 @@ import importlib.util
 import io
 import json
 import pathlib
-import sys
 import types
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -13,7 +12,9 @@ import fakeredis
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-sys.modules.setdefault("redis", types.SimpleNamespace(WatchError=Exception))
+# No `redis` stub here: importing fakeredis above pulls the REAL redis-py into
+# sys.modules (it hard-depends on it), so the sys.modules.setdefault this file used
+# to do was already a no-op by the time it ran.
 LOADER = importlib.machinery.SourceFileLoader("bus_mod", str(ROOT / "bus"))
 SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
 bus = importlib.util.module_from_spec(SPEC)
