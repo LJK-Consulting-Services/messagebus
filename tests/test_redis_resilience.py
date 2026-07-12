@@ -360,6 +360,85 @@ def test_drain_leaves_the_pen_takeable_at_once_and_syncs_huddle_meta(
     assert "force-take available" not in out  # the old 120s-wait path
 
 
+def test_drain_clears_driver_when_release_reply_was_lost(
+        bus_module, fake_redis, ns, monkeypatch, capsys):
+    """If Redis retries after the release EXEC landed, the second pass sees the
+    pen already gone and driver already blank. That must still count as released."""
+    monkeypatch.setattr(bus_module, "_ws_meta", lambda *_a, **_kw: None)
+    fake_redis.set(bus_module.k_pen(44), "claude-2")
+    fake_redis.set(bus_module.k_huddle(44), json.dumps({
+        "issue": 44, "opener": "claude-2", "participants": ["claude-2", "codex-1"],
+        "driver": "claude-2", "branch": "huddle/issue-44", "status": "open"}))
+    real_release = bus_module._release_pen_driver
+
+    def lost_reply_retry(r, issue, agent, expected_session):
+        assert (issue, agent) == ("44", "claude-2")
+        assert real_release(r, issue, agent, expected_session)
+        return real_release(r, issue, agent, expected_session)
+
+    monkeypatch.setattr(bus_module, "_release_pen_driver", lost_reply_retry)
+
+    assert bus_module.cmd_drain(fake_redis, ns(as_agent="claude-2", force=False,
+                                               json=True)) == 0
+
+    assert fake_redis.get(bus_module.k_pen(44)) is None
+    assert json.loads(fake_redis.get(bus_module.k_huddle(44)))["driver"] == ""
+    # and the release is still REPORTED — the pen really did go away
+    assert json.loads(capsys.readouterr().out)["pens_released"] == ["44"]
+
+
+def test_drain_close_reopen_race_does_not_release_new_huddle_pen(
+        bus_module, fake_redis, ns, monkeypatch, capsys):
+    monkeypatch.setattr(bus_module, "_ws_meta", lambda *_a, **_kw: None)
+    old_meta = {
+        "issue": 44, "opener": "claude-2", "participants": ["claude-2", "codex-1"],
+        "driver": "claude-2", "branch": "huddle/issue-44", "status": "open",
+        "session": "huddle:issue-44:old"}
+    new_meta = dict(old_meta)
+    new_meta["session"] = "huddle:issue-44:new"
+    fake_redis.set(bus_module.k_pen(44), "claude-2")
+    fake_redis.set(bus_module.k_huddle(44), json.dumps(old_meta))
+
+    def reopen_after_session_snapshot(_r, _agent, _issues):
+        fake_redis.set(bus_module.k_huddle(44), json.dumps(new_meta))
+        fake_redis.set(bus_module.k_pen(44), "claude-2")
+        return []
+
+    monkeypatch.setattr(bus_module, "_unpushed_pen_issues", reopen_after_session_snapshot)
+
+    assert bus_module.cmd_drain(fake_redis, ns(as_agent="claude-2", force=False,
+                                               json=True)) == 0
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["pens_released"] == []
+    assert fake_redis.get(bus_module.k_pen(44)) == "claude-2"
+    assert json.loads(fake_redis.get(bus_module.k_huddle(44))) == new_meta
+
+
+def test_drain_neither_releases_nor_clears_a_pen_a_peer_now_holds(
+        bus_module, fake_redis, ns, monkeypatch, capsys):
+    """The negative control on the fix above: "clear the driver for every pen we
+    held" must NOT become "clear the driver for every pen we ever held".
+
+    A peer force-took the pen between our scan and our release, and their take
+    installed driver=peer. Both the CAS and the driver-CAS must refuse, and we must
+    not announce a release we did not perform.
+    """
+    monkeypatch.setattr(bus_module, "_ws_meta", lambda *_a, **_kw: None)
+    monkeypatch.setattr(bus_module, "_held_by", lambda *_a: ["44"])  # our stale scan
+    fake_redis.set(bus_module.k_pen(44), "codex-1")                  # peer holds it now
+    fake_redis.set(bus_module.k_huddle(44), json.dumps({
+        "issue": 44, "opener": "claude-2", "participants": ["claude-2", "codex-1"],
+        "driver": "codex-1", "branch": "huddle/issue-44", "status": "open"}))
+
+    assert bus_module.cmd_drain(fake_redis, ns(as_agent="claude-2", force=False,
+                                               json=True)) == 0
+
+    assert fake_redis.get(bus_module.k_pen(44)) == "codex-1"          # never yanked
+    assert json.loads(fake_redis.get(bus_module.k_huddle(44)))["driver"] == "codex-1"
+    assert json.loads(capsys.readouterr().out)["pens_released"] == []  # nor claimed
+
+
 def test_drain_is_never_silent_even_with_no_pen(bus_module, fake_redis, ns, events_of,
                                                 monkeypatch, capsys):
     """Clearing presence drops the agent out of the done-gate's present-participant
@@ -407,19 +486,15 @@ def test_drain_refuses_to_strand_unpushed_work(bus_module, fake_redis, ns, event
 
 def test_drain_never_steals_a_pen_that_already_moved(bus_module, fake_redis, ns,
                                                      monkeypatch, capsys):
-    """The pen is released by CAS. If a peer force-took it between our scan and
-    our delete, the delete must be a no-op — never yank the pen out of the hands
-    of whoever holds it now."""
+    """If a peer takes the pen between our scan and release, never yank it away."""
     monkeypatch.setattr(bus_module, "_ws_meta", lambda *_a, **_kw: None)
     fake_redis.set(bus_module.k_pen(44), "claude-2")
 
-    real_compare_delete = bus_module.compare_delete
+    def peer_takes_after_snapshot(_r, _agent, _issues):
+        fake_redis.set(bus_module.k_pen(44), "codex-1")
+        return []
 
-    def steal_first(r, key, value):
-        r.set(key, "codex-1")  # peer takes the pen right before our CAS lands
-        return real_compare_delete(r, key, value)
-
-    monkeypatch.setattr(bus_module, "compare_delete", steal_first)
+    monkeypatch.setattr(bus_module, "_unpushed_pen_issues", peer_takes_after_snapshot)
 
     assert bus_module.cmd_drain(fake_redis, ns(as_agent="claude-2", force=False,
                                                json=True)) == 0
