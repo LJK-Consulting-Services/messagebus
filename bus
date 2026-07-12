@@ -1988,9 +1988,10 @@ def cmd_huddle_close(r, args):
     by the DONE-GATE — every present participant signed off at the current tip and
     no open blocks — unless --force. Participant-only (stops a bystander closing).
 
-    The gate runs under a WATCH on every key it reads, and the delete that ends the
-    huddle commits in the SAME transaction (#92). The invariant: the gate's inputs
-    must not change between the gate and the delete that destroys them.
+    The gate runs under a WATCH on every REDIS key it reads, and the delete that ends
+    the huddle commits in the SAME transaction (#92). The invariant it enforces: no
+    gate input that lives in Redis may change between the gate and the delete that
+    destroys it.
 
     Two ways that was violated, both real gate BYPASSES rather than cosmetic races:
       * `huddle join` grows `participants` in the metadata blob. A join landing after
@@ -2008,11 +2009,17 @@ def cmd_huddle_close(r, args):
     so a concurrent write can only make the gate MORE satisfied, never turn a refusal
     into a pass. Watching it would buy nothing and abort the close on every sign-off.
 
-    A retry is not a spin: on the re-read the new participant is unsigned, or the new
-    block is open, so the gate now fails and the close is correctly refused. Pen ops
-    write the metadata blob too (participants and driver share one key), so pen
-    activity also aborts and retries — benign to the gate, and the cost of the
-    single-blob design rather than a defect.
+    NOT covered, by construction: the shared git tip (`_shared_tip`, read by the gate)
+    is not a Redis key, so no WATCH can freeze it. A checkpoint push landing in the
+    gate->EXEC window closes at a tip nobody signed. That gap pre-dates #92 and is
+    tracked in #95; the tip-pinned sign-offs, not this WATCH, are its only guard.
+
+    A retry re-reads and re-gates: a landed join leaves a participant unsigned, a
+    landed block is open, so the gate then refuses. Pen ops also write the metadata
+    blob (participants and driver share one key), and those writes are benign to the
+    gate — so they abort and retry WITHOUT flipping the verdict. In a turn-based,
+    agent-paced system that is a handful of retries, not a spin; there is no retry cap,
+    matching the house WATCH idiom (`_set_driver`, `_mutate_json`).
     """
     issue = args.issue
     key, block_key = k_huddle(issue), k_block(issue)
@@ -2063,6 +2070,11 @@ def cmd_huddle_close(r, args):
                 continue  # a join, block, or pen op landed; re-read and re-gate on it
     # gh is network and must not sit inside the transaction, so it runs after the
     # huddle is already down. A failure here leaves the label stale, never the state.
+    # The atomic teardown also means the meta is gone before these gh calls, so a
+    # racing `huddle open` on the same issue can slip into this window and its
+    # status:claimed can lose to our status:pr-open (last write wins) — a GH-label
+    # race only; Redis stays consistent (the new huddle fully owns lock+meta). gh is
+    # best-effort and labels are manually correctable here, so this is not gated. (#99)
     err = None
     if owned:
         try:
