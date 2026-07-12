@@ -2341,34 +2341,57 @@ def cmd_huddle_close(r, args):
     full stop. It is also the gate input we least need frozen: a participant whose
     presence lapses mid-gate is indistinguishable from one who lapses just after it.
 
-    NOT covered, by construction: the shared git tip (`_shared_tip`, read by the gate)
-    is not a Redis key, so no WATCH can freeze it. A checkpoint push landing in the
-    gate->EXEC window closes at a tip nobody signed. That gap pre-dates #92 and is
-    tracked in #95; the tip-pinned sign-offs, not this WATCH, are its only guard.
+    The shared git tip (`_shared_tip`, read by the gate) is not a Redis key, so no
+    WATCH can freeze it. It is covered instead by the PEN INVARIANT (#95): the closer
+    must ALREADY hold the pen. `cmd_pen_checkpoint` and `cmd_huddle_recover` are the
+    only two commands that push the shared branch, and both are `_require_pen`-gated,
+    so while the closer holds the pen NO other agent can move the tip. A push landing
+    in the gate->EXEC window is not detected — it is made unreachable.
+
+    The invariant is a PRECONDITION, never a side effect: the close VERIFIES the pen
+    and never acquires it, so a refused close (open block, unsigned participant) moves
+    nothing and needs no rollback. Coming to hold the pen is `bus pen take`'s job, and
+    routing it there is deliberate — an ABSENT driver yields immediately (#94), and a
+    LIVE one gets take's challenge/deny, which is exactly the conversation owed to
+    someone still writing. `--force` skips the gate, and with it the pen check: there
+    is no tip to protect when nothing reads it.
+
+    Residual, stated plainly: this binds only pushes made THROUGH the bus. A human
+    running `git push` straight at the shared branch still moves the tip under a
+    close, and no Redis-side guard can see it. That matches #95's own threat model.
 
     A retry re-reads and re-gates: a landed join leaves a participant unsigned, a
     landed block is open, so the gate then refuses. Pen ops also write the metadata
     blob (participants and driver share one key), and those writes are benign to the
     gate — so they abort and retry WITHOUT flipping the verdict.
 
+    `k_pen` is watched too, and honestly it is belt-and-braces: every pen mover
+    (`_set_driver`, `_release_pen_driver`, `compare_set_huddle_meta`) writes the
+    metadata blob in the SAME transaction as the pen, so the `key` WATCH above already
+    aborts us on any pen move. Watching `k_pen` adds no abort this code does not
+    already take. It is here so the close's correctness rests on the key it actually
+    reads rather than on that coupling holding forever in code it does not own.
+
     COST, stated honestly: a retry is NOT cheap here. `donegate` re-runs, and it does a
     `git fetch` (via `_shared_tip`) plus a keyspace scan per participant (#96) — so an
     abort costs seconds, not the microseconds an abort costs in `_set_driver` or
     `_mutate_huddle_json`. The retry is uncapped as in those helpers, but the comparison to
     them ends there. It is tolerable only because a close happens once per huddle and
-    the writers that abort it are agent-paced, so retries are rare. The tip is
-    deliberately re-read on each pass rather than sampled once: that re-read is the only
-    thing that catches a checkpoint push landing alongside a join, and trading it for
-    latency on a once-per-huddle path would widen #95 to buy speed we do not need.
-    Hoisting the fetch out of the transaction is tracked as a follow-up.
+    the writers that abort it are agent-paced, so retries are rare. The tip is STILL
+    re-read on each pass rather than sampled once, and the pen invariant does not buy
+    that away (#114): a WATCH lapses at an abort, so across a retry boundary the pen
+    could be taken, pushed on, and passed BACK to us — k_pen reads as ours again while
+    the tip has moved (an ABA). Within one pass the WATCH catches it; across passes only
+    the re-read does. Sampling the tip once would reopen #95 through that seam. Killing
+    the per-pass fetch needs a fencing token on the pen, not this invariant (#114).
     """
     issue = args.issue
-    key, block_key = k_huddle(issue), k_block(issue)
+    key, block_key, pen_key = k_huddle(issue), k_block(issue), k_pen(issue)
     session = None
     with r.pipeline() as pipe:
         while True:
             try:
-                pipe.watch(key, block_key)
+                pipe.watch(key, block_key, pen_key)
                 raw = pipe.get(key)
                 if not raw:
                     pipe.unwatch()
@@ -2401,6 +2424,23 @@ def cmd_huddle_close(r, args):
                 # the closer + every present participant has signed off at the current
                 # tip and no block is open.
                 if not getattr(args, "force", False):
+                    # PEN INVARIANT (#95). Read INSIDE the watched window and BEFORE the
+                    # gate: the gate's verdict is only as good as the tip it read, and the
+                    # pen is what pins that tip. Verify only — acquiring here would move
+                    # the pen as a side effect of a close that may still refuse.
+                    holder = pipe.get(pen_key)
+                    if holder != args.as_agent:
+                        pipe.unwatch()
+                        sys.stderr.write(
+                            f"bus huddle close: you ({args.as_agent}) must hold the pen to "
+                            f"close #{issue} (holder: {holder or '(none)'}).\n"
+                            f"  The done-gate signs off a specific tip, and only the pen "
+                            f"holder can move it — closing without it can commit at a tip "
+                            f"nobody signed (#95).\n"
+                            f"  Take it first: bus pen take --issue {issue} --reason "
+                            f"'closing the huddle'\n"
+                            f"  (or --force to close without the gate).\n")
+                        return 1
                     ok, reasons = donegate(r, issue, meta, args.as_agent)
                     if not ok:
                         pipe.unwatch()
@@ -2428,13 +2468,22 @@ def cmd_huddle_close(r, args):
                 continue  # a join, block, or pen op landed; re-read and re-gate on it
     # gh is network and must not sit inside the transaction, so it runs after the
     # huddle is already down. A failure here leaves the label stale, never the state.
-    # The atomic teardown also means the meta is gone before these gh calls, so a
-    # racing `huddle open` on the same issue can slip into this window and its
-    # status:claimed can lose to our status:pr-open (last write wins) — a GH-label
-    # race only; Redis stays consistent (the new huddle fully owns lock+meta). gh is
-    # best-effort and labels are manually correctable here, so this is not gated. (#99)
+    #
+    # The atomic teardown means the meta AND the lock are gone before these gh calls,
+    # so the issue is briefly free and a racing `huddle open` can claim it in that
+    # window. Our status:pr-open would then land on THEIR freshly-opened huddle and
+    # beat their status:claimed (last write wins), plus a "closed" comment on a huddle
+    # that is very much open. Re-read the lock first: if someone now holds it, the
+    # label is theirs to set and not ours, so we stand down and say so. (#99)
+    #
+    # This SHRINKS the race, it does not close it — they could still claim in the gap
+    # between this read and the gh call. But that gap is one local Redis GET, where the
+    # unguarded one spanned two network round-trips to GitHub. gh is not transactional
+    # with Redis, so no ordering makes it airtight; label-before-delete is strictly
+    # worse (a WatchError abort would leave pr-open on a huddle that never closed).
+    reclaimed = r.get(k_lock(issue)) if owned else None
     err = None
-    if owned:
+    if owned and not reclaimed:
         try:
             set_status_label(issue, "status:pr-open")
             gh(["issue", "comment", str(issue),
@@ -2449,6 +2498,13 @@ def cmd_huddle_close(r, args):
         sys.stderr.write(f"warning: huddle #{issue} lock was already gone (expired or "
                          f"reaped); cleared metadata but did NOT advance the status "
                          f"label — set it manually if the issue still needs it\n")
+    elif reclaimed:
+        # Silence here would be the worst outcome: the close LOOKS complete, the label
+        # still reads status:claimed, and nobody knows it was ours to advance. (#99)
+        sys.stderr.write(f"warning: huddle #{issue} closed, but a new session claimed the "
+                         f"issue before the label could be advanced; left it to them and "
+                         f"did NOT set status:pr-open — set it manually if this close "
+                         f"still needs recording\n")
     elif err:
         sys.stderr.write(f"warning: huddle closed but gh update failed: {err}\n")
     return 0
