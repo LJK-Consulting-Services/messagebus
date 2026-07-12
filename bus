@@ -1743,11 +1743,12 @@ def _set_driver(r, issue, driver, *, pen_to, pen_expect,
     any checkpoint/presence/race window. Issue numbers are reusable after
     close+reopen, so checking only the pen holder is not enough.
 
-    Returns True if the pen and driver were written; False if the huddle is gone,
-    or `expected_session` / `pen_expect` / `challenge_expect` did not match, or
-    `driver` is not a current participant. Every caller acts on the result.
-    Corrupt metadata raises (like `_huddle_meta`) rather than silently no-opping
-    — a driver write we can't complete must be loud.
+    Returns True if the move is in place — either because this call wrote it, or
+    because it was ALREADY exactly what was asked for (see `already_done` below).
+    False if the huddle is gone, or `expected_session` / `pen_expect` /
+    `challenge_expect` did not match, or `driver` is not a current participant.
+    Every caller acts on the result. Corrupt metadata raises (like `_huddle_meta`)
+    rather than silently no-opping — a driver write we can't complete must be loud.
     """
     key = k_huddle(issue)
     pen_key = k_pen(issue)
