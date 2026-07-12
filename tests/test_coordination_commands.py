@@ -45,19 +45,22 @@ def test_set_status_label_read_failure_adds_only_new_label(bus_module, monkeypat
 def test_status_renews_holder_and_announces(bus_module, fake_redis, ns, monkeypatch, capsys):
     status = mock.Mock()
     gh = mock.Mock(return_value=(0, "", ""))
+    # #71: cmd_status reads the live label to enforce transition legality; seed a
+    # current status so claimed -> pr-open is a legal forward move.
+    monkeypatch.setattr(bus_module, "issue_labels", lambda _issue: ["status:claimed"])
     monkeypatch.setattr(bus_module, "set_status_label", status)
     monkeypatch.setattr(bus_module, "gh", gh)
     fake_redis.set(bus_module.k_lock(79), "alice", ex=10)
 
     assert bus_module.cmd_status(
         fake_redis,
-        ns(as_agent="alice", issue=79, set="status:pr-open", ttl=120),
+        ns(as_agent="alice", issue=79, set="status:pr-open", ttl=120, force=False),
     ) == 0
 
     assert fake_redis.ttl(bus_module.k_lock(79)) > 10
     assert fake_redis.xlen(bus_module.k_stream("main")) == 1
     assert "status:pr-open" in capsys.readouterr().out
-    status.assert_called_once_with(79, "status:pr-open")
+    status.assert_called_once_with(79, "status:pr-open", current_labels=["status:claimed"])
     gh.assert_called_once()
 
 

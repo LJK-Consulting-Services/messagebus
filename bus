@@ -210,17 +210,76 @@ STATUS_LABELS = [
     "status:merged", "status:deployed", "status:verified",
 ]
 
+# The status pipeline is linear. Forward progress by any distance is always
+# allowed; a no-op re-set (current == new) is skipped; a backward move is
+# refused unless --force, except the two explicit "back to work" edges an
+# abandoned claim or a closed PR needs. This blocks fat-finger regressions
+# (verified -> open) and duplicate re-sets while leaving forward workflow alone.
+_STATUS_INDEX = {label: i for i, label in enumerate(STATUS_LABELS)}
+_STATUS_BACK_EDGES = {
+    ("status:claimed", "status:open"),      # abandon a claim, back to the pool
+    ("status:pr-open", "status:claimed"),   # PR closed -> back to building
+}
 
-def set_status_label(issue, new_label):
+
+def status_transition(current, new):
+    """Classify a status move without touching gh or Redis.
+
+    Returns:
+      'noop'    - current == new; the caller should skip the write
+      'ok'      - a legal transition
+      'illegal' - refused unless the caller passes --force
+
+    `current` may be None (no status label yet) or a foreign/stale label; either
+    way any set is 'ok' — we only constrain moves between known pipeline stages.
+    Raises ValueError if `new` is not a known status label.
+    """
+    if new not in _STATUS_INDEX:
+        raise ValueError(f"unknown status label: {new}")
+    if current not in _STATUS_INDEX:
+        return "ok"            # no prior state, or a label we don't manage
+    if current == new:
+        return "noop"
+    if _STATUS_INDEX[new] > _STATUS_INDEX[current]:
+        return "ok"            # forward, any distance
+    if (current, new) in _STATUS_BACK_EDGES:
+        return "ok"
+    return "illegal"
+
+
+def effective_status(labels):
+    """The furthest-along status:* label on the issue, or None.
+
+    Picking the max pipeline stage (not the first label gh happens to return)
+    makes the legality check deterministic and conservative when a prior
+    read-failure fallback left more than one status:* label on the issue: the
+    issue is treated as its most-advanced stage, so a backward move is still
+    correctly refused. `labels` may be None (read failed) -> None.
+    """
+    known = [l for l in (labels or []) if l in _STATUS_INDEX]
+    if not known:
+        return None
+    return max(known, key=lambda l: _STATUS_INDEX[l])
+
+
+_UNREAD = object()
+
+
+def set_status_label(issue, new_label, current_labels=_UNREAD):
     """Add new_label, remove any other status:* label the issue actually has.
 
     Deriving the remove-set from the issue's current labels (not blindly
     removing all five) means gh never sees a "remove a label it doesn't have"
     error, so there's no fragile stderr parsing or retry.
+
+    Pass `current_labels` (the list from a prior issue_labels() call, or None if
+    that read failed) to reuse an already-taken snapshot instead of reading
+    again — cmd_status does this so the legality decision and the write act on
+    one read, not two (removes a self-inflicted TOCTOU window).
     """
     if new_label not in STATUS_LABELS:
         raise ValueError(f"unknown status label: {new_label}")
-    current = issue_labels(issue)
+    current = issue_labels(issue) if current_labels is _UNREAD else current_labels
     if current is None:
         # couldn't read labels -> add the new one only, don't guess removals.
         # A later transition (with a working read) derives removals from real
@@ -1329,8 +1388,22 @@ def cmd_claim(r, args):
             return 1
     # We won the lock. Reflect to gh + announce. If gh fails, keep the lock
     # (the announce still tells others), but surface the error.
+    # Surface (but don't block) a backslide: claiming an issue already past the
+    # claim stage moves it back to status:claimed. This runs inside agent loops,
+    # so a hard refusal here could wedge a driver — warn and proceed. The
+    # explicit `bus status` command is where backward moves are hard-refused.
+    # This warning is advisory, so the early cross-check snapshot is fine even if
+    # slightly stale; the actual label write below still takes its own fresh read.
+    claim_current = effective_status(labels)
+    if claim_current and status_transition(claim_current, "status:claimed") == "illegal":
+        sys.stderr.write(f"note: #{args.issue} was {claim_current}; claiming moves "
+                         f"it back to status:claimed\n")
     err = None
     try:
+        # NOT current_labels=labels: `labels` was read at the top, before the
+        # lock and worktree setup. Reusing it here would widen the read->write
+        # window and could leave stale labels. Let set_status_label take its own
+        # fresh read immediately before the edit (the established claim behavior).
         set_status_label(args.issue, "status:claimed")
         gh(["issue", "comment", str(args.issue),
             "--body", f"Claimed by `{args.as_agent}` via bus at {now_iso()}."], check=False)
@@ -1370,7 +1443,35 @@ def cmd_release(r, args):
 
 
 def cmd_status(r, args):
-    set_status_label(args.issue, args.set)
+    # Legality gate (ported from agent-bussy's reviewed transition design): read
+    # the LIVE status ONCE and refuse an illegal move so a fat-finger can't send
+    # a verified issue back to open, and a duplicate re-set doesn't re-comment.
+    labels = issue_labels(args.issue)
+    if labels is None:
+        # read failed -> we can neither verify legality NOR know which old label
+        # to remove for a clean transition. --force overrides legality, not
+        # un-readability (forcing here would leave BOTH the old and new label and
+        # announce a state that effective_status doesn't agree with). Refuse and
+        # let the operator retry when gh is reachable.
+        sys.stderr.write(
+            f"could not read the current status of #{args.issue}; cannot apply "
+            f"the transition to {args.set} cleanly. Retry when gh is reachable.\n")
+        return 1
+    current = effective_status(labels)
+    verdict = status_transition(current, args.set)
+    if verdict == "noop":
+        print(f"issue #{args.issue} already {args.set} (no change)")
+        return 0
+    if verdict == "illegal" and not args.force:
+        legal = [l for l in STATUS_LABELS if status_transition(current, l) == "ok"]
+        sys.stderr.write(
+            f"refusing {current} -> {args.set} on #{args.issue}: not a legal "
+            f"transition. Legal next: {', '.join(legal) or '(none)'}. "
+            f"Use --force to override.\n")
+        return 1
+    # reuse the snapshot we already read — don't let set_status_label re-read and
+    # act on a different state than the one we just judged legal.
+    set_status_label(args.issue, args.set, current_labels=labels)
     gh(["issue", "comment", str(args.issue),
         "--body", f"Status -> `{args.set}` by `{args.as_agent}` at {now_iso()}."], check=False)
     # a status update is a sign of life -> renew the claim lock if we hold it
@@ -2097,7 +2198,13 @@ def cmd_huddle_open(r, args):
     # outage must not abort a live huddle (mirrors cmd_claim).
     err = None
     try:
-        set_status_label(issue, "status:claimed")
+        # Same acquire-path policy as cmd_claim: warn on a backslide, don't block.
+        h_labels = issue_labels(issue)
+        h_current = effective_status(h_labels)
+        if h_current and status_transition(h_current, "status:claimed") == "illegal":
+            sys.stderr.write(f"note: #{issue} was {h_current}; opening a huddle "
+                             f"moves it back to status:claimed\n")
+        set_status_label(issue, "status:claimed", current_labels=h_labels)
         gh(["issue", "comment", str(issue),
             "--body", f"Huddle opened by `{args.as_agent}` via bus at {now_iso()} "
                       f"(branch `{branch}`)."], check=False)
@@ -2838,6 +2945,8 @@ def build_parser():
     st = sub.add_parser("status", help="transition a gh issue status label")
     _as(st); _issue(st)
     st.add_argument("--set", required=True, choices=STATUS_LABELS)
+    st.add_argument("--force", action="store_true",
+                    help="override the transition-legality check (allow a backward move)")
     st.add_argument("--ttl", type=int, default=28800, help=TTL_HELP)
 
     ws = sub.add_parser("ws", help="per-agent git worktrees for isolated parallel building")
