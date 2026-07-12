@@ -360,3 +360,89 @@ def test_real_redis_pen_pass_keeps_a_join_that_lands_mid_meta_write(
         assert verify.get(bus_module.k_pen(issue)) == "agent-a"
     finally:
         _delete_issue_keys(verify, bus_module, issue)
+
+
+# ---- #94: a CAS/existence result the caller drops on the floor -----------------
+#
+# The real-server half. fakeredis can reproduce the STATE a race leaves behind, but
+# the guarantees being claimed here are Redis's own — a real Lua CAS, and a real
+# WATCH/MULTI that aborts when a watched key is touched. Both of these also FAIL
+# against the pre-fix bus, which is what makes them evidence rather than decoration.
+
+
+def test_real_redis_pen_pass_into_a_huddle_closed_mid_flight_leaves_no_pen(
+    bus_module, ns, redis_url, monkeypatch, capsys,
+):
+    """#94 item 2, on a real server.
+
+    Pre-fix, `pen pass` discarded `_set_driver`'s False and ran its blind
+    `r.set(k_pen(...))` anyway — resurrecting a pen key for a huddle that had just
+    closed (close is the only path that deletes k_pen, so nothing would ever reap
+    it) and announcing a handoff into it.
+
+    The concurrent writer deletes the huddle keys directly rather than calling
+    `cmd_huddle_close`: the Redis-side mutation is identical (close DELs exactly
+    these keys) and driving the real command would fire its gh side effects at the
+    live repo from a test.
+    """
+    issue = _issue_id()
+    r = bus_module.connect(redis_url)
+    verify = bus_module.connect(redis_url)
+    closer = bus_module.connect(redis_url)
+
+    try:
+        _seed_huddle(r, bus_module, issue, ["agent-d", "agent-a"], "agent-d")
+        r.set(bus_module.k_pen(issue), "agent-d", ex=60)
+        monkeypatch.setattr(bus_module, "cmd_pen_checkpoint", lambda _r, _args: 0)
+        state = _fire_once_on_huddle_read(
+            monkeypatch, r, bus_module, issue,
+            lambda: _delete_issue_keys(closer, bus_module, issue))
+
+        rc = bus_module.cmd_pen_pass(
+            r, ns(issue=issue, as_agent="agent-d", to="agent-a", room="integration"))
+
+        assert state["fired"], "the concurrent close never landed — race not exercised"
+        assert rc == 1                                       # aborts, and says so
+        assert verify.get(bus_module.k_huddle(issue)) is None
+        assert verify.get(bus_module.k_pen(issue)) is None   # no resurrected pen key
+        assert "changed while passing" in capsys.readouterr().err
+    finally:
+        _delete_issue_keys(verify, bus_module, issue)
+
+
+def test_real_redis_drain_clears_driver_when_release_reply_was_lost(
+    bus_module, ns, redis_url, monkeypatch,
+):
+    """#94 item 1, against a real server with real WATCH/MULTI semantics.
+
+    B3 (#83) made Redis writes retryable, so release code must survive "first
+    execution landed, reply was lost, operation ran again." The second pass sees
+    the pen already gone; it must still report success only when the matching
+    huddle session's driver is already blank.
+    """
+    issue = _issue_id()
+    r = bus_module.connect(redis_url)
+    verify = bus_module.connect(redis_url)
+
+    try:
+        _seed_huddle(r, bus_module, issue, ["agent-d", "agent-a"], "agent-d")
+        r.set(bus_module.k_pen(issue), "agent-d", ex=60)
+        monkeypatch.setattr(bus_module, "_unpushed_pen_issues", lambda *_a: [])
+        real_release = bus_module._release_pen_driver
+
+        def lost_reply_retry(client, target, agent, expected_session):
+            assert (target, agent) == (str(issue), "agent-d")
+            assert real_release(client, target, agent, expected_session)
+            return real_release(client, target, agent, expected_session)
+
+        monkeypatch.setattr(bus_module, "_release_pen_driver", lost_reply_retry)
+
+        assert bus_module.cmd_drain(
+            r, ns(as_agent="agent-d", force=False, room="integration")) == 0
+
+        assert verify.get(bus_module.k_pen(issue)) is None
+        meta = json.loads(verify.get(bus_module.k_huddle(issue)))
+        assert meta["driver"] == "", "drain left a stale driver on a pen it released"
+        assert meta["participants"] == ["agent-d", "agent-a"]  # nothing else disturbed
+    finally:
+        _delete_issue_keys(verify, bus_module, issue)
