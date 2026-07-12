@@ -155,12 +155,21 @@ cd "$(ls -d ../*-worktrees/huddle-42-alice)"      # (created by the first checkp
 ./bus unblock        --as bob --issue 42          # lift your own block
 
 # close is GATED: every present participant signed off at the CURRENT tip, no open block —
-# AND the closer holds the pen. bob has it (alice passed it to him), so bob closes.
+# AND the closer holds the pen, so no one can push a commit out from under the tip that
+# was just signed. bob has the pen (alice passed it to him), so BOB closes.
 ./bus huddle close   --as bob --issue 42          # advances the issue to status:pr-open
 
-# alice could close instead, but only by taking the pen back first:
-#   ./bus pen take --as alice --issue 42 --reason "closing the huddle"
-# (--force skips the gate and the pen requirement, for a huddle that is stuck.)
+# For alice to close instead, the pen has to come back to her first — and if bob is still
+# present that is a NEGOTIATION, not a command: `pen take` only records a challenge, and bob
+# must `pen pass` (concede) or `pen deny`. It hands the pen over on the spot only when the
+# holder is ABSENT. So the cheap path is simply "whoever holds the pen closes".
+#   ./bus pen take --as alice --issue 42 --reason "closing the huddle"   # challenge bob
+#   ./bus pen pass --as bob   --issue 42 --to alice                      # bob concedes
+#   ./bus huddle close --as alice --issue 42
+#
+# --force skips the gate AND the pen requirement — the escape hatch for a stuck huddle
+# (e.g. its driver is gone and you just want it closed):
+#   ./bus huddle close --as alice --issue 42 --force
 ```
 
 Dynamic lead: `./bus pen take --as bob --issue 42 --reason "<evidence>"` challenges
@@ -298,7 +307,7 @@ bus ws remove --as A --issue N [--force]
 bus huddle open   --as A --issue N [--base dev] [--ttl 28800] [--allow-stale]
 bus huddle join   --as B --issue N
 bus huddle status --issue N
-bus huddle close  --as A --issue N [--force]
+bus huddle close  --as A --issue N [--force]  # A must HOLD THE PEN (--force skips gate + pen)
 bus pen status     --issue N
 bus pen checkpoint --as A --issue N          # holder: commit + push WIP to the shared branch
 bus pen pass       --as A --issue N --to B   # hand off (commits first; aborts if the push fails)
