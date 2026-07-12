@@ -20,15 +20,8 @@ bus = importlib.util.module_from_spec(SPEC)
 LOADER.exec_module(bus)
 
 
-def FakeRedis():
-    """fakeredis, which runs the bus's REAL Lua (the pinned dev env has `lupa`).
-
-    This used to be a hand-rolled dict with an `eval` that ignored the script text and
-    dispatched on ARITY, so a one-key script was executed as a compare-and-DELETE
-    whatever it actually said. Every CAS test in this file therefore asserted the
-    double's behaviour, not the bus's: corrupting CAS_DELETE_LUA or CAS_SET_META_LUA
-    left the suite green (#116).
-    """
+def _fake_redis():
+    """A double that runs the bus's REAL Lua -- the pinned dev env has `lupa` (#116)."""
     return fakeredis.FakeRedis(decode_responses=True)
 
 
@@ -58,7 +51,7 @@ class HuddleLockTest(unittest.TestCase):
         )
 
     def test_compare_set_huddle_meta_requires_exact_session_holder(self):
-        r = FakeRedis()
+        r = _fake_redis()
         lock = bus.k_lock(27)
         meta = bus.k_huddle(27)
         r.set(lock, "huddle:issue-27:old")
@@ -119,7 +112,7 @@ class HuddleLockTest(unittest.TestCase):
         )
 
     def test_cleanup_lost_huddle_branch_leaves_active_session_branch(self):
-        r = FakeRedis()
+        r = _fake_redis()
         r.set(bus.k_lock(27), "huddle:issue-27:new-owner")
 
         with mock.patch.object(bus, "cleanup_shared_branch") as cleanup:
@@ -132,7 +125,7 @@ class HuddleLockTest(unittest.TestCase):
         cleanup.assert_not_called()
 
     def test_cleanup_lost_huddle_branch_leaves_metadata_owned_branch(self):
-        r = FakeRedis()
+        r = _fake_redis()
         r.set(bus.k_huddle(27), json.dumps({"issue": 27}))
 
         with mock.patch.object(bus, "cleanup_shared_branch") as cleanup:
@@ -145,7 +138,7 @@ class HuddleLockTest(unittest.TestCase):
         cleanup.assert_not_called()
 
     def test_open_lost_lock_after_branch_creation_aborts_without_deleting_new_session(self):
-        r = FakeRedis()
+        r = _fake_redis()
 
         def create_branch(_main, _base, _branch, allow_stale=False):
             r.set(bus.k_lock(27), "huddle:issue-27:new-owner")
@@ -178,7 +171,7 @@ class HuddleLockTest(unittest.TestCase):
         self.assertIn("left remote branch", stderr.getvalue())
 
     def test_open_lost_lock_after_branch_creation_cleans_orphan_branch(self):
-        r = FakeRedis()
+        r = _fake_redis()
         cleanup_calls = []
 
         def create_branch(_main, _base, _branch, allow_stale=False):
@@ -215,7 +208,7 @@ class HuddleLockTest(unittest.TestCase):
         self.assertIn("deleted remote branch", stderr.getvalue())
 
     def test_successful_open_records_exact_holder_in_metadata(self):
-        r = FakeRedis()
+        r = _fake_redis()
         args = types.SimpleNamespace(
             issue=27,
             as_agent="agent-a",
