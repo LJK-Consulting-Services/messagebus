@@ -2343,10 +2343,25 @@ def cmd_huddle_close(r, args):
 
     The shared git tip (`_shared_tip`, read by the gate) is not a Redis key, so no
     WATCH can freeze it. It is covered instead by the PEN INVARIANT (#95): the closer
-    must ALREADY hold the pen. `cmd_pen_checkpoint` and `cmd_huddle_recover` are the
-    only two commands that push the shared branch, and both are `_require_pen`-gated,
-    so while the closer holds the pen NO other agent can move the tip. A push landing
-    in the gate->EXEC window is not detected — it is made unreachable.
+    must ALREADY hold the pen. Every command that can push the shared branch is
+    `_require_pen`-gated, so while the closer holds the pen NO other agent can move the
+    tip. A push landing in the gate->EXEC window is not detected — it is made
+    unreachable.
+
+    That claim has to be checked by TRANSITIVE CLOSURE, not by grepping `_leased_push`
+    — a direct-call audit gets it wrong. Four commands reach a push:
+      * `cmd_pen_checkpoint`, `cmd_huddle_recover` — push directly. Both `_require_pen`.
+      * `cmd_pen_pass` — pushes THROUGH `cmd_pen_checkpoint` (it checkpoints before
+        handing over, so committed work is never stranded off the branch). A grep for
+        the push helpers does not show it. It is `_require_pen`-gated too.
+      * `cmd_huddle_open` — pushes via `create_shared_branch`, and is NOT pen-gated.
+        It cannot move a LIVE huddle's tip: it refuses outright when the issue already
+        has a huddle or a held lock, and `create_shared_branch` pushes with an
+        empty-expect `--force-with-lease=refs/heads/<branch>:`, which REQUIRES the ref
+        to be absent. It can only bring a branch into existence, never advance one.
+    The remaining push site, `cleanup_shared_branch`, runs only via
+    `cleanup_lost_huddle_branch`, which refuses while the lock or the metadata survives.
+    So on a live huddle every reachable push is pen-gated.
 
     The invariant is a PRECONDITION, never a side effect: the close VERIFIES the pen
     and never acquires it, so a refused close (open block, unsigned participant) moves

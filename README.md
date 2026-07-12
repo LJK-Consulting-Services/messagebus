@@ -130,7 +130,9 @@ is **fail-closed** (rolls the claim back if the worktree can't be created). Conf
 A **huddle** lets several agents author *one* shared branch together. A single
 **write-pen** (a Redis mutex) means only its holder commits at any moment; the
 pen changes hands, so the code has many authors but never two writers at once.
-A **done-gate** requires everyone to sign off at the final commit before close.
+A **done-gate** requires everyone to sign off at the final commit before close —
+and the closer must **hold the pen**, so nobody can push a commit out from under
+the very tip everyone just signed.
 
 ```bash
 # alice opens a huddle on issue 42 and holds the pen
@@ -148,19 +150,25 @@ cd "$(ls -d ../*-worktrees/huddle-42-alice)"      # (created by the first checkp
 # bob's worktree fast-forwards to alice's work; he builds on it, then signs off
 ./bus pen checkpoint --as bob --issue 42          # ff to alice's tip; edit; checkpoint
 ./bus signoff        --as bob --issue 42          # (this push makes alice's signoff stale — she re-signs)
+./bus signoff        --as alice --issue 42        # alice re-signs, at bob's tip
 ./bus signoff        --as bob --issue 42 --block "the error path is untested"   # or hard-block instead
 ./bus unblock        --as bob --issue 42          # lift your own block
 
-# close is GATED: every present participant must have signed off at the CURRENT tip, no open block
-./bus huddle close   --as alice --issue 42        # advances the issue to status:pr-open
+# close is GATED: every present participant signed off at the CURRENT tip, no open block —
+# AND the closer holds the pen. bob has it (alice passed it to him), so bob closes.
+./bus huddle close   --as bob --issue 42          # advances the issue to status:pr-open
+
+# alice could close instead, but only by taking the pen back first:
+#   ./bus pen take --as alice --issue 42 --reason "closing the huddle"
+# (--force skips the gate and the pen requirement, for a huddle that is stuck.)
 ```
 
 Dynamic lead: `./bus pen take --as bob --issue 42 --reason "<evidence>"` challenges
-for the pen. It force-takes only from an **absent** driver (and only after a grace
-window); a *present* driver keeps the pen until it `pen pass`es (concede) or
-`pen deny`s. Pen/huddle ops refresh presence, so an actively-driving agent is
-never force-taken. Any new push dismisses stale sign-offs, so a huddle can't be
-closed over code nobody re-approved.
+for the pen. It takes **immediately** from an **absent** driver — a vanished driver
+never blocks progress. A *present* driver keeps the pen until it `pen pass`es
+(concede) or `pen deny`s. Pen/huddle ops refresh presence, so an actively-driving
+agent is never force-taken. Any new push dismisses stale sign-offs, so a huddle
+can't be closed over code nobody re-approved.
 
 ### 5. Orchestrating from a Claude Code session (the coordinator)
 
