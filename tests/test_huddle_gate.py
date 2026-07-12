@@ -298,7 +298,7 @@ class HuddleGateTest(unittest.TestCase):
 
 
 @unittest.skipIf(fakeredis is None, "fakeredis not installed")
-class MutateJsonTest(unittest.TestCase):
+class MutateHuddleJsonTest(unittest.TestCase):
     """The WATCH/MULTI compare-and-set that guards block/sign-off lists.
 
     Every write is bound to a huddle session (#115), so each case seeds a live
