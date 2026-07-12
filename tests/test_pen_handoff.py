@@ -1,4 +1,6 @@
 import json
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 
@@ -212,3 +214,95 @@ def test_pen_pass_success_checkpoints_then_moves_pen_and_clears_challenge(
     assert fake_redis.get(bus_module.k_penchal(79)) is None
     assert "passed the pen" in capsys.readouterr().out
     assert fake_redis.xlen(bus_module.k_stream("main")) == 1
+
+
+# ---- #94: `pen pass` / `pen take` must ACT on _set_driver's False --------------
+#
+# `_set_driver` returns False when the huddle metadata key is gone. All three write
+# paths used to discard that: they wrote the pen key and announced a handoff anyway.
+# Because `huddle close` is the only thing that deletes k_pen, the blind `r.set`
+# then RESURRECTED a pen key that nothing would ever clean up, attached to a huddle
+# that no longer existed. The fix writes the driver FIRST and aborts on False, so a
+# huddle closed under us leaves nothing behind.
+
+
+def test_pen_pass_into_a_huddle_closed_mid_flight_writes_nothing(
+    bus_module, fake_redis, ns, monkeypatch, capsys
+):
+    """The close lands during `pen checkpoint` — a real window: that step does a git
+    commit and push, so it is the longest gap in the whole command."""
+    fake_redis.set(bus_module.k_huddle(79), json.dumps(huddle_meta(bus_module)))
+    fake_redis.set(bus_module.k_pen(79), "alice")
+    fake_redis.set(bus_module.k_penchal(79), json.dumps({"challenger": "bob"}))
+
+    def checkpoint_then_close(_r, _args):
+        fake_redis.delete(bus_module.k_huddle(79))
+        return 0
+
+    monkeypatch.setattr(bus_module, "cmd_pen_checkpoint", checkpoint_then_close)
+
+    rc = bus_module.cmd_pen_pass(fake_redis, ns(as_agent="alice", issue=79, to="bob"))
+
+    assert rc == 1
+    assert fake_redis.get(bus_module.k_pen(79)) == "alice"   # NOT handed to bob
+    assert fake_redis.get(bus_module.k_huddle(79)) is None   # and not resurrected
+    assert json.loads(fake_redis.get(bus_module.k_penchal(79))) == {"challenger": "bob"}
+    assert "is gone" in capsys.readouterr().err
+    assert fake_redis.xlen(bus_module.k_stream("main")) == 0  # no handoff announced
+
+
+def test_pen_take_unheld_into_a_huddle_closed_mid_flight_creates_no_pen_key(
+    bus_module, fake_redis, ns, monkeypatch, capsys
+):
+    """The unheld-pen path is the one that CREATES a pen key from nothing, so it is
+    the one that can strand a pen on a closed huddle."""
+    fake_redis.set(bus_module.k_huddle(79), json.dumps(huddle_meta(bus_module, driver="")))
+    real_get = fake_redis.get
+    fired = {"done": False}
+
+    def close_when_the_pen_is_read(key, *a, **kw):
+        value = real_get(key, *a, **kw)
+        if key == bus_module.k_pen(79) and not fired["done"]:
+            fired["done"] = True
+            fake_redis.delete(bus_module.k_huddle(79))
+        return value
+
+    monkeypatch.setattr(fake_redis, "get", close_when_the_pen_is_read)
+
+    rc = bus_module.cmd_pen_take(
+        fake_redis, ns(as_agent="bob", issue=79, reason="driver left"))
+
+    assert fired["done"], "the close never landed — the race was not exercised"
+    assert rc == 1
+    assert fake_redis.get(bus_module.k_pen(79)) is None   # no pen for a dead huddle
+    assert fake_redis.get(bus_module.k_huddle(79)) is None
+    assert "is gone" in capsys.readouterr().err
+    assert fake_redis.xlen(bus_module.k_stream("main")) == 0
+
+
+def test_pen_take_force_into_a_huddle_closed_mid_flight_writes_nothing(
+    bus_module, fake_redis, ns, monkeypatch, capsys
+):
+    """Same for the force-take path (absent driver, challenge past the grace window)."""
+    challenge = {"challenger": "bob", "reason": "stale",
+                 "ts": (datetime.now(timezone.utc)
+                        - timedelta(seconds=bus_module.PEN_TAKE_GRACE + 5)).isoformat()}
+    fake_redis.set(bus_module.k_huddle(79), json.dumps(huddle_meta(bus_module)))
+    fake_redis.set(bus_module.k_pen(79), "alice")
+    fake_redis.set(bus_module.k_penchal(79), json.dumps(challenge))
+
+    def absent_and_close(_r, holder):
+        assert holder == "alice"
+        fake_redis.delete(bus_module.k_huddle(79))
+        return False   # alice is absent, so the force-take proceeds
+
+    monkeypatch.setattr(bus_module, "_holder_present", absent_and_close)
+
+    rc = bus_module.cmd_pen_take(fake_redis, ns(as_agent="bob", issue=79, reason="stale"))
+
+    assert rc == 1
+    assert fake_redis.get(bus_module.k_pen(79)) == "alice"   # not stolen into a void
+    assert fake_redis.get(bus_module.k_huddle(79)) is None
+    assert json.loads(fake_redis.get(bus_module.k_penchal(79))) == challenge
+    assert "is gone" in capsys.readouterr().err
+    assert fake_redis.xlen(bus_module.k_stream("main")) == 0
