@@ -52,6 +52,73 @@ def test_donegate_requires_closer_floor_and_present_participant_current_tip(
     assert bus_module.donegate(fake_redis, 79, meta, "alice") == (True, [])
 
 
+def scan_spy(fake_redis, monkeypatch):
+    """Record the `match` pattern of every scan_iter the gate issues."""
+    patterns = []
+    inner = fake_redis.scan_iter
+
+    def spy(match=None, **kwargs):
+        patterns.append(match)
+        return inner(match=match, **kwargs)
+
+    monkeypatch.setattr(fake_redis, "scan_iter", spy)
+    return patterns
+
+
+def test_donegate_takes_one_presence_snapshot_not_a_scan_per_participant(
+    bus_module, fake_redis, monkeypatch
+):
+    """#96: the gate scans the keyspace once, however many participants it has.
+
+    Pre-fix this issued one `bus:presence:*:<agent>` scan per unsigned non-closer
+    participant (2 here) — asserting the pattern list fails against the old shape.
+    """
+    meta = huddle_meta(bus_module)  # alice (closer), bob, carol
+    fake_redis.set(bus_module.k_presence("other-room", "bob"), "now")
+    fake_redis.set(bus_module.k_signoff(79), json.dumps({"alice": TIP}))
+    monkeypatch.setattr(bus_module, "_shared_tip", lambda _issue: TIP)
+    patterns = scan_spy(fake_redis, monkeypatch)
+
+    ok, reasons = bus_module.donegate(fake_redis, 79, meta, "alice")
+
+    assert patterns == ["bus:presence:*"]
+    # ...and the snapshot preserves idle≠dead: present-and-unsigned bob freezes the
+    # gate, absent carol does not.
+    assert not ok
+    assert any("bob has not signed off" in reason for reason in reasons)
+    assert not any("carol has not signed off" in reason for reason in reasons)
+
+
+def test_donegate_does_not_scan_when_every_participant_has_already_signed(
+    bus_module, fake_redis, monkeypatch
+):
+    """Presence can only EXCUSE an unsigned participant, so a gate with nobody
+    unsigned needs no snapshot at all — the passing path scans zero times."""
+    meta = huddle_meta(bus_module)  # alice (closer), bob, carol
+    fake_redis.set(bus_module.k_presence("other-room", "bob"), "now")
+    fake_redis.set(
+        bus_module.k_signoff(79), json.dumps({"alice": TIP, "bob": TIP, "carol": TIP})
+    )
+    monkeypatch.setattr(bus_module, "_shared_tip", lambda _issue: TIP)
+    patterns = scan_spy(fake_redis, monkeypatch)
+
+    assert bus_module.donegate(fake_redis, 79, meta, "alice") == (True, [])
+    assert patterns == []
+
+
+def test_donegate_skips_the_presence_scan_when_the_closer_is_the_only_participant(
+    bus_module, fake_redis, monkeypatch
+):
+    """A solo huddle has nobody else to check — so it must not scan at all."""
+    meta = huddle_meta(bus_module) | {"participants": ["alice"]}
+    fake_redis.set(bus_module.k_signoff(79), json.dumps({"alice": TIP}))
+    monkeypatch.setattr(bus_module, "_shared_tip", lambda _issue: TIP)
+    patterns = scan_spy(fake_redis, monkeypatch)
+
+    assert bus_module.donegate(fake_redis, 79, meta, "alice") == (True, [])
+    assert patterns == []
+
+
 def test_huddle_close_open_block_keeps_critical_state_and_skips_status_update(
     bus_module, fake_redis, ns, monkeypatch
 ):

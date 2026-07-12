@@ -80,6 +80,12 @@ def k_penchal(issue): return f"bus:penchal:issue:{issue}"
 def k_signoff(issue): return f"bus:signoff:issue:{issue}"
 def k_block(issue):   return f"bus:block:issue:{issue}"
 
+# SCAN batch-size hint. Redis walks the whole keyspace either way; COUNT only sets
+# how much it does per round-trip, so the default of 10 costs ~keyspace/10 round
+# trips. It is a hint, never a filter or a limit — the cursor still returns every
+# matching key.
+_SCAN_COUNT = 1000
+
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -952,6 +958,16 @@ def _holder_present(r, holder):
     """True if `holder` has a presence key in ANY room (locks are global, an
     agent may be live in a different room than the one reap was invoked for)."""
     return bool(holder) and any(True for _ in r.scan_iter(match=f"bus:presence:*:{holder}"))
+
+
+def _present_set(r):
+    """Snapshot of every agent id holding a presence key in ANY room — the
+    all-agents form of `_holder_present`, for callers that would otherwise scan
+    the keyspace once per agent. Rooms and agent ids are ident()-validated to
+    exclude ':', so the last segment of bus:presence:<room>:<agent> is exactly the
+    agent. COUNT is a batch-size hint only; it does not filter."""
+    return {key.rsplit(":", 1)[-1]
+            for key in r.scan_iter(match="bus:presence:*", count=_SCAN_COUNT)}
 
 
 def stale_lock_info(r, issue, present_set=None):
@@ -2869,9 +2885,15 @@ def donegate(r, issue, meta, closer):
     if signs.get(closer) != tip:
         reasons.append(f"the closing agent {closer} must sign off at the current tip "
                        f"{tip[:8]} (a huddle can't close with no sign-off)")
-    for p in meta["participants"]:
-        if p != closer and _holder_present(r, p) and signs.get(p) != tip:
-            reasons.append(f"{p} has not signed off at the current tip {tip[:8]}")
+    # Presence only ever excuses a participant who HASN'T signed at the tip, so the
+    # gate needs at most one snapshot, and none at all when everyone already has
+    # (#96 — this was a keyspace scan per participant).
+    unsigned = [p for p in meta["participants"]
+                if p != closer and signs.get(p) != tip]
+    if unsigned:
+        present = _present_set(r)
+        reasons.extend(f"{p} has not signed off at the current tip {tip[:8]}"
+                       for p in unsigned if p in present)
     return (len(reasons) == 0), reasons
 
 
