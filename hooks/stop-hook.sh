@@ -78,6 +78,9 @@ bus_should_stop "$AGENT" && allow_stop
 
 turns=$(bus_uint_file "$COUNT_FILE")
 if (( turns >= MAX_TURNS )); then
+  if [[ -f "$ACTIVE_FILE" && ! -f "$DONE_MARKER" ]]; then
+    block_continue_or_stop "self-continue" "$(bus_continue_prompt "$DONE_MARKER")"
+  fi
   echo "bus stop-hook: hit BUS_MAX_TURNS=$MAX_TURNS for $AGENT, allowing stop" >&2
   allow_stop
 fi
