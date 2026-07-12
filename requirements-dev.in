@@ -1,5 +1,7 @@
 -r requirements.txt
-fakeredis==2.34.1
+# fakeredis has no EVAL at all unless lupa is installed; [lua] pulls it in.
+# Guarded by tests/test_fakeredis_lua.py -- drop the extra and that test goes red.
+fakeredis[lua]==2.34.1
 pytest==9.0.3
 pytest-cov==7.1.0
 ruff==0.15.21
