@@ -323,11 +323,20 @@ RC_SHUTDOWN = 11   # a delivered message was the shutdown sentinel
 RC_REDIS_DOWN = 3  # Redis unreachable (at startup, or a restart we couldn't ride out)
 
 
+# Version of the on-stream MESSAGE envelope (write side = make_fields, read side
+# = fields_to_msg). Bump ONLY on a breaking envelope change; readers tolerate a
+# missing field (legacy messages predate the stamp) by defaulting to 0. Distinct
+# from EVENT_SCHEMA_VERSION (#81), which versions the kind='event' body — the two
+# compose. See CHANGELOG.md.
+MESSAGE_SCHEMA_VERSION = 1
+
+
 def make_fields(frm, to, body, kind="msg", topic="", reply_to=""):
     """The single source of truth for the on-stream message schema (write side,
     mirror of fields_to_msg on the read side)."""
     return {"from": frm, "to": to, "topic": topic,
-            "reply_to": reply_to, "kind": kind, "body": body}
+            "reply_to": reply_to, "kind": kind, "body": body,
+            "schema_version": MESSAGE_SCHEMA_VERSION}
 
 
 # ---- structured observability (B6, #81) ------------------------------------
@@ -464,6 +473,8 @@ def fields_to_msg(msg_id, fields):
         "reply_to": fields.get("reply_to", ""),
         "kind": fields.get("kind", "msg"),
         "body": fields.get("body", ""),
+        # Legacy messages predate the stamp → treat a missing field as version 0.
+        "schema_version": int(fields.get("schema_version", 0)),
     }
 
 
