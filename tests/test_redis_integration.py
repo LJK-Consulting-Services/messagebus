@@ -536,9 +536,8 @@ def test_real_redis_close_with_a_reaped_lock_clears_state_but_not_the_label(
     #92 moved the lock release from a client-side `compare_delete_lock` into the
     gated transaction as a queued EVAL. The hit path is covered above; this is the
     branch where a Lua CAS and a naive DEL actually differ, so it is the one worth
-    proving against a real server. fakeredis cannot: it only speaks EVAL with `lupa`
-    installed, and the mirror in conftest resolves the compare in Python rather than
-    in the script.
+    proving against a real server. The unit fake now runs real Lua too, but it still
+    cannot prove Redis's cross-client transaction semantics.
 
     Contract when the lock is NOT ours (it expired, or was reaped and re-acquired):
     the CAS must return 0 and leave the OTHER holder's lock alone, the huddle state

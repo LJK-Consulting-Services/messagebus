@@ -3,64 +3,23 @@ import importlib.util
 import io
 import json
 import pathlib
-import sys
 import types
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
+import fakeredis
+
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-sys.modules.setdefault("redis", types.SimpleNamespace(WatchError=Exception))
 LOADER = importlib.machinery.SourceFileLoader("bus_mod", str(ROOT / "bus"))
 SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
 bus = importlib.util.module_from_spec(SPEC)
 LOADER.exec_module(bus)
 
 
-class FakeRedis:
-    def __init__(self):
-        self.data = {}
-
-    def get(self, key):
-        return self.data.get(key)
-
-    def set(self, key, value, nx=False, ex=None):
-        if nx and key in self.data:
-            return False
-        self.data[key] = value
-        return True
-
-    def delete(self, key):
-        return self.data.pop(key, None) is not None
-
-    def eval(self, _script, numkeys, *args):
-        keys = args[:numkeys]
-        argv = args[numkeys:]
-        if numkeys == 1:
-            key = keys[0]
-            holder = argv[0]
-            if self.data.get(key) == holder:
-                self.delete(key)
-                return 1
-            return 0
-        if numkeys == 2:
-            lock_key, meta_key = keys
-            holder, meta_json = argv
-            if self.data.get(lock_key) == holder:
-                self.data[meta_key] = meta_json
-                return 1
-            return 0
-        if numkeys == 4:
-            lock_key, meta_key, pen_key, chal_key = keys
-            holder, meta_json, pen_holder = argv
-            if self.data.get(lock_key) == holder:
-                self.data[meta_key] = meta_json
-                self.data[pen_key] = pen_holder
-                self.delete(chal_key)
-                return 1
-            return 0
-        raise AssertionError(f"unexpected eval key count {numkeys}")
+def fake_redis():
+    return fakeredis.FakeRedis(decode_responses=True)
 
 
 class HuddleLockTest(unittest.TestCase):
@@ -89,7 +48,7 @@ class HuddleLockTest(unittest.TestCase):
         )
 
     def test_compare_set_huddle_meta_requires_exact_session_holder(self):
-        r = FakeRedis()
+        r = fake_redis()
         lock = bus.k_lock(27)
         meta = bus.k_huddle(27)
         r.set(lock, "huddle:issue-27:old")
@@ -150,7 +109,7 @@ class HuddleLockTest(unittest.TestCase):
         )
 
     def test_cleanup_lost_huddle_branch_leaves_active_session_branch(self):
-        r = FakeRedis()
+        r = fake_redis()
         r.set(bus.k_lock(27), "huddle:issue-27:new-owner")
 
         with mock.patch.object(bus, "cleanup_shared_branch") as cleanup:
@@ -163,7 +122,7 @@ class HuddleLockTest(unittest.TestCase):
         cleanup.assert_not_called()
 
     def test_cleanup_lost_huddle_branch_leaves_metadata_owned_branch(self):
-        r = FakeRedis()
+        r = fake_redis()
         r.set(bus.k_huddle(27), json.dumps({"issue": 27}))
 
         with mock.patch.object(bus, "cleanup_shared_branch") as cleanup:
@@ -176,7 +135,7 @@ class HuddleLockTest(unittest.TestCase):
         cleanup.assert_not_called()
 
     def test_open_lost_lock_after_branch_creation_aborts_without_deleting_new_session(self):
-        r = FakeRedis()
+        r = fake_redis()
 
         def create_branch(_main, _base, _branch, allow_stale=False):
             r.set(bus.k_lock(27), "huddle:issue-27:new-owner")
@@ -209,7 +168,7 @@ class HuddleLockTest(unittest.TestCase):
         self.assertIn("left remote branch", stderr.getvalue())
 
     def test_open_lost_lock_after_branch_creation_cleans_orphan_branch(self):
-        r = FakeRedis()
+        r = fake_redis()
         cleanup_calls = []
 
         def create_branch(_main, _base, _branch, allow_stale=False):
@@ -246,7 +205,7 @@ class HuddleLockTest(unittest.TestCase):
         self.assertIn("deleted remote branch", stderr.getvalue())
 
     def test_successful_open_records_exact_holder_in_metadata(self):
-        r = FakeRedis()
+        r = fake_redis()
         args = types.SimpleNamespace(
             issue=27,
             as_agent="agent-a",

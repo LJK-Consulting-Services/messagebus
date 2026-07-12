@@ -13,7 +13,7 @@ Only the two genuine external boundaries are mocked: the git shared-branch tip
 keeps the gate logic under test while letting us control the "current tip" so the
 anti-gaming staleness property can be checked deterministically.
 
-Run:  python -m unittest discover -s tests   (needs redis-py + fakeredis)
+Run:  python -m unittest discover -s tests   (needs redis-py + fakeredis[lua])
 """
 import contextlib
 import importlib.machinery
@@ -29,18 +29,6 @@ try:
     import fakeredis
 except ImportError:  # pragma: no cover - suite skips cleanly without the dep
     fakeredis = None
-
-if fakeredis is not None:
-    # The shared double, which mirrors the bus's Lua CAS scripts in Python — on the
-    # client AND on the pipeline. fakeredis only speaks EVAL when `lupa` is installed,
-    # which CI does not install, so a raw FakeStrictRedis dies on the compare-and-delete
-    # that `huddle close` now queues inside its MULTI (#92).
-    #
-    # Imported OUTSIDE the try above on purpose: folding it in would turn a broken
-    # conftest into a silent "fakeredis not installed" skip of this whole suite, which is
-    # the same shape of machine-dependent false green that let this file ship without
-    # ever seeding k_lock.
-    from conftest import BusFakeRedis
 
 _BUS_PATH = os.path.join(os.path.dirname(__file__), os.pardir, "bus")
 
@@ -76,7 +64,7 @@ class HuddleGateTest(unittest.TestCase):
     SESSION = "huddle:issue-42:deadbeef"
 
     def setUp(self):
-        self.r = BusFakeRedis(decode_responses=True)
+        self.r = fakeredis.FakeRedis(decode_responses=True)
         # A huddle with three participants; alice is opener/driver + pen holder.
         # (Written directly rather than via cmd_huddle_open, which would shell out
         # to git to create the shared branch — not what these tests exercise.)
