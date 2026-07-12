@@ -12,7 +12,8 @@ lines and has already caused three separate agents to cite the wrong line.
 
 ## 1. The wildcard presence reads must be scoped all-or-nothing
 
-`scan_iter` sites on `origin/dev` that read presence keys:
+`scan_iter` sites on `origin/dev` whose presence read is cross-room or bare and
+needs a scoping decision:
 
 | line | caller | glob | room-scoped? |
 |------|--------|------|--------------|
@@ -22,7 +23,8 @@ lines and has already caused three separate agents to cite the wrong line.
 | 1206 | `cmd_board`   | `bus:presence:*` | **bare** |
 | 1700 | `cmd_ws_list` | `bus:presence:*` | **bare** |
 
-#96 adds a sixth: `_present_set`, which copies the **bare** form.
+#96 adds another cross-room/all-agent presence snapshot: `_present_set`, which
+copies the **bare** form.
 
 Two of these — `_holder_present` (954) and `cmd_drain` (1162) — read across rooms
 **deliberately**, and say so in the source. Scoping them blind BREAKS them: `cmd_drain`
@@ -121,5 +123,5 @@ Pure batching hint, no semantic change. Verified against fakeredis + real Redis 
 ---
 
 **Sizing:** low priority — sub-millisecond on current keyspaces, and the malformed-key path
-is fail-closed and CLI-unreachable. The durable win is consolidation: six presence reads,
-one decision each, landed together.
+is fail-closed and CLI-unreachable. The durable win is consolidation: seven presence reads
+total, six of which need the cross-room/all-agent scoping decision, landed together.
