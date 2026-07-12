@@ -1839,10 +1839,24 @@ def _huddle_meta(r, issue):
 
 _NO_HUDDLE_SESSION = object()
 
+# "whatever challenge is there, it is moot." A challenge binds to the CURRENT holder
+# (`_record_pen_challenge` only records against a non-null `expected_driver`, and
+# `pen deny` refuses to act on one that names anyone else), so exactly two acts moot
+# it — for two different reasons, and a caller must match one of them to use this:
+#   - `pen pass`: the agent conceding IS the challenged driver, so any challenge in
+#     flight necessarily names them, and conceding is the protocol's own resolution.
+#   - taking an UNHELD pen: no live challenge can exist against a pen nobody holds, so
+#     anything still there names a driver who is gone.
+# A caller moving the pen off a PRESENT holder is a BYSTANDER to that holder's
+# challenge and must CAS on it (`cmd_pen_take` passes `raw`). Spelled as a sentinel
+# rather than a default so that caller cannot drop the CAS by omission: the MULTI
+# DELETEs the challenge key unconditionally, so a caller with no `challenge_expect`
+# destroys a rival challenge it never read.
+_ANY_CHALLENGE = object()
 
-def _set_driver(r, issue, driver, *, pen_to, pen_expect,
-                clear_challenge=False, expected_session=None,
-                driver_must_be_participant=False, challenge_expect=None):
+
+def _set_driver(r, issue, driver, *, pen_to, pen_expect, expected_session,
+                challenge_expect):
     """Move the pen and rewrite the huddle's `driver`, in one transaction.
 
     The metadata is one JSON blob, so a read-modify-SET of it is a lost-update
@@ -1876,27 +1890,24 @@ def _set_driver(r, issue, driver, *, pen_to, pen_expect,
     """
     key = k_huddle(issue)
     pen_key = k_pen(issue)
-    chal_key = k_penchal(issue) if clear_challenge else None
+    chal_key = k_penchal(issue)
     with r.pipeline() as pipe:
         while True:
             try:
-                watch_keys = [key, pen_key]
-                if chal_key:
-                    watch_keys.append(chal_key)
-                pipe.watch(*watch_keys)
+                pipe.watch(key, pen_key, chal_key)
                 raw = pipe.get(key)
                 if not raw:
                     pipe.unwatch()
                     return False
                 meta = json.loads(raw)
-                if expected_session is not None and huddle_meta_holder(meta, issue) != expected_session:
+                if huddle_meta_holder(meta, issue) != expected_session:
                     pipe.unwatch()
                     return False
-                if driver_must_be_participant and driver not in meta.get("participants", []):
+                if driver not in meta.get("participants", []):
                     pipe.unwatch()
                     return False
                 current_pen = pipe.get(pen_key)
-                current_chal = pipe.get(chal_key) if chal_key else None
+                current_chal = pipe.get(chal_key)
                 # The move we were asked to make is ALREADY in place. Redis can lose
                 # an EXEC reply, so a retry of a transaction that landed must report
                 # success, not a phantom conflict — the mismatch below is then our own
@@ -1904,7 +1915,7 @@ def _set_driver(r, issue, driver, *, pen_to, pen_expect,
                 already_done = (current_pen == pen_to
                                 and meta.get("driver") == driver
                                 and current_chal is None)
-                if challenge_expect is not None and current_chal != challenge_expect:
+                if challenge_expect is not _ANY_CHALLENGE and current_chal != challenge_expect:
                     pipe.unwatch()
                     return already_done
                 if current_pen != pen_expect:
@@ -1914,8 +1925,7 @@ def _set_driver(r, issue, driver, *, pen_to, pen_expect,
                 pipe.multi()
                 pipe.set(pen_key, pen_to)
                 pipe.set(key, json.dumps(meta))
-                if chal_key:
-                    pipe.delete(chal_key)
+                pipe.delete(chal_key)
                 pipe.execute()
                 return True
             except redis.WatchError:
@@ -2653,8 +2663,7 @@ def cmd_pen_pass(r, args):
                          f"{args.as_agent}. Fix the push, then retry the pass.\n")
         return 1
     if not _set_driver(r, issue, args.to, pen_to=args.to, pen_expect=args.as_agent,
-                       clear_challenge=True, expected_session=session,
-                       driver_must_be_participant=True):
+                       expected_session=session, challenge_expect=_ANY_CHALLENGE):
         sys.stderr.write(f"bus pen pass: huddle or pen changed while passing #{issue}; "
                          "not moving the pen\n")
         return 1
@@ -2674,9 +2683,8 @@ def _take_unheld_pen(r, args, issue, session):
     cleared with it — it named a holder who no longer exists.
     """
     if not _set_driver(r, issue, args.as_agent, pen_to=args.as_agent,
-                       pen_expect=None, clear_challenge=True,
-                       expected_session=session,
-                       driver_must_be_participant=True):
+                       pen_expect=None, expected_session=session,
+                       challenge_expect=_ANY_CHALLENGE):
         sys.stderr.write(f"bus pen take: huddle or pen changed while taking #{issue}; "
                          "not moving the pen\n")
         return 1
@@ -2726,9 +2734,7 @@ def cmd_pen_take(r, args):
     # this drops the brief-heartbeat-lapse grace in favour of immediate progress.
     if driver_absent:
         if not _set_driver(r, issue, args.as_agent, pen_to=args.as_agent,
-                           pen_expect=driver, clear_challenge=True,
-                           expected_session=session,
-                           driver_must_be_participant=True,
+                           pen_expect=driver, expected_session=session,
                            challenge_expect=raw):
             # #106: `pen_expect=driver` can miss because the very drain we are
             # racing has ALREADY released the pen — there is no holder at all now.
