@@ -2464,6 +2464,28 @@ def cmd_pen_pass(r, args):
     return 0
 
 
+def _take_unheld_pen(r, args, issue, session):
+    """Take a pen nobody holds, and report. Returns an exit code.
+
+    An unheld pen has no incumbent to protect, so there is nothing for the
+    challenge protocol to mediate: it is simply free. Still CAS-guarded
+    (`pen_expect=None`), so a peer who grabs it first aborts this take instead of
+    being overwritten. Any challenge lingering against the vanished driver is
+    cleared with it — it named a holder who no longer exists.
+    """
+    if not _set_driver(r, issue, args.as_agent, pen_to=args.as_agent,
+                       pen_expect=None, clear_challenge=True,
+                       expected_session=session,
+                       driver_must_be_participant=True):
+        sys.stderr.write(f"bus pen take: huddle or pen changed while taking #{issue}; "
+                         "not moving the pen\n")
+        return 1
+    announce(r, args.room, args.as_agent,
+             f"took the unheld pen on #{issue}", topic=f"issue-{issue}")
+    print(f"{args.as_agent} took the unheld pen on #{issue}")
+    return 0
+
+
 def cmd_pen_take(r, args):
     """Challenge for the pen (dynamic lead). `--reason` is required evidence.
     If the current driver is ABSENT (no presence anywhere), take it over now at
@@ -2491,17 +2513,7 @@ def cmd_pen_take(r, args):
         # protect: an unheld pen is simply free. Without this, an unheld pen still
         # costs a challenger the full PEN_TAKE_GRACE and the huddle can't make a
         # single write until it expires.
-        if not _set_driver(r, issue, args.as_agent, pen_to=args.as_agent,
-                           pen_expect=None, clear_challenge=True,
-                           expected_session=session,
-                           driver_must_be_participant=True):
-            sys.stderr.write(f"bus pen take: huddle or pen changed while taking #{issue}; "
-                             "not moving the pen\n")
-            return 1
-        announce(r, args.room, args.as_agent,
-                 f"took the unheld pen on #{issue}", topic=f"issue-{issue}")
-        print(f"{args.as_agent} took the unheld pen on #{issue}")
-        return 0
+        return _take_unheld_pen(r, args, issue, session)
     raw = r.get(k_penchal(issue))
     driver_absent = not _holder_present(r, driver)
     # Operator decision (#94): a driver with NO presence anywhere is treated as
@@ -2518,6 +2530,16 @@ def cmd_pen_take(r, args):
                            expected_session=session,
                            driver_must_be_participant=True,
                            challenge_expect=raw):
+            # #106: `pen_expect=driver` can miss because the very drain we are
+            # racing has ALREADY released the pen — there is no holder at all now.
+            # That is not a refusal: an unheld pen is free, and this take was
+            # justified by the driver's absence, which the release only confirms.
+            # Without this the take failed on its first try and needed a manual
+            # retry, which is exactly the stall #94 removed the grace window to
+            # avoid. Re-read once: only a pen still HELD (a returning driver, or a
+            # faster peer) is a genuine reason to refuse.
+            if r.get(k_pen(issue)) is None:
+                return _take_unheld_pen(r, args, issue, session)
             sys.stderr.write(f"bus pen take: huddle or pen changed while taking #{issue}; "
                              "not moving the pen\n")
             return 1
