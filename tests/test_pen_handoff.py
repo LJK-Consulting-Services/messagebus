@@ -218,12 +218,9 @@ def test_pen_pass_success_checkpoints_then_moves_pen_and_clears_challenge(
 
 # ---- #94: `pen pass` / `pen take` must ACT on _set_driver's False --------------
 #
-# `_set_driver` returns False when the huddle metadata key is gone. All three write
-# paths used to discard that: they wrote the pen key and announced a handoff anyway.
-# Because `huddle close` is the only thing that deletes k_pen, the blind `r.set`
-# then RESURRECTED a pen key that nothing would ever clean up, attached to a huddle
-# that no longer existed. The fix writes the driver FIRST and aborts on False, so a
-# huddle closed under us leaves nothing behind.
+# All three write paths used to write huddle driver metadata and the pen key as
+# separate operations. A close in either gap could leave a pen key attached to a
+# deleted huddle. The fix moves driver + pen in one Redis transaction.
 
 
 def test_pen_pass_into_a_huddle_closed_mid_flight_writes_nothing(
@@ -306,3 +303,85 @@ def test_pen_take_force_into_a_huddle_closed_mid_flight_writes_nothing(
     assert json.loads(fake_redis.get(bus_module.k_penchal(79))) == challenge
     assert "is gone" in capsys.readouterr().err
     assert fake_redis.xlen(bus_module.k_stream("main")) == 0
+
+
+def _close_after_first_pipeline_execute(monkeypatch, fake_redis, bus_module):
+    state = {"fired": False}
+    real_pipeline = fake_redis.pipeline
+
+    def close_huddle():
+        fake_redis.delete(
+            bus_module.k_huddle(79),
+            bus_module.k_pen(79),
+            bus_module.k_penchal(79),
+            bus_module.k_signoff(79),
+            bus_module.k_block(79),
+        )
+
+    def pipeline(*args, **kwargs):
+        pipe = real_pipeline(*args, **kwargs)
+        real_execute = pipe.execute
+
+        def execute(*execute_args, **execute_kwargs):
+            result = real_execute(*execute_args, **execute_kwargs)
+            if not state["fired"]:
+                state["fired"] = True
+                close_huddle()
+            return result
+
+        pipe.execute = execute
+        return pipe
+
+    monkeypatch.setattr(fake_redis, "pipeline", pipeline)
+    return state
+
+
+def test_pen_pass_close_after_driver_write_leaves_no_orphan_pen(
+    bus_module, fake_redis, ns, monkeypatch
+):
+    fake_redis.set(bus_module.k_huddle(79), json.dumps(huddle_meta(bus_module)))
+    fake_redis.set(bus_module.k_pen(79), "alice")
+    fake_redis.set(bus_module.k_penchal(79), json.dumps({"challenger": "bob"}))
+    monkeypatch.setattr(bus_module, "cmd_pen_checkpoint", lambda *_args: 0)
+    state = _close_after_first_pipeline_execute(monkeypatch, fake_redis, bus_module)
+
+    rc = bus_module.cmd_pen_pass(fake_redis, ns(as_agent="alice", issue=79, to="bob"))
+
+    assert state["fired"], "the close-after-write race was not exercised"
+    assert rc == 0
+    assert fake_redis.get(bus_module.k_huddle(79)) is None
+    assert fake_redis.get(bus_module.k_pen(79)) is None
+
+
+def test_pen_take_unheld_close_after_driver_write_leaves_no_orphan_pen(
+    bus_module, fake_redis, ns, monkeypatch
+):
+    fake_redis.set(bus_module.k_huddle(79), json.dumps(huddle_meta(bus_module, driver="")))
+    state = _close_after_first_pipeline_execute(monkeypatch, fake_redis, bus_module)
+
+    rc = bus_module.cmd_pen_take(fake_redis, ns(as_agent="bob", issue=79, reason="stale"))
+
+    assert state["fired"], "the close-after-write race was not exercised"
+    assert rc == 0
+    assert fake_redis.get(bus_module.k_huddle(79)) is None
+    assert fake_redis.get(bus_module.k_pen(79)) is None
+
+
+def test_pen_take_force_close_after_driver_write_leaves_no_orphan_pen(
+    bus_module, fake_redis, ns, monkeypatch
+):
+    challenge = {"challenger": "bob", "reason": "stale",
+                 "ts": (datetime.now(timezone.utc)
+                        - timedelta(seconds=bus_module.PEN_TAKE_GRACE + 5)).isoformat()}
+    fake_redis.set(bus_module.k_huddle(79), json.dumps(huddle_meta(bus_module)))
+    fake_redis.set(bus_module.k_pen(79), "alice")
+    fake_redis.set(bus_module.k_penchal(79), json.dumps(challenge))
+    monkeypatch.setattr(bus_module, "_holder_present", lambda _r, _holder: False)
+    state = _close_after_first_pipeline_execute(monkeypatch, fake_redis, bus_module)
+
+    rc = bus_module.cmd_pen_take(fake_redis, ns(as_agent="bob", issue=79, reason="stale"))
+
+    assert state["fired"], "the close-after-write race was not exercised"
+    assert rc == 0
+    assert fake_redis.get(bus_module.k_huddle(79)) is None
+    assert fake_redis.get(bus_module.k_pen(79)) is None

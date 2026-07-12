@@ -1,6 +1,7 @@
 import json
 import os
 import uuid
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 import pytest
@@ -194,6 +195,28 @@ def _fire_once_on_huddle_read(monkeypatch, r, bus_module, issue, action, where="
     def pipeline(*a, **kw):
         pipe = orig_pipeline(*a, **kw)
         pipe.get = hook(pipe.get)
+        return pipe
+
+    monkeypatch.setattr(r, "pipeline", pipeline)
+    return state
+
+
+def _fire_once_after_pipeline_execute(monkeypatch, r, action):
+    state = {"fired": False}
+    orig_pipeline = r.pipeline
+
+    def pipeline(*a, **kw):
+        pipe = orig_pipeline(*a, **kw)
+        real_execute = pipe.execute
+
+        def execute(*execute_args, **execute_kw):
+            result = real_execute(*execute_args, **execute_kw)
+            if not state["fired"]:
+                state["fired"] = True
+                action()
+            return result
+
+        pipe.execute = execute
         return pipe
 
     monkeypatch.setattr(r, "pipeline", pipeline)
@@ -406,6 +429,85 @@ def test_real_redis_pen_pass_into_a_huddle_closed_mid_flight_leaves_no_pen(
         assert verify.get(bus_module.k_huddle(issue)) is None
         assert verify.get(bus_module.k_pen(issue)) is None   # no resurrected pen key
         assert "is gone" in capsys.readouterr().err
+    finally:
+        _delete_issue_keys(verify, bus_module, issue)
+
+
+def test_real_redis_pen_pass_close_after_driver_write_leaves_no_orphan_pen(
+    bus_module, ns, redis_url, monkeypatch,
+):
+    issue = _issue_id()
+    r = bus_module.connect(redis_url)
+    verify = bus_module.connect(redis_url)
+    closer = bus_module.connect(redis_url)
+
+    try:
+        _seed_huddle(r, bus_module, issue, ["agent-d", "agent-a"], "agent-d")
+        r.set(bus_module.k_pen(issue), "agent-d", ex=60)
+        monkeypatch.setattr(bus_module, "cmd_pen_checkpoint", lambda _r, _args: 0)
+        state = _fire_once_after_pipeline_execute(
+            monkeypatch, r, lambda: _delete_issue_keys(closer, bus_module, issue))
+
+        assert bus_module.cmd_pen_pass(
+            r, ns(issue=issue, as_agent="agent-d", to="agent-a", room="integration")) == 0
+
+        assert state["fired"], "the close-after-write race was not exercised"
+        assert verify.get(bus_module.k_huddle(issue)) is None
+        assert verify.get(bus_module.k_pen(issue)) is None
+    finally:
+        _delete_issue_keys(verify, bus_module, issue)
+
+
+def test_real_redis_pen_take_unheld_close_after_driver_write_leaves_no_orphan_pen(
+    bus_module, ns, redis_url, monkeypatch,
+):
+    issue = _issue_id()
+    r = bus_module.connect(redis_url)
+    verify = bus_module.connect(redis_url)
+    closer = bus_module.connect(redis_url)
+
+    try:
+        _seed_huddle(r, bus_module, issue, ["agent-d", "agent-a"], "")
+        state = _fire_once_after_pipeline_execute(
+            monkeypatch, r, lambda: _delete_issue_keys(closer, bus_module, issue))
+
+        assert bus_module.cmd_pen_take(
+            r, ns(issue=issue, as_agent="agent-a", reason="driver left",
+                  room="integration")) == 0
+
+        assert state["fired"], "the close-after-write race was not exercised"
+        assert verify.get(bus_module.k_huddle(issue)) is None
+        assert verify.get(bus_module.k_pen(issue)) is None
+    finally:
+        _delete_issue_keys(verify, bus_module, issue)
+
+
+def test_real_redis_pen_take_force_close_after_driver_write_leaves_no_orphan_pen(
+    bus_module, ns, redis_url, monkeypatch,
+):
+    issue = _issue_id()
+    r = bus_module.connect(redis_url)
+    verify = bus_module.connect(redis_url)
+    closer = bus_module.connect(redis_url)
+    challenge = {"challenger": "agent-a", "reason": "stale",
+                 "ts": (datetime.now(timezone.utc)
+                        - timedelta(seconds=bus_module.PEN_TAKE_GRACE + 5)).isoformat()}
+
+    try:
+        _seed_huddle(r, bus_module, issue, ["agent-d", "agent-a"], "agent-d")
+        r.set(bus_module.k_pen(issue), "agent-d", ex=60)
+        r.set(bus_module.k_penchal(issue), json.dumps(challenge), ex=60)
+        monkeypatch.setattr(bus_module, "_holder_present", lambda _r, _holder: False)
+        state = _fire_once_after_pipeline_execute(
+            monkeypatch, r, lambda: _delete_issue_keys(closer, bus_module, issue))
+
+        assert bus_module.cmd_pen_take(
+            r, ns(issue=issue, as_agent="agent-a", reason="stale",
+                  room="integration")) == 0
+
+        assert state["fired"], "the close-after-write race was not exercised"
+        assert verify.get(bus_module.k_huddle(issue)) is None
+        assert verify.get(bus_module.k_pen(issue)) is None
     finally:
         _delete_issue_keys(verify, bus_module, issue)
 
