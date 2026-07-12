@@ -989,20 +989,15 @@ def compare_delete_lock(r, issue, holder):
     return compare_delete(r, k_lock(issue), holder)
 
 
-def compare_set_huddle_meta(r, issue, holder, meta_json, pen_holder=None):
-    keys = [k_lock(issue), k_huddle(issue)]
-    argv = [holder, meta_json]
-    script = """
+CAS_SET_META_LUA = """
         if redis.call('GET', KEYS[1]) == ARGV[1] then
             redis.call('SET', KEYS[2], ARGV[2])
             return 1
         end
         return 0
         """
-    if pen_holder is not None:
-        keys.extend([k_pen(issue), k_penchal(issue)])
-        argv.append(pen_holder)
-        script = """
+
+CAS_SET_META_PEN_LUA = """
         if redis.call('GET', KEYS[1]) == ARGV[1] then
             redis.call('SET', KEYS[2], ARGV[2])
             redis.call('SET', KEYS[3], ARGV[3])
@@ -1011,6 +1006,16 @@ def compare_set_huddle_meta(r, issue, holder, meta_json, pen_holder=None):
         end
         return 0
         """
+
+
+def compare_set_huddle_meta(r, issue, holder, meta_json, pen_holder=None):
+    keys = [k_lock(issue), k_huddle(issue)]
+    argv = [holder, meta_json]
+    script = CAS_SET_META_LUA
+    if pen_holder is not None:
+        keys.extend([k_pen(issue), k_penchal(issue)])
+        argv.append(pen_holder)
+        script = CAS_SET_META_PEN_LUA
     return r.eval(
         script,
         len(keys), *keys, *argv,
@@ -2276,9 +2281,10 @@ def cmd_huddle_status(r, args):
     return 0
 
 
-def _refuse_close(r, args, issue, reasons):
+def _refuse_close(r, args, reasons):
     """Report a close the done-gate turned down. Runs after `unwatch`, never inside
     the transaction."""
+    issue = args.issue
     # Structured signal (B6, #81): surface the blocked close for tooling. Emit the
     # COUNT of open reasons only — the reason strings embed untrusted user --block
     # text and must never ride the event layer.
@@ -2296,10 +2302,11 @@ def cmd_huddle_close(r, args):
     by the DONE-GATE — every present participant signed off at the current tip and
     no open blocks — unless --force. Participant-only (stops a bystander closing).
 
-    The gate runs under a WATCH on every REDIS key it reads, and the delete that ends
+    The gate runs under a WATCH on the metadata and block keys, and the delete that ends
     the huddle commits in the SAME transaction (#92). The invariant it enforces: no
-    gate input that lives in Redis may change between the gate and the delete that
-    destroys it.
+    WATCHED gate input may change between the gate and the delete that destroys it.
+    Three gate inputs are deliberately outside that set — k_signoff, the presence keys
+    and the git tip — each for its own reason, spelled out below.
 
     Two ways that was violated, both real gate BYPASSES rather than cosmetic races:
       * `huddle join` grows `participants` in the metadata blob. A join landing after
@@ -2317,6 +2324,11 @@ def cmd_huddle_close(r, args):
     so a concurrent write can only make the gate MORE satisfied, never turn a refusal
     into a pass. Watching it would buy nothing and abort the close on every sign-off.
 
+    The presence keys (`donegate` -> `_holder_present`) are not watched either. They
+    carry a TTL, and Redis does not reliably abort a WATCH on key EXPIRY, so watching
+    them would be unsound rather than merely expensive — and a participant whose
+    presence lapses mid-gate is anyway indistinguishable from one who lapsed just after.
+
     NOT covered, by construction: the shared git tip (`_shared_tip`, read by the gate)
     is not a Redis key, so no WATCH can freeze it. A checkpoint push landing in the
     gate->EXEC window closes at a tip nobody signed. That gap pre-dates #92 and is
@@ -2325,9 +2337,18 @@ def cmd_huddle_close(r, args):
     A retry re-reads and re-gates: a landed join leaves a participant unsigned, a
     landed block is open, so the gate then refuses. Pen ops also write the metadata
     blob (participants and driver share one key), and those writes are benign to the
-    gate — so they abort and retry WITHOUT flipping the verdict. In a turn-based,
-    agent-paced system that is a handful of retries, not a spin; there is no retry cap,
-    matching the house WATCH idiom (`_set_driver`, `_mutate_json`).
+    gate — so they abort and retry WITHOUT flipping the verdict.
+
+    COST, stated honestly: a retry is NOT cheap here. `donegate` re-runs, and it does a
+    `git fetch` (via `_shared_tip`) plus a keyspace scan per participant (#96) — so an
+    abort costs seconds, not the microseconds an abort costs in `_set_driver` or
+    `_mutate_json`. The retry is uncapped as in those helpers, but the comparison to
+    them ends there. It is tolerable only because a close happens once per huddle and
+    the writers that abort it are agent-paced, so retries are rare. The tip is
+    deliberately re-read on each pass rather than sampled once: that re-read is the only
+    thing that catches a checkpoint push landing alongside a join, and trading it for
+    latency on a once-per-huddle path would widen #95 to buy speed we do not need.
+    Hoisting the fetch out of the transaction is tracked as a follow-up.
     """
     issue = args.issue
     key, block_key = k_huddle(issue), k_block(issue)
@@ -2371,7 +2392,7 @@ def cmd_huddle_close(r, args):
                     ok, reasons = donegate(r, issue, meta, args.as_agent)
                     if not ok:
                         pipe.unwatch()
-                        _refuse_close(r, args, issue, reasons)
+                        _refuse_close(r, args, reasons)
                         return 1
                 # Release the lock and destroy the huddle state in ONE transaction, so
                 # there is no window where the metadata is gone but the lock is still

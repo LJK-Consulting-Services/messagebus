@@ -402,6 +402,7 @@ def test_real_redis_close_regates_on_a_join_inside_the_gate_window(
     r = bus_module.connect(redis_url)
     verify = bus_module.connect(redis_url)
     joiner = bus_module.connect(redis_url)
+    presence = []  # predeclared: the `finally` must not NameError over a seeding failure
 
     try:
         _seed_huddle(r, bus_module, issue, ["agent-a", "agent-b"], "agent-a")
@@ -436,7 +437,8 @@ def test_real_redis_close_regates_on_a_join_inside_the_gate_window(
         assert verify.get(bus_module.k_lock(issue)) is not None
     finally:
         _delete_issue_keys(verify, bus_module, issue)
-        verify.delete(*presence)
+        if presence:
+            verify.delete(*presence)
 
 
 def test_real_redis_close_regates_on_a_block_raised_inside_the_gate_window(
@@ -527,7 +529,7 @@ def test_real_redis_close_still_closes_when_the_gate_is_genuinely_met(
 
 
 def test_real_redis_close_with_a_reaped_lock_clears_state_but_not_the_label(
-    bus_module, ns, redis_url, monkeypatch,
+    bus_module, ns, redis_url, monkeypatch, no_github,
 ):
     """The MISS half of the CAS the close queues inside its MULTI.
 
@@ -554,9 +556,10 @@ def test_real_redis_close_with_a_reaped_lock_clears_state_but_not_the_label(
     try:
         _seed_huddle(r, bus_module, issue, ["agent-a", "agent-b"], "agent-a")
         monkeypatch.setattr(bus_module, "_shared_tip", lambda _issue: tip)
+        # `no_github` already neutralises gh; re-point set_status_label so we can assert
+        # the close does NOT advance it.
         monkeypatch.setattr(bus_module, "set_status_label",
                             lambda _issue, label: labels.append(label))
-        monkeypatch.setattr(bus_module, "gh", lambda *_a, **_kw: (0, "", ""))
         r.set(bus_module.k_signoff(issue), json.dumps({"agent-a": tip, "agent-b": tip}))
         presence = _seed_presence(r, bus_module, "integration", ("agent-a", "agent-b"))
         # Our session lock lapsed and someone else now holds the claim on this issue.
