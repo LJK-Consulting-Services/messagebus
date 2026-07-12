@@ -104,6 +104,18 @@ def test_huddle_open_does_not_blindly_reset_pen_after_metadata_create(
 def test_huddle_close_does_not_delete_reopened_session_state(
     bus_module, fake_redis, ns, monkeypatch, capsys
 ):
+    """A close is bound to the session it started against.
+
+    The close reads the metadata under WATCH, then tears the huddle down in the same
+    transaction (#92). If the huddle is closed and REOPENED inside that window, the
+    WATCH aborts our EXEC and we re-read — but what we re-read is a different huddle.
+    Re-gating it and proceeding would destroy a session the caller never targeted, and
+    `--force` would do it without even consulting the gate. So a session swap refuses.
+
+    The swap is driven from inside `donegate`, which is exactly where the real window
+    is (between the watched read and EXEC), so this exercises the true WATCH abort and
+    retry rather than stubbing out the teardown.
+    """
     old_meta = make_huddle(bus_module)
     old_meta["session"] = "huddle:issue-79:old"
     new_meta = make_huddle(bus_module)
@@ -114,19 +126,28 @@ def test_huddle_close_does_not_delete_reopened_session_state(
     monkeypatch.setattr(bus_module, "set_status_label", mock.Mock())
     monkeypatch.setattr(bus_module, "gh", mock.Mock(return_value=(0, "", "")))
 
-    def stale_close_loses_lock(_r, issue, holder):
-        assert (issue, holder) == (79, old_meta["session"])
-        fake_redis.set(bus_module.k_lock(79), new_meta["session"])
-        fake_redis.set(bus_module.k_huddle(79), json.dumps(new_meta))
-        fake_redis.set(bus_module.k_pen(79), "alice")
-        return 0
+    fired = []
 
-    monkeypatch.setattr(bus_module, "compare_delete_lock", stale_close_loses_lock)
+    def reopen_under_the_close(_r, issue, meta, _closer):
+        # First gate call only: the huddle we are closing is torn down and a fresh
+        # one opens behind the same key, exactly as a real close+open race would.
+        if not fired:
+            fired.append(True)
+            assert bus_module.huddle_meta_holder(meta, issue) == old_meta["session"]
+            fake_redis.set(bus_module.k_huddle(79), json.dumps(new_meta))
+            fake_redis.set(bus_module.k_lock(79), new_meta["session"])
+            fake_redis.set(bus_module.k_pen(79), "alice")
+        return True, []
 
-    rc = bus_module.cmd_huddle_close(fake_redis, ns(as_agent="alice", issue=79, force=True))
+    monkeypatch.setattr(bus_module, "donegate", reopen_under_the_close)
 
+    rc = bus_module.cmd_huddle_close(fake_redis, ns(as_agent="alice", issue=79, force=False))
+
+    assert fired, "the concurrent reopen never landed — the race was not exercised"
     assert rc == 1
+    # The new session is untouched: its lock, its pen and its metadata all survive.
     assert fake_redis.get(bus_module.k_pen(79)) == "alice"
+    assert fake_redis.get(bus_module.k_lock(79)) == new_meta["session"]
     assert json.loads(fake_redis.get(bus_module.k_huddle(79))) == new_meta
     assert "changed sessions" in capsys.readouterr().err
 

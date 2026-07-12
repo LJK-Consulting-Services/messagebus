@@ -30,6 +30,18 @@ try:
 except ImportError:  # pragma: no cover - suite skips cleanly without the dep
     fakeredis = None
 
+if fakeredis is not None:
+    # The shared double, which mirrors the bus's Lua CAS scripts in Python — on the
+    # client AND on the pipeline. fakeredis only speaks EVAL when `lupa` is installed,
+    # which CI does not install, so a raw FakeStrictRedis dies on the compare-and-delete
+    # that `huddle close` now queues inside its MULTI (#92).
+    #
+    # Imported OUTSIDE the try above on purpose: folding it in would turn a broken
+    # conftest into a silent "fakeredis not installed" skip of this whole suite, which is
+    # the same shape of machine-dependent false green that let this file ship without
+    # ever seeding k_lock.
+    from conftest import BusFakeRedis
+
 _BUS_PATH = os.path.join(os.path.dirname(__file__), os.pardir, "bus")
 
 
@@ -61,8 +73,10 @@ def _args(**kw):
 class HuddleGateTest(unittest.TestCase):
     ISSUE = 42
 
+    SESSION = "huddle:issue-42:deadbeef"
+
     def setUp(self):
-        self.r = fakeredis.FakeStrictRedis(decode_responses=True)
+        self.r = BusFakeRedis(decode_responses=True)
         # A huddle with three participants; alice is opener/driver + pen holder.
         # (Written directly rather than via cmd_huddle_open, which would shell out
         # to git to create the shared branch — not what these tests exercise.)
@@ -70,8 +84,13 @@ class HuddleGateTest(unittest.TestCase):
             "issue": self.ISSUE, "opener": "alice",
             "participants": ["alice", "bob", "carol"],
             "driver": "alice", "branch": bus.huddle_branch(self.ISSUE),
-            "session": "huddle:issue-42:deadbeef", "status": "open"}))
+            "session": self.SESSION, "status": "open"}))
         self.r.set(bus.k_pen(self.ISSUE), "alice")
+        # The session lock the close compare-and-deletes. It was never seeded here,
+        # which was invisible while `compare_delete_lock` was stubbed to "we owned
+        # it" — the close now runs the REAL CAS inside its transaction (#92), and an
+        # absent lock is a miss, so a close that should tear down would silently not.
+        self.r.set(bus.k_lock(self.ISSUE), self.SESSION)
 
         # The two external boundaries. `_shared_tip` reads self._tip so a test can
         # "advance" the branch mid-scenario to model a checkpoint/push.
@@ -85,13 +104,6 @@ class HuddleGateTest(unittest.TestCase):
                 p = mock.patch.object(bus, name)
             setattr(self, attr, p.start())
             self.addCleanup(p.stop)
-        # compare_delete_lock is an atomic Lua compare-and-delete on the session
-        # lock; it's a separate primitive from the done-gate these tests target,
-        # and this fakeredis build has no `eval`. Stub it to the "we owned the
-        # lock" branch so close() proceeds to advance status + tear down.
-        p = mock.patch.object(bus, "compare_delete_lock", return_value=1)
-        self.cmp_del = p.start()
-        self.addCleanup(p.stop)
         # The cmd_* handlers print progress to stdout; keep the test output clean.
         quiet = contextlib.redirect_stdout(io.StringIO())
         quiet.__enter__()

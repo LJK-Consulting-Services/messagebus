@@ -362,6 +362,224 @@ def test_real_redis_pen_pass_keeps_a_join_that_lands_mid_meta_write(
         _delete_issue_keys(verify, bus_module, issue)
 
 
+# --- done-gate TOCTOU on the close path (#92) -----------------------------------
+#
+# The sites above lose a participant by OVERWRITING the blob. These lose the gate's
+# INPUTS: the gate ran on a snapshot, and the close then deleted the very state a
+# concurrent writer had just added — the joiner's chance to sign, or an open block.
+#
+# Both drive a real concurrent write into the gate->EXEC window on real Redis. The
+# interleave is deterministic (an abort, not a sleep), so neither is timing-flaky.
+
+
+def _seed_presence(r, bus_module, room, agents):
+    """Presence for each agent, and the keys to delete in teardown. An ABSENT
+    participant does not hold the done-gate, so a test that forgets this passes for
+    the wrong reason — the participant is skipped, not checked."""
+    keys = [bus_module.k_presence(room, a) for a in agents]
+    for k in keys:
+        r.set(k, "now", ex=60)
+    return keys
+
+
+def test_real_redis_close_regates_on_a_join_inside_the_gate_window(
+    bus_module, ns, redis_url, monkeypatch, no_github,
+):
+    """A join landing inside the close's gate window must not slip past the done-gate.
+
+    This is a gate BYPASS, not a cosmetic race. A and B have both signed at the tip,
+    so the gate is legitimately satisfied for the participants the closer read. C
+    joins while the close is in flight; the pre-fix close gated on a participant list
+    that never contained C, passed, and deleted the whole huddle — including the
+    sign-off key C would have signed. C is silently merged over.
+
+    Under the fix the join aborts the EXEC, the close re-gates against the fresh
+    participant list, and C's missing sign-off refuses the close. The abort is what
+    makes this deterministic rather than timing-dependent.
+    """
+    issue = _issue_id()
+    tip = "c" * 40
+    r = bus_module.connect(redis_url)
+    verify = bus_module.connect(redis_url)
+    joiner = bus_module.connect(redis_url)
+    presence = []  # predeclared: the `finally` must not NameError over a seeding failure
+
+    try:
+        _seed_huddle(r, bus_module, issue, ["agent-a", "agent-b"], "agent-a")
+        # The shared branch is not what's under test; pin the tip so the gate turns
+        # purely on who has signed it.
+        monkeypatch.setattr(bus_module, "_shared_tip", lambda _issue: tip)
+        # Closer + B have both signed AT THE TIP: without C the gate passes, so a
+        # close that ignores C returns 0 rather than failing for some unrelated reason.
+        r.set(bus_module.k_signoff(issue), json.dumps({"agent-a": tip, "agent-b": tip}))
+        presence = _seed_presence(r, bus_module, "integration",
+                                  ("agent-a", "agent-b", "agent-c"))
+
+        # where="any" on purpose: the fixed close reads the key through the watching
+        # pipeline, the pre-fix close through the client. Hooking only one would fire
+        # against a single version — and the negative control would then fail for want
+        # of a concurrent join rather than for losing it.
+        state = _fire_once_on_huddle_read(
+            monkeypatch, r, bus_module, issue,
+            lambda: bus_module.cmd_huddle_join(
+                joiner, ns(issue=issue, as_agent="agent-c", room="integration")))
+
+        rc = bus_module.cmd_huddle_close(
+            r, ns(issue=issue, as_agent="agent-a", room="integration", force=False))
+
+        assert state["fired"], "the concurrent join never landed — race not exercised"
+        assert rc == 1, "the done-gate passed with a present, unsigned participant"
+        # A refused close must leave the huddle INTACT — C still has to be able to
+        # sign. Asserting rc alone would miss a close that refuses but deletes anyway.
+        meta = json.loads(verify.get(bus_module.k_huddle(issue)))
+        assert "agent-c" in meta["participants"], "the join was lost by the close"
+        assert verify.get(bus_module.k_signoff(issue)) is not None
+        assert verify.get(bus_module.k_lock(issue)) is not None
+    finally:
+        _delete_issue_keys(verify, bus_module, issue)
+        if presence:
+            verify.delete(*presence)
+
+
+def test_real_redis_close_regates_on_a_block_raised_inside_the_gate_window(
+    bus_module, ns, redis_url, monkeypatch, no_github,
+):
+    """A block raised after the gate read the block list must not be closed over.
+
+    `signoff --block` writes k_block and NOTHING else, so watching only the metadata
+    key left this wide open: the gate read an empty block list, the WATCH stayed
+    clean, EXEC committed — and the close's own delete destroyed the block. The
+    huddle closed over a live objection, and the objection vanished with it.
+
+    The hook fires on `_shared_tip`, which `donegate` calls AFTER its block read and
+    before its sign-off read — landing the block precisely in the gate->EXEC window.
+    Hooking the huddle read instead would be a weaker test: the block would land
+    BEFORE the gate and be caught by the gate rather than by the WATCH.
+    """
+    issue = _issue_id()
+    tip = "d" * 40
+    r = bus_module.connect(redis_url)
+    verify = bus_module.connect(redis_url)
+    blocker = bus_module.connect(redis_url)
+    presence = []
+
+    try:
+        _seed_huddle(r, bus_module, issue, ["agent-a", "agent-b"], "agent-a")
+        # Everyone has signed: the gate is satisfied but for the block, so a close
+        # that misses the block returns 0 rather than failing for an unrelated reason.
+        r.set(bus_module.k_signoff(issue), json.dumps({"agent-a": tip, "agent-b": tip}))
+        presence = _seed_presence(r, bus_module, "integration", ("agent-a", "agent-b"))
+
+        fired = {"n": 0}
+
+        def tip_then_block(_issue):
+            if not fired["n"]:
+                fired["n"] = 1
+                bus_module.cmd_signoff(blocker, ns(
+                    issue=issue, as_agent="agent-b", room="integration",
+                    block="found a data-loss bug, do NOT merge"))
+            return tip
+
+        monkeypatch.setattr(bus_module, "_shared_tip", tip_then_block)
+
+        rc = bus_module.cmd_huddle_close(
+            r, ns(issue=issue, as_agent="agent-a", room="integration", force=False))
+
+        assert fired["n"], "the concurrent block never landed — race not exercised"
+        assert rc == 1, "the done-gate closed the huddle over an open block"
+        # The block must SURVIVE the refused close — destroying it would silently
+        # discard the objection even though the close itself was turned down.
+        blocks = json.loads(verify.get(bus_module.k_block(issue)))
+        assert [b["agent"] for b in blocks] == ["agent-b"], "the block was destroyed"
+        assert verify.get(bus_module.k_huddle(issue)) is not None
+    finally:
+        _delete_issue_keys(verify, bus_module, issue)
+        if presence:
+            verify.delete(*presence)
+
+
+def test_real_redis_close_still_closes_when_the_gate_is_genuinely_met(
+    bus_module, ns, redis_url, monkeypatch, no_github,
+):
+    """The WATCH/retry must not break the ordinary close — without this, the two tests
+    above would also pass against a `cmd_huddle_close` that never closes anything."""
+    issue = _issue_id()
+    tip = "c" * 40
+    r = bus_module.connect(redis_url)
+    verify = bus_module.connect(redis_url)
+    presence = []
+
+    try:
+        _seed_huddle(r, bus_module, issue, ["agent-a", "agent-b"], "agent-a")
+        monkeypatch.setattr(bus_module, "_shared_tip", lambda _issue: tip)
+        r.set(bus_module.k_signoff(issue), json.dumps({"agent-a": tip, "agent-b": tip}))
+        presence = _seed_presence(r, bus_module, "integration", ("agent-a", "agent-b"))
+
+        assert bus_module.cmd_huddle_close(
+            r, ns(issue=issue, as_agent="agent-a", room="integration", force=False)) == 0
+
+        # Lock released and every huddle key gone — the close's whole contract.
+        assert verify.get(bus_module.k_huddle(issue)) is None
+        assert verify.get(bus_module.k_lock(issue)) is None
+        assert verify.get(bus_module.k_signoff(issue)) is None
+    finally:
+        _delete_issue_keys(verify, bus_module, issue)
+        if presence:
+            verify.delete(*presence)
+
+
+def test_real_redis_close_with_a_reaped_lock_clears_state_but_not_the_label(
+    bus_module, ns, redis_url, monkeypatch, no_github,
+):
+    """The MISS half of the CAS the close queues inside its MULTI.
+
+    #92 moved the lock release from a client-side `compare_delete_lock` into the
+    gated transaction as a queued EVAL. The hit path is covered above; this is the
+    branch where a Lua CAS and a naive DEL actually differ, so it is the one worth
+    proving against a real server. fakeredis cannot: it only speaks EVAL with `lupa`
+    installed, and the mirror in conftest resolves the compare in Python rather than
+    in the script.
+
+    Contract when the lock is NOT ours (it expired, or was reaped and re-acquired):
+    the CAS must return 0 and leave the OTHER holder's lock alone, the huddle state
+    must still be cleared (close is the only orphan-cleanup path, and meta has no
+    TTL), and the status label must NOT advance — doing so would clobber whoever now
+    holds the claim.
+    """
+    issue = _issue_id()
+    tip = "c" * 40
+    r = bus_module.connect(redis_url)
+    verify = bus_module.connect(redis_url)
+    labels = []
+    presence = []
+
+    try:
+        _seed_huddle(r, bus_module, issue, ["agent-a", "agent-b"], "agent-a")
+        monkeypatch.setattr(bus_module, "_shared_tip", lambda _issue: tip)
+        # `no_github` already neutralises gh; re-point set_status_label so we can assert
+        # the close does NOT advance it.
+        monkeypatch.setattr(bus_module, "set_status_label",
+                            lambda _issue, label: labels.append(label))
+        r.set(bus_module.k_signoff(issue), json.dumps({"agent-a": tip, "agent-b": tip}))
+        presence = _seed_presence(r, bus_module, "integration", ("agent-a", "agent-b"))
+        # Our session lock lapsed and someone else now holds the claim on this issue.
+        r.set(bus_module.k_lock(issue), "someone-else", ex=60)
+
+        rc = bus_module.cmd_huddle_close(
+            r, ns(issue=issue, as_agent="agent-a", room="integration", force=False))
+
+        assert rc == 0
+        assert verify.get(bus_module.k_lock(issue)) == "someone-else", \
+            "the CAS deleted a lock that was not ours"
+        assert verify.get(bus_module.k_huddle(issue)) is None   # orphan meta still reaped
+        assert verify.get(bus_module.k_signoff(issue)) is None
+        assert labels == [], "advanced the label while another agent held the claim"
+    finally:
+        _delete_issue_keys(verify, bus_module, issue)
+        if presence:
+            verify.delete(*presence)
+
+
 # ---- #94: a CAS/existence result the caller drops on the floor -----------------
 #
 # The real-server half. fakeredis can reproduce the STATE a race leaves behind, but

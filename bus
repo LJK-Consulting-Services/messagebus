@@ -969,38 +969,35 @@ def stale_lock_info(r, issue, present_set=None):
     return holder, r.ttl(k_lock(issue))
 
 
+# Two callers: `compare_delete` (standalone) and `cmd_huddle_close`, which queues it
+# inside a MULTI so the lock-release and the metadata delete commit together.
+CAS_DELETE_LUA = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+
+
 def compare_delete(r, key, value):
     """Atomically DEL `key`, but only while it still holds `value`. Deleting a
     token someone else now owns is the whole failure mode this prevents."""
-    return r.eval(
-        """
-        if redis.call('GET', KEYS[1]) == ARGV[1] then
-            return redis.call('DEL', KEYS[1])
-        end
-        return 0
-        """,
-        1, key, value,
-    )
+    return r.eval(CAS_DELETE_LUA, 1, key, value)
 
 
 def compare_delete_lock(r, issue, holder):
     return compare_delete(r, k_lock(issue), holder)
 
 
-def compare_set_huddle_meta(r, issue, holder, meta_json, pen_holder=None):
-    keys = [k_lock(issue), k_huddle(issue)]
-    argv = [holder, meta_json]
-    script = """
+CAS_SET_META_LUA = """
         if redis.call('GET', KEYS[1]) == ARGV[1] then
             redis.call('SET', KEYS[2], ARGV[2])
             return 1
         end
         return 0
         """
-    if pen_holder is not None:
-        keys.extend([k_pen(issue), k_penchal(issue)])
-        argv.append(pen_holder)
-        script = """
+
+CAS_SET_META_PEN_LUA = """
         if redis.call('GET', KEYS[1]) == ARGV[1] then
             redis.call('SET', KEYS[2], ARGV[2])
             redis.call('SET', KEYS[3], ARGV[3])
@@ -1009,6 +1006,16 @@ def compare_set_huddle_meta(r, issue, holder, meta_json, pen_holder=None):
         end
         return 0
         """
+
+
+def compare_set_huddle_meta(r, issue, holder, meta_json, pen_holder=None):
+    keys = [k_lock(issue), k_huddle(issue)]
+    argv = [holder, meta_json]
+    script = CAS_SET_META_LUA
+    if pen_holder is not None:
+        keys.extend([k_pen(issue), k_penchal(issue)])
+        argv.append(pen_holder)
+        script = CAS_SET_META_PEN_LUA
     return r.eval(
         script,
         len(keys), *keys, *argv,
@@ -1997,29 +2004,6 @@ def _record_pen_challenge(r, issue, challenger, reason, expected_session, expect
                 continue
 
 
-def _delete_huddle_state(r, issue, expected_session):
-    """Delete huddle volatile keys only if metadata still belongs to this session."""
-    huddle_key = k_huddle(issue)
-    with r.pipeline() as pipe:
-        while True:
-            try:
-                pipe.watch(huddle_key)
-                raw = pipe.get(huddle_key)
-                if raw:
-                    meta = json.loads(raw)
-                    if huddle_meta_holder(meta, issue) != expected_session:
-                        pipe.unwatch()
-                        return False
-                pipe.multi()
-                if raw:
-                    pipe.delete(huddle_key, k_pen(issue), k_penchal(issue),
-                                k_signoff(issue), k_block(issue))
-                pipe.execute()
-                return True
-            except redis.WatchError:
-                continue
-
-
 def _delete_pen_challenge(r, issue, driver, challenge_raw):
     """Delete a challenge only if it is still the same challenge for this session."""
     chal_key = k_penchal(issue)
@@ -2297,45 +2281,154 @@ def cmd_huddle_status(r, args):
     return 0
 
 
+def _refuse_close(r, args, reasons):
+    """Report a close the done-gate turned down. Runs after `unwatch`, never inside
+    the transaction."""
+    issue = args.issue
+    # Structured signal (B6, #81): surface the blocked close for tooling. Emit the
+    # COUNT of open reasons only — the reason strings embed untrusted user --block
+    # text and must never ride the event layer.
+    announce_event(r, args.room, args.as_agent, EV_DONEGATE_BLOCK,
+                   {"issue": issue, "closer": args.as_agent, "open_reasons": len(reasons)},
+                   topic=f"issue-{issue}")
+    sys.stderr.write(f"bus huddle close: #{issue} not done — {len(reasons)} open:\n")
+    for why in reasons:
+        sys.stderr.write(f"  - {why}\n")
+    sys.stderr.write("  resolve, or `--force` to close anyway.\n")
+
+
 def cmd_huddle_close(r, args):
     """Close the huddle: mark the issue pr-open, drop the lock + metadata. Gated
     by the DONE-GATE — every present participant signed off at the current tip and
-    no open blocks — unless --force. Participant-only (stops a bystander closing)."""
+    no open blocks — unless --force. Participant-only (stops a bystander closing).
+
+    The gate runs under a WATCH on the metadata and block keys, and the delete that ends
+    the huddle commits in the SAME transaction (#92). The invariant it enforces: no
+    WATCHED gate input may change between the gate and the delete that destroys it.
+    Three gate inputs are deliberately outside that set — k_signoff, the presence keys
+    and the git tip — each for its own reason, spelled out below.
+
+    Two ways that was violated, both real gate BYPASSES rather than cosmetic races:
+      * `huddle join` grows `participants` in the metadata blob. A join landing after
+        the gate's read added a participant the gate never checked for a sign-off —
+        and the delete then destroyed the sign-off key they would have signed.
+      * `signoff --block` writes k_block and never touches the metadata blob. Watching
+        only the metadata key did not help: a block landing after the gate read an empty
+        block list left the WATCH clean, so EXEC committed and the delete threw the block
+        away. The huddle closed over a live objection.
+    Watching both means such a write either lands before the gate (and is seen) or
+    aborts our EXEC (and we re-gate against it).
+
+    k_signoff is deliberately NOT watched. State the property in the direction that
+    matters: a concurrent sign-off cannot turn a PASS into a REFUSAL. It can only add a
+    sign-off at the tip the gate just read, so it can make a REFUSAL stale — the safe
+    direction, and one we have already bailed on by then. An unwatched key can only hurt
+    you if it could invalidate the verdict you ACTED on, and this one cannot. Watching it
+    would abort the close on every sign-off and buy nothing.
+    (`cmd_signoff` is an upsert, `{**s, agent: tip}`, so a re-sign REPLACES that agent's
+    tip. That only subtracts a sign-off the gate counted if the tip moved underneath us —
+    which is #95's hole, below, not a second one.)
+
+    The presence keys (`donegate` -> `_holder_present`) are not watched either, and this
+    one is structural, not a judgement call: `_holder_present` resolves an agent by GLOB
+    — `scan_iter(match="bus:presence:*:{holder}")` — because a lock is global and the
+    agent may be live in any room, so the closer does not know the key's name. WATCH
+    takes literal keys and cannot watch a pattern. Presence is therefore unwatchable,
+    full stop. It is also the gate input we least need frozen: a participant whose
+    presence lapses mid-gate is indistinguishable from one who lapses just after it.
+
+    NOT covered, by construction: the shared git tip (`_shared_tip`, read by the gate)
+    is not a Redis key, so no WATCH can freeze it. A checkpoint push landing in the
+    gate->EXEC window closes at a tip nobody signed. That gap pre-dates #92 and is
+    tracked in #95; the tip-pinned sign-offs, not this WATCH, are its only guard.
+
+    A retry re-reads and re-gates: a landed join leaves a participant unsigned, a
+    landed block is open, so the gate then refuses. Pen ops also write the metadata
+    blob (participants and driver share one key), and those writes are benign to the
+    gate — so they abort and retry WITHOUT flipping the verdict.
+
+    COST, stated honestly: a retry is NOT cheap here. `donegate` re-runs, and it does a
+    `git fetch` (via `_shared_tip`) plus a keyspace scan per participant (#96) — so an
+    abort costs seconds, not the microseconds an abort costs in `_set_driver` or
+    `_mutate_json`. The retry is uncapped as in those helpers, but the comparison to
+    them ends there. It is tolerable only because a close happens once per huddle and
+    the writers that abort it are agent-paced, so retries are rare. The tip is
+    deliberately re-read on each pass rather than sampled once: that re-read is the only
+    thing that catches a checkpoint push landing alongside a join, and trading it for
+    latency on a once-per-huddle path would widen #95 to buy speed we do not need.
+    Hoisting the fetch out of the transaction is tracked as a follow-up.
+    """
     issue = args.issue
-    meta = _huddle_meta(r, issue)
-    if not meta:
-        sys.stderr.write(f"bus huddle close: no huddle on #{issue}\n")
-        return 1
-    if args.as_agent not in meta["participants"]:
-        sys.stderr.write(f"bus huddle close: {args.as_agent} is not a participant of "
-                         f"#{issue}'s huddle; only participants may close\n")
-        return 1
-    touch_presence(r, args.room, args.as_agent)
-    # DONE-GATE (stage 3): the GROUP owns "perfect" — refuse to close until the
-    # closer + every present participant has signed off at the current tip and no
-    # block is open.
-    if not getattr(args, "force", False):
-        ok, reasons = donegate(r, issue, meta, args.as_agent)
-        if not ok:
-            # Structured signal (B6, #81): surface the blocked close for tooling.
-            # Emit the COUNT of open reasons only — the reason strings embed
-            # untrusted user --block text and must never ride the event layer.
-            announce_event(r, args.room, args.as_agent, EV_DONEGATE_BLOCK,
-                           {"issue": issue, "closer": args.as_agent,
-                            "open_reasons": len(reasons)},
-                           topic=f"issue-{issue}")
-            sys.stderr.write(f"bus huddle close: #{issue} not done — {len(reasons)} open:\n")
-            for why in reasons:
-                sys.stderr.write(f"  - {why}\n")
-            sys.stderr.write("  resolve, or `--force` to close anyway.\n")
-            return 1
-    # Advance the label ONLY if we still legitimately hold the session lock.
-    # compare_delete_lock returns 1 iff the lock was ours (atomic, no TOCTOU); a
-    # 0 means it already expired or was reaped — possibly re-acquired by someone
-    # else — so advancing status:pr-open would clobber their state. Cleanup is
-    # also session-bound: a delayed close must not delete a reopened huddle.
-    session = huddle_meta_holder(meta, issue)
-    owned = compare_delete_lock(r, issue, session)
+    key, block_key = k_huddle(issue), k_block(issue)
+    session = None
+    with r.pipeline() as pipe:
+        while True:
+            try:
+                pipe.watch(key, block_key)
+                raw = pipe.get(key)
+                if not raw:
+                    pipe.unwatch()
+                    sys.stderr.write(f"bus huddle close: no huddle on #{issue}\n")
+                    return 1
+                meta = json.loads(raw)
+                # The close is bound to the session it STARTED against. A retry re-reads,
+                # and the huddle it re-reads may not be the one we set out to close: a
+                # close + `huddle open` landing in the window swaps in a brand-new session
+                # behind the same key. WATCH catches that the key changed, but "changed"
+                # is not "still mine" — re-gating would just gate the NEW huddle and tear
+                # it down (with --force, unconditionally), destroying a huddle the caller
+                # never targeted. Benign same-session churn (a join, a pen op) still
+                # retries and re-gates; only a session swap refuses.
+                current = huddle_meta_holder(meta, issue)
+                if session is None:
+                    session = current
+                elif current != session:
+                    pipe.unwatch()
+                    sys.stderr.write(f"bus huddle close: huddle #{issue} changed sessions "
+                                     f"while closing; left current huddle state intact\n")
+                    return 1
+                if args.as_agent not in meta["participants"]:
+                    pipe.unwatch()
+                    sys.stderr.write(f"bus huddle close: {args.as_agent} is not a participant of "
+                                     f"#{issue}'s huddle; only participants may close\n")
+                    return 1
+                touch_presence(r, args.room, args.as_agent)
+                # DONE-GATE (stage 3): the GROUP owns "perfect" — refuse to close until
+                # the closer + every present participant has signed off at the current
+                # tip and no block is open.
+                if not getattr(args, "force", False):
+                    ok, reasons = donegate(r, issue, meta, args.as_agent)
+                    if not ok:
+                        pipe.unwatch()
+                        _refuse_close(r, args, reasons)
+                        return 1
+                # Release the lock and destroy the huddle state in ONE transaction, so
+                # there is no window where the metadata is gone but the lock is still
+                # held. The CAS releases the lock ONLY if it is still ours: a 0 means it
+                # expired or was reaped — possibly re-acquired by someone else — so
+                # advancing status:pr-open would clobber their state. Either way we
+                # ALWAYS clear the metadata: close is the only orphan-cleanup path and
+                # must never leave meta behind (meta has no TTL; the lock does).
+                #
+                # The CAS is queued rather than routed through `compare_delete_lock`: a
+                # pipeline in MULTI mode QUEUES what a client would execute, so passing
+                # `pipe` to a helper typed for a client would silently turn its "delete
+                # now" into "delete at EXEC". Spelling the eval out keeps that visible.
+                pipe.multi()
+                pipe.eval(CAS_DELETE_LUA, 1, k_lock(issue), session)
+                pipe.delete(key, k_pen(issue), k_penchal(issue),
+                            k_signoff(issue), block_key)  # all huddle state dies with it
+                owned = bool(pipe.execute()[0])
+                break
+            except redis.WatchError:
+                continue  # a join, block, or pen op landed; re-read and re-gate on it
+    # gh is network and must not sit inside the transaction, so it runs after the
+    # huddle is already down. A failure here leaves the label stale, never the state.
+    # The atomic teardown also means the meta is gone before these gh calls, so a
+    # racing `huddle open` on the same issue can slip into this window and its
+    # status:claimed can lose to our status:pr-open (last write wins) — a GH-label
+    # race only; Redis stays consistent (the new huddle fully owns lock+meta). gh is
+    # best-effort and labels are manually correctable here, so this is not gated. (#99)
     err = None
     if owned:
         try:
@@ -2345,10 +2438,6 @@ def cmd_huddle_close(r, args):
                check=False)
         except Exception as e:  # noqa: BLE001 - report and continue
             err = str(e)
-    if not _delete_huddle_state(r, issue, session):
-        sys.stderr.write(f"bus huddle close: huddle #{issue} changed sessions while closing; "
-                         "left current huddle state intact\n")
-        return 1
     announce(r, args.room, args.as_agent, f"closed huddle on #{issue}",
              topic=f"issue-{issue}")
     print(f"{args.as_agent} closed huddle on #{issue}")
