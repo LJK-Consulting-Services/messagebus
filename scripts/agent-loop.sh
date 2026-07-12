@@ -24,7 +24,8 @@
 set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/bus-lib.sh"
-WAIT_SECS="${BUS_WAIT_SECS:-60}"
+WAIT_SECS="$(bus_uint_env BUS_WAIT_SECS 60)"
+MAX_CONTINUE="$(bus_uint_env BUS_MAX_CONTINUE 6)"
 
 AGENT="${1:?usage: agent-loop.sh <agent-id> <agent-cmd> [args...]}"; shift
 bus_require_valid_id "$AGENT"
@@ -72,11 +73,11 @@ while true; do
     [[ -f "$BUS_DONE_MARKER" ]] && { echo "agent-loop: $AGENT signaled terminal" >&2; break; }
     bus_should_stop "$AGENT" && break
     attempt=$((attempt + 1))
-    if (( attempt >= ${BUS_MAX_CONTINUE:-6} )); then
+    if (( attempt >= MAX_CONTINUE )); then
       echo "agent-loop: $AGENT hit BUS_MAX_CONTINUE without a terminal signal; yielding" >&2
       break
     fi
-    feed="CONTINUE your current task — you have NOT reached a terminal handoff (MB-SPEED R1). Keep going until your work is committed AND pushed AND you've requested review on the bus, OR you post a hard blocker as a question. Inspect your worktree, branch, and the bus to see where you are, then finish this turn. When you reach that terminal state, run:  touch \"$BUS_DONE_MARKER\"  — that tells the loop you are done."
+    feed="$(bus_continue_prompt "$BUS_DONE_MARKER")"
   done
   rm -f "$BUS_DONE_MARKER"
 done
