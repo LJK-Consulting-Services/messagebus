@@ -544,3 +544,52 @@ def test_pen_take_fallthrough_does_not_take_the_pen_of_a_reopened_huddle(
     assert fake_redis.get(bus_module.k_pen(79)) is None  # bob does NOT drive the new huddle
     assert json.loads(fake_redis.get(bus_module.k_huddle(79))) == reopened
     assert "changed while taking" in capsys.readouterr().err
+
+
+# ---- #112: _set_driver's guards are unconditional, so they must be TESTED --------
+#
+# `clear_challenge` / `driver_must_be_participant` / `expected_session` used to be
+# defaulted-but-always-overridden, so their guard branches were unreachable from any
+# caller and nothing covered them. Making them structural removes the "a caller can
+# opt out" hazard, but it does not by itself prove the guards fire — poisoning either
+# check to `if False:` left the whole suite green. These two pin them.
+#
+# Both call `_set_driver` directly on purpose: `cmd_pen_pass` / `cmd_pen_take` screen
+# for a stale session and a non-participant BEFORE opening the transaction, so through
+# them the inner checks are unreachable. The inner ones are not redundant — the outer
+# reads are already stale by the time EXEC runs, which is the whole reason they are
+# re-done inside the watched window.
+
+
+def test_set_driver_refuses_a_stale_session(bus_module, fake_redis):
+    """Issue numbers are reused after close+reopen, so a matching pen holder proves
+    nothing: only `expected_session` binds the caller to the huddle it actually read."""
+    meta = huddle_meta(bus_module)
+    fake_redis.set(bus_module.k_huddle(79), json.dumps(meta))
+    fake_redis.set(bus_module.k_pen(79), "alice")
+
+    moved = bus_module._set_driver(
+        fake_redis, 79, "bob", pen_to="bob", pen_expect="alice",
+        expected_session="huddle:issue-79:a-previous-session",
+    )
+
+    assert moved is False
+    assert fake_redis.get(bus_module.k_pen(79)) == "alice"
+    assert json.loads(fake_redis.get(bus_module.k_huddle(79))) == meta
+
+
+def test_set_driver_refuses_a_driver_who_is_not_a_participant(bus_module, fake_redis):
+    """The pen only ever moves between participants: a non-participant driver would be
+    invisible to the done-gate, which only demands sign-off from `participants`."""
+    meta = huddle_meta(bus_module)  # participants: alice, bob
+    fake_redis.set(bus_module.k_huddle(79), json.dumps(meta))
+    fake_redis.set(bus_module.k_pen(79), "alice")
+
+    moved = bus_module._set_driver(
+        fake_redis, 79, "mallory", pen_to="mallory", pen_expect="alice",
+        expected_session=meta["session"],
+    )
+
+    assert moved is False
+    assert fake_redis.get(bus_module.k_pen(79)) == "alice"
+    assert json.loads(fake_redis.get(bus_module.k_huddle(79))) == meta

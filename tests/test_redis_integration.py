@@ -664,3 +664,76 @@ def test_real_redis_drain_clears_driver_when_release_reply_was_lost(
         assert meta["participants"] == ["agent-d", "agent-a"]  # nothing else disturbed
     finally:
         _delete_issue_keys(verify, bus_module, issue)
+
+
+def _fire_once_on_multi(monkeypatch, r, action):
+    """Fire `action` after every watched READ, immediately before EXEC.
+
+    `_fire_once_on_huddle_read` fires too early to pin a WATCH: `_set_driver` reads the
+    huddle key first and the challenge key later, so a write injected at the huddle read
+    is still visible to the plain `challenge_expect` compare that follows. Only a write
+    landing after ALL the reads leaves the WATCH as the sole thing that can catch it.
+    """
+    state = {"fired": False}
+    orig_pipeline = r.pipeline
+
+    def pipeline(*a, **kw):
+        pipe = orig_pipeline(*a, **kw)
+        orig_multi = pipe.multi
+
+        def multi(*aa, **kk):
+            if not state["fired"]:
+                state["fired"] = True
+                action()
+            return orig_multi(*aa, **kk)
+
+        pipe.multi = multi
+        return pipe
+
+    monkeypatch.setattr(r, "pipeline", pipeline)
+    return state
+
+
+def test_real_redis_take_aborts_on_a_challenge_raised_inside_the_watched_window(
+    bus_module, ns, redis_url, monkeypatch,
+):
+    """#112: `k_penchal` is in `_set_driver`'s WATCH, and that is load-bearing.
+
+    The absent-driver take passes `challenge_expect` and DELETEs the challenge key in
+    its MULTI. A rival challenge recorded after the take has read the old one but before
+    EXEC is invisible to that compare -- only the WATCH can catch it. Without the WATCH
+    the take's MULTI silently destroys the rival challenge and the challenger waits
+    forever on a driver who was never told they were challenged.
+
+    Injected at `multi()`, i.e. after every read: drop `chal_key` from the
+    `pipe.watch(...)` line and this test goes red while the rest of the suite stays
+    green. Injected at the huddle read instead, it would pass either way -- the compare
+    would catch the rival and the WATCH would never be exercised.
+    """
+    issue = _issue_id()
+    r = bus_module.connect(redis_url)
+    verify = bus_module.connect(redis_url)
+    rival = bus_module.connect(redis_url)
+
+    try:
+        # agent-d holds the pen but has NO presence anywhere -> the absent-driver path.
+        _seed_huddle(r, bus_module, issue, ["agent-d", "agent-a", "agent-c"], "agent-d")
+        r.set(bus_module.k_pen(issue), "agent-d", ex=60)
+        mine = json.dumps({"challenger": "agent-a", "reason": "d is gone"})
+        r.set(bus_module.k_penchal(issue), mine)
+        theirs = json.dumps({"challenger": "agent-c", "reason": "i want it too"})
+
+        state = _fire_once_on_multi(
+            monkeypatch, r, lambda: rival.set(bus_module.k_penchal(issue), theirs))
+
+        rc = bus_module.cmd_pen_take(
+            r, ns(issue=issue, as_agent="agent-a", reason="d is gone",
+                  room="integration"))
+
+        assert state["fired"], "the rival challenge never landed -- race not exercised"
+        assert rc == 1, "the take committed against a challenge it never saw"
+        assert verify.get(bus_module.k_pen(issue)) == "agent-d", "pen moved anyway"
+        assert verify.get(bus_module.k_penchal(issue)) == theirs, \
+            "the rival challenge was silently deleted by the take's MULTI"
+    finally:
+        _delete_issue_keys(verify, bus_module, issue)
