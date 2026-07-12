@@ -1716,7 +1716,7 @@ def _huddle_meta(r, issue):
 _NO_HUDDLE_SESSION = object()
 
 
-def _set_driver(r, issue, driver, *, pen_to=None, pen_expect,
+def _set_driver(r, issue, driver, *, pen_to, pen_expect,
                 clear_challenge=False, expected_session=None,
                 driver_must_be_participant=False, challenge_expect=None):
     """Move the pen and rewrite the huddle's `driver`, in one transaction.
@@ -1731,12 +1731,13 @@ def _set_driver(r, issue, driver, *, pen_to=None, pen_expect,
     Not `_mutate_json`: that recreates a deleted key from `default` (resurrecting
     a closed huddle as a participant-less stub) and has no abort path.
 
-    `pen_expect` is required, not defaulted: every caller is moving the pen, and
-    the pen key is written in the SAME transaction as the metadata. That makes
-    the result load-bearing — a closed huddle or a pen that moved under the
-    caller aborts before `k_pen` changes, so no pen key is seeded on a huddle
-    that is already gone. There is no "rewrite the driver but ignore the pen"
-    mode; a caller that wants one has to say what it expects the pen to be.
+    `pen_to`/`pen_expect` are required, not defaulted: every caller is moving the
+    pen, and the pen key is written in the SAME transaction as the metadata. That
+    makes the result load-bearing — a closed huddle or a pen that moved under the
+    caller aborts before `k_pen` changes, so no pen key is seeded on a huddle that
+    is already gone. There is no "rewrite the driver but ignore the pen" mode; a
+    caller that wants one has to say what it expects the pen to be, and where it
+    is sending it. (Releasing the pen is `_release_pen_driver`, not this.)
 
     `expected_session` binds a stale caller to the exact huddle it read before
     any checkpoint/presence/race window. Issue numbers are reusable after
@@ -1771,26 +1772,22 @@ def _set_driver(r, issue, driver, *, pen_to=None, pen_expect,
                     return False
                 current_pen = pipe.get(pen_key)
                 current_chal = pipe.get(chal_key) if chal_key else None
+                # The move we were asked to make is ALREADY in place. Redis can lose
+                # an EXEC reply, so a retry of a transaction that landed must report
+                # success, not a phantom conflict — the mismatch below is then our own
+                # completed write, not a competing one.
+                already_done = (current_pen == pen_to
+                                and meta.get("driver") == driver
+                                and current_chal is None)
                 if challenge_expect is not None and current_chal != challenge_expect:
-                    already_done = (
-                        pen_to is not None and current_pen == pen_to
-                        and meta.get("driver") == driver
-                        and current_chal is None
-                    )
                     pipe.unwatch()
                     return already_done
                 if current_pen != pen_expect:
-                    already_done = (
-                        pen_to is not None and current_pen == pen_to
-                        and meta.get("driver") == driver
-                        and (not chal_key or current_chal is None)
-                    )
                     pipe.unwatch()
                     return already_done
                 meta["driver"] = driver
                 pipe.multi()
-                if pen_to is not None:
-                    pipe.set(pen_key, pen_to)
+                pipe.set(pen_key, pen_to)
                 pipe.set(key, json.dumps(meta))
                 if chal_key:
                     pipe.delete(chal_key)
