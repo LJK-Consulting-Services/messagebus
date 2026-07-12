@@ -426,3 +426,121 @@ def test_pen_take_force_aborts_when_challenge_refreshes_mid_take(
     assert fake_redis.get(bus_module.k_pen(79)) == "alice"
     assert json.loads(fake_redis.get(bus_module.k_penchal(79))) == fresh
     assert "changed while taking" in capsys.readouterr().err
+
+
+# ---- #106: a drain freeing the pen mid-take is not a refusal ------------------
+# `pen take` reads the pen holder, checks presence, then CASes on `pen_expect=driver`.
+# The drain it is racing can release the pen inside that window, so the CAS misses —
+# not because someone else won the pen, but because NOBODY holds it now. Refusing
+# there stalls the huddle for a round-trip, which is the exact stall #94 dropped the
+# grace window to avoid. An unheld pen is free.
+
+
+def test_pen_take_lands_when_the_drain_it_races_frees_the_pen_mid_take(
+    bus_module, fake_redis, ns, monkeypatch, capsys
+):
+    meta = huddle_meta(bus_module, driver="alice")
+    fake_redis.set(bus_module.k_huddle(79), json.dumps(meta))
+    fake_redis.set(bus_module.k_pen(79), "alice")
+
+    def alice_drains_in_the_window(_r, holder):
+        # alice's `bus drain` commits here: pen released, driver cleared (one CAS).
+        assert holder == "alice"
+        fake_redis.delete(bus_module.k_pen(79))
+        fake_redis.set(bus_module.k_huddle(79), json.dumps(dict(meta, driver="")))
+        return False  # ...and alice is gone
+
+    monkeypatch.setattr(bus_module, "_holder_present", alice_drains_in_the_window)
+
+    rc = bus_module.cmd_pen_take(fake_redis, ns(as_agent="bob", issue=79, reason="alice drained"))
+
+    assert rc == 0
+    assert fake_redis.get(bus_module.k_pen(79)) == "bob"
+    assert json.loads(fake_redis.get(bus_module.k_huddle(79)))["driver"] == "bob"
+    assert "took the unheld pen" in capsys.readouterr().out
+
+
+def test_pen_take_still_refuses_when_a_peer_holds_the_pen_by_the_time_it_cases(
+    bus_module, fake_redis, ns, monkeypatch, capsys
+):
+    # Guard on the #106 fall-through, NOT a regression test: it passes pre-fix too.
+    # The re-read must distinguish "pen is now UNHELD" (take it) from "pen is now
+    # held by SOMEONE ELSE" (back off) — never overwrite a peer who won the race.
+    meta = huddle_meta(bus_module, driver="alice")
+    meta["participants"] = ["alice", "bob", "carol"]
+    fake_redis.set(bus_module.k_huddle(79), json.dumps(meta))
+    fake_redis.set(bus_module.k_pen(79), "alice")
+
+    def carol_wins_the_pen_in_the_window(_r, holder):
+        assert holder == "alice"
+        fake_redis.set(bus_module.k_pen(79), "carol")
+        fake_redis.set(bus_module.k_huddle(79), json.dumps(dict(meta, driver="carol")))
+        return False
+
+    monkeypatch.setattr(bus_module, "_holder_present", carol_wins_the_pen_in_the_window)
+
+    rc = bus_module.cmd_pen_take(fake_redis, ns(as_agent="bob", issue=79, reason="race"))
+
+    assert rc == 1
+    assert fake_redis.get(bus_module.k_pen(79)) == "carol"  # carol is NOT overwritten
+    assert json.loads(fake_redis.get(bus_module.k_huddle(79)))["driver"] == "carol"
+    assert "changed while taking" in capsys.readouterr().err
+
+
+def test_pen_take_fallthrough_into_a_closed_huddle_creates_no_orphan_pen(
+    bus_module, fake_redis, ns, monkeypatch, capsys
+):
+    # Guard on the #106 fall-through, NOT a regression test: it passes pre-fix too.
+    # The fall-through must stay CAS-guarded: if the drain that freed the pen was
+    # followed by a `huddle close`, taking the "free" pen would seed a pen key for a
+    # huddle that no longer exists — and close is the only path that deletes k_pen,
+    # so that key would outlive every cleanup.
+    meta = huddle_meta(bus_module, driver="alice")
+    fake_redis.set(bus_module.k_huddle(79), json.dumps(meta))
+    fake_redis.set(bus_module.k_pen(79), "alice")
+
+    def drain_then_close_in_the_window(_r, holder):
+        assert holder == "alice"
+        fake_redis.delete(bus_module.k_pen(79))
+        fake_redis.delete(bus_module.k_huddle(79))
+        return False
+
+    monkeypatch.setattr(bus_module, "_holder_present", drain_then_close_in_the_window)
+
+    rc = bus_module.cmd_pen_take(fake_redis, ns(as_agent="bob", issue=79, reason="closed"))
+
+    assert rc == 1
+    assert fake_redis.get(bus_module.k_pen(79)) is None  # no orphan pen on a dead huddle
+    assert fake_redis.get(bus_module.k_huddle(79)) is None
+    assert "changed while taking" in capsys.readouterr().err
+
+
+def test_pen_take_fallthrough_does_not_take_the_pen_of_a_reopened_huddle(
+    bus_module, fake_redis, ns, monkeypatch, capsys
+):
+    # Guard on the #106 fall-through, NOT a regression test: it passes pre-fix too.
+    # Issue numbers are reusable, so "the pen on #79 is free" is only true of the
+    # huddle the caller actually read. A close+reopen inside the window leaves the
+    # pen genuinely unheld — the shape the fall-through takes — but in a DIFFERENT
+    # session, which the caller never joined and must not seize the pen in.
+    meta = huddle_meta(bus_module, driver="alice")
+    fake_redis.set(bus_module.k_huddle(79), json.dumps(meta))
+    fake_redis.set(bus_module.k_pen(79), "alice")
+    reopened = dict(meta, session="huddle:issue-79:reopened", driver="",
+                    participants=["carol"])
+
+    def drain_then_close_and_reopen(_r, holder):
+        assert holder == "alice"
+        fake_redis.delete(bus_module.k_pen(79))          # alice drains: pen is free...
+        fake_redis.set(bus_module.k_huddle(79),          # ...then #79 closes and reopens
+                       json.dumps(reopened))
+        return False
+
+    monkeypatch.setattr(bus_module, "_holder_present", drain_then_close_and_reopen)
+
+    rc = bus_module.cmd_pen_take(fake_redis, ns(as_agent="bob", issue=79, reason="stale"))
+
+    assert rc == 1
+    assert fake_redis.get(bus_module.k_pen(79)) is None  # bob does NOT drive the new huddle
+    assert json.loads(fake_redis.get(bus_module.k_huddle(79))) == reopened
+    assert "changed while taking" in capsys.readouterr().err

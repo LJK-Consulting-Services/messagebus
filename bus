@@ -1821,15 +1821,13 @@ def _huddle_meta(r, issue):
     return json.loads(raw) if raw else None
 
 
-_NO_PEN_EXPECT = object()
 _NO_HUDDLE_SESSION = object()
 
 
-def _set_driver(r, issue, driver, expect=None, pen_to=None,
-                pen_expect=_NO_PEN_EXPECT, clear_challenge=False,
-                expected_session=None, driver_must_be_participant=False,
-                challenge_expect=None):
-    """Rewrite ONLY the huddle's `driver` field, preserving every other field.
+def _set_driver(r, issue, driver, *, pen_to, pen_expect,
+                clear_challenge=False, expected_session=None,
+                driver_must_be_participant=False, challenge_expect=None):
+    """Move the pen and rewrite the huddle's `driver`, in one transaction.
 
     The metadata is one JSON blob, so a read-modify-SET of it is a lost-update
     race against `huddle join`, which grows `participants` under its own
@@ -1838,38 +1836,35 @@ def _set_driver(r, issue, driver, expect=None, pen_to=None,
     present and never signed off. Re-reading the whole dict inside the watched
     window is what keeps the join.
 
-    `expect` makes it a compare-and-set on the CURRENT driver, evaluated inside
-    the transaction — on a stale read, `drain` could otherwise clear a driver a
-    concurrent `pen take` had just installed.
-
     Not `_mutate_json`: that recreates a deleted key from `default` (resurrecting
     a closed huddle as a participant-less stub) and has no abort path.
 
-    When `pen_to`/`pen_expect` are supplied, the pen key is moved in the same
-    transaction as the metadata write. That makes the result load-bearing: a
-    closed huddle or moved pen aborts before `k_pen` changes.
+    `pen_to`/`pen_expect` are required, not defaulted: every caller is moving the
+    pen, and the pen key is written in the SAME transaction as the metadata. That
+    makes the result load-bearing — a closed huddle or a pen that moved under the
+    caller aborts before `k_pen` changes, so no pen key is seeded on a huddle that
+    is already gone. There is no "rewrite the driver but ignore the pen" mode; a
+    caller that wants one has to say what it expects the pen to be, and where it
+    is sending it. (Releasing the pen is `_release_pen_driver`, not this.)
 
     `expected_session` binds a stale caller to the exact huddle it read before
     any checkpoint/presence/race window. Issue numbers are reusable after
     close+reopen, so checking only the pen holder is not enough.
 
-    Returns True if the driver was written; False if the huddle is gone,
-    `expect` did not match, `expected_session` did not match, `driver` is not a
-    current participant, or `pen_expect` did not match. Corrupt metadata raises
-    (like `_huddle_meta`) rather than silently no-opping — a driver write we
-    can't complete must be loud. (`cmd_huddle_join` instead prints and returns 1
-    on corrupt metadata; here some callers discard the return value, so raising
-    is the only way the failure surfaces at all.)
+    Returns True if the move is in place — either because this call wrote it, or
+    because it was ALREADY exactly what was asked for (see `already_done` below).
+    False if the huddle is gone, or `expected_session` / `pen_expect` /
+    `challenge_expect` did not match, or `driver` is not a current participant.
+    Every caller acts on the result. Corrupt metadata raises (like `_huddle_meta`)
+    rather than silently no-opping — a driver write we can't complete must be loud.
     """
     key = k_huddle(issue)
-    pen_key = k_pen(issue) if pen_to is not None or pen_expect is not _NO_PEN_EXPECT else None
+    pen_key = k_pen(issue)
     chal_key = k_penchal(issue) if clear_challenge else None
     with r.pipeline() as pipe:
         while True:
             try:
-                watch_keys = [key]
-                if pen_key:
-                    watch_keys.append(pen_key)
+                watch_keys = [key, pen_key]
                 if chal_key:
                     watch_keys.append(chal_key)
                 pipe.watch(*watch_keys)
@@ -1881,34 +1876,27 @@ def _set_driver(r, issue, driver, expect=None, pen_to=None,
                 if expected_session is not None and huddle_meta_holder(meta, issue) != expected_session:
                     pipe.unwatch()
                     return False
-                if expect is not None and meta.get("driver") != expect:
-                    pipe.unwatch()
-                    return False
                 if driver_must_be_participant and driver not in meta.get("participants", []):
                     pipe.unwatch()
                     return False
-                current_pen = pipe.get(pen_key) if pen_key else None
+                current_pen = pipe.get(pen_key)
                 current_chal = pipe.get(chal_key) if chal_key else None
+                # The move we were asked to make is ALREADY in place. Redis can lose
+                # an EXEC reply, so a retry of a transaction that landed must report
+                # success, not a phantom conflict — the mismatch below is then our own
+                # completed write, not a competing one.
+                already_done = (current_pen == pen_to
+                                and meta.get("driver") == driver
+                                and current_chal is None)
                 if challenge_expect is not None and current_chal != challenge_expect:
-                    already_done = (
-                        pen_to is not None and current_pen == pen_to
-                        and meta.get("driver") == driver
-                        and current_chal is None
-                    )
                     pipe.unwatch()
                     return already_done
-                if pen_expect is not _NO_PEN_EXPECT and current_pen != pen_expect:
-                    already_done = (
-                        pen_to is not None and current_pen == pen_to
-                        and meta.get("driver") == driver
-                        and (not chal_key or current_chal is None)
-                    )
+                if current_pen != pen_expect:
                     pipe.unwatch()
                     return already_done
                 meta["driver"] = driver
                 pipe.multi()
-                if pen_to is not None:
-                    pipe.set(pen_key, pen_to)
+                pipe.set(pen_key, pen_to)
                 pipe.set(key, json.dumps(meta))
                 if chal_key:
                     pipe.delete(chal_key)
@@ -2660,6 +2648,28 @@ def cmd_pen_pass(r, args):
     return 0
 
 
+def _take_unheld_pen(r, args, issue, session):
+    """Take a pen nobody holds, and report. Returns an exit code.
+
+    An unheld pen has no incumbent to protect, so there is nothing for the
+    challenge protocol to mediate: it is simply free. Still CAS-guarded
+    (`pen_expect=None`), so a peer who grabs it first aborts this take instead of
+    being overwritten. Any challenge lingering against the vanished driver is
+    cleared with it — it named a holder who no longer exists.
+    """
+    if not _set_driver(r, issue, args.as_agent, pen_to=args.as_agent,
+                       pen_expect=None, clear_challenge=True,
+                       expected_session=session,
+                       driver_must_be_participant=True):
+        sys.stderr.write(f"bus pen take: huddle or pen changed while taking #{issue}; "
+                         "not moving the pen\n")
+        return 1
+    announce(r, args.room, args.as_agent,
+             f"took the unheld pen on #{issue}", topic=f"issue-{issue}")
+    print(f"{args.as_agent} took the unheld pen on #{issue}")
+    return 0
+
+
 def cmd_pen_take(r, args):
     """Challenge for the pen (dynamic lead). `--reason` is required evidence.
     If the current driver is ABSENT (no presence anywhere), take it over now at
@@ -2687,17 +2697,7 @@ def cmd_pen_take(r, args):
         # protect: an unheld pen is simply free. Without this, an unheld pen still
         # costs a challenger the full PEN_TAKE_GRACE and the huddle can't make a
         # single write until it expires.
-        if not _set_driver(r, issue, args.as_agent, pen_to=args.as_agent,
-                           pen_expect=None, clear_challenge=True,
-                           expected_session=session,
-                           driver_must_be_participant=True):
-            sys.stderr.write(f"bus pen take: huddle or pen changed while taking #{issue}; "
-                             "not moving the pen\n")
-            return 1
-        announce(r, args.room, args.as_agent,
-                 f"took the unheld pen on #{issue}", topic=f"issue-{issue}")
-        print(f"{args.as_agent} took the unheld pen on #{issue}")
-        return 0
+        return _take_unheld_pen(r, args, issue, session)
     raw = r.get(k_penchal(issue))
     driver_absent = not _holder_present(r, driver)
     # Operator decision (#94): a driver with NO presence anywhere is treated as
@@ -2714,6 +2714,16 @@ def cmd_pen_take(r, args):
                            expected_session=session,
                            driver_must_be_participant=True,
                            challenge_expect=raw):
+            # #106: `pen_expect=driver` can miss because the very drain we are
+            # racing has ALREADY released the pen — there is no holder at all now.
+            # That is not a refusal: an unheld pen is free, and this take was
+            # justified by the driver's absence, which the release only confirms.
+            # Without this the take failed on its first try and needed a manual
+            # retry, which is exactly the stall #94 removed the grace window to
+            # avoid. Re-read once: only a pen still HELD (a returning driver, or a
+            # faster peer) is a genuine reason to refuse.
+            if r.get(k_pen(issue)) is None:
+                return _take_unheld_pen(r, args, issue, session)
             sys.stderr.write(f"bus pen take: huddle or pen changed while taking #{issue}; "
                              "not moving the pen\n")
             return 1
