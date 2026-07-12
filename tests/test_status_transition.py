@@ -79,10 +79,10 @@ class StatusTransition(unittest.TestCase):
     def test_legal_next_set_is_nonempty_except_terminal(self):
         # mirrors how cmd_status builds its "Legal next:" hint
         for current in bus.STATUS_LABELS[:-1]:
-            legal = [l for l in bus.STATUS_LABELS if T(current, l) == "ok"]
+            legal = [lbl for lbl in bus.STATUS_LABELS if T(current, lbl) == "ok"]
             self.assertTrue(legal, f"{current} should have a legal forward move")
         # verified is terminal: no legal onward move
-        self.assertEqual([l for l in bus.STATUS_LABELS if T(VERIFIED, l) == "ok"], [])
+        self.assertEqual([lbl for lbl in bus.STATUS_LABELS if T(VERIFIED, lbl) == "ok"], [])
 
 
 class EffectiveStatus(unittest.TestCase):
