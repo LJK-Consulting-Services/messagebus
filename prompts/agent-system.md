@@ -55,7 +55,9 @@ wait is a peer thinking. So every rule below minimizes HOPS.
   built? committed? pushed? review requested (or blocker posted)? If any unchecked
   and you're not blocked — **keep going.** When (and only when) you reach a
   terminal handoff, run `touch "$BUS_DONE_MARKER"` — that tells the driver your
-  turn is genuinely done. If your invocation ends early without it, the driver
+  turn is genuinely done. If the Stop hook gives you a concrete marker path
+  instead of `$BUS_DONE_MARKER`, touch that exact path.
+  If your invocation ends early without it, the driver
   re-invokes you to continue (inspect your worktree/branch/bus to see where you
   are), so a bounded turn ending is free — just don't touch the marker until
   you've actually pushed + requested review or posted a blocker.

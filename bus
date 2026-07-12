@@ -49,10 +49,13 @@ import os
 import re
 import secrets
 import sys
+import time
 from datetime import datetime, timezone
 
 try:
     import redis
+    from redis.backoff import ExponentialBackoff
+    from redis.retry import Retry
 except ImportError:
     sys.stderr.write("bus: redis-py not installed. Run: pip install redis\n")
     sys.exit(2)
@@ -88,11 +91,75 @@ SOCKET_TIMEOUT = 5     # seconds; client-side read timeout (fail fast on dead Re
 # re-blocked in a loop; the chunk must stay safely under SOCKET_TIMEOUT.
 BLOCK_CHUNK_MS = 1000
 
+RETRY_ATTEMPTS = 3        # per-command retries inside one client (B3)
+HEALTH_CHECK_INTERVAL = 30  # seconds idle before redis-py PINGs a pooled connection
+
+# Backoff schedule for rebuilding a client after the server goes away entirely
+# (restart). Bounded on purpose: ~30s total, then the caller gives up loudly
+# rather than hanging a turn forever on a Redis that is never coming back.
+RECONNECT_BACKOFF = (1, 2, 4, 8, 15)
+
+# What "the connection is gone" looks like coming out of redis-py. A killed
+# server usually surfaces as ConnectionError, but a half-open socket can time out
+# first, and both mean the same thing to us: this client is dead, build a new one.
+# These are the redis-py exceptions, NOT the builtins — builtin ConnectionError is
+# an OSError and never matches what redis-py raises.
+REDIS_GONE = (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError)
+
 
 def connect(url):
-    r = redis.Redis.from_url(url, decode_responses=True, socket_timeout=SOCKET_TIMEOUT)
+    """Build a Redis client that survives a blip.
+
+    `retry` + `retry_on_error` make redis-py transparently re-dial and re-send a
+    command that died on a dropped/timed-out connection, so a transient blip no
+    longer takes an agent's whole turn down. `health_check_interval` PINGs a
+    connection that has sat idle, so a long-lived process discovers a stale
+    socket on its own terms instead of on the next real command.
+
+    `socket_timeout` stays at 5s: it is load-bearing for the chunked-block
+    invariant above (BLOCK_CHUNK_MS < SOCKET_TIMEOUT). Retries wrap the *chunk*,
+    they never lengthen a single blocking read.
+
+    Retrying makes writes at-least-once: if an `xadd` reaches the server but the
+    reply is lost, the retry appends a second copy. For a coordination log a rare
+    duplicate line is strictly better than a crashed agent, and the one write
+    where a duplicate would matter — the `SET NX` claim in cmd_claim — already
+    re-reads the holder when `NX` reports it lost, so a re-sent claim self-heals
+    into "you already hold this issue".
+    """
+    r = redis.Redis.from_url(
+        url, decode_responses=True, socket_timeout=SOCKET_TIMEOUT,
+        retry=Retry(ExponentialBackoff(), RETRY_ATTEMPTS),
+        retry_on_error=list(REDIS_GONE),
+        health_check_interval=HEALTH_CHECK_INTERVAL,
+    )
     r.ping()  # fail fast with a clear error if server is down
     return r
+
+
+def reconnect(url, sleep=time.sleep, deadline=None):
+    """Rebuild a client after the server itself went away (a restart, not a blip
+    — redis-py's own retry already covers the blip). Returns a live client, or
+    None once the backoff schedule (or the caller's deadline) is exhausted.
+
+    `deadline` is a time.monotonic() instant. A caller that promised a bounded
+    call — `bus wait --timeout N` — MUST pass it: without it this would happily
+    sleep the whole 30s schedule and blow straight through the caller's budget,
+    hanging every agent's turn on a Redis that is never coming back.
+
+    `sleep` is injectable so the retry path is testable without real waits."""
+    for delay in RECONNECT_BACKOFF:
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None      # budget spent; the caller's timeout wins
+            delay = min(delay, remaining)
+        sleep(delay)
+        try:
+            return connect(url)
+        except (redis.exceptions.RedisError, OSError):
+            continue  # server still down; keep backing off until the budget runs out
+    return None
 
 
 def touch_presence(r, room, agent):
@@ -253,13 +320,112 @@ SHUTDOWN = "__SHUTDOWN__"  # a message with this exact body means "stop"
 RC_DELIVERED = 0   # messages for the agent were printed
 RC_NONE = 10       # nothing addressed to the agent (empty poll / wait timeout)
 RC_SHUTDOWN = 11   # a delivered message was the shutdown sentinel
+RC_REDIS_DOWN = 3  # Redis unreachable (at startup, or a restart we couldn't ride out)
+
+
+# Version of the on-stream MESSAGE envelope (write side = make_fields, read side
+# = fields_to_msg). Bump ONLY on a breaking envelope change; readers tolerate a
+# missing field (legacy messages predate the stamp) by defaulting to 0. Distinct
+# from EVENT_SCHEMA_VERSION (#81), which versions the kind='event' body — the two
+# compose. See CHANGELOG.md.
+MESSAGE_SCHEMA_VERSION = 1
 
 
 def make_fields(frm, to, body, kind="msg", topic="", reply_to=""):
     """The single source of truth for the on-stream message schema (write side,
     mirror of fields_to_msg on the read side)."""
     return {"from": frm, "to": to, "topic": topic,
-            "reply_to": reply_to, "kind": kind, "body": body}
+            "reply_to": reply_to, "kind": kind, "body": body,
+            "schema_version": MESSAGE_SCHEMA_VERSION}
+
+
+# ---- structured observability (B6, #81) ------------------------------------
+# A machine-readable event layer that rides the existing room stream alongside
+# the human announce() line. An event is a kind='event' message whose body is a
+# compact JSON envelope. EVENT_SCHEMA_VERSION versions THIS envelope and is
+# deliberately independent of the message-envelope schema_version (#80) — the
+# two compose. Events ride the room stream as kind='event' messages the same way
+# announce() emits kind='system'; `bus events` is the structured, queryable view.
+EVENT_SCHEMA_VERSION = 1
+
+# Stable event type names — the only values allowed in the envelope's "event"
+# field. Add a new type here (and its emit site) when a reliability fix wants to
+# surface a structured signal. Only EV_DONEGATE_BLOCK is wired on `dev` today.
+EV_DONEGATE_BLOCK = "donegate_block"
+EV_RECONNECT = "reconnect"                    # B3: agent survived a Redis restart
+EV_RETENTION_BLOCKED = "retention_blocked"    # B3: trim refused, unread would drop
+EV_RETENTION_FORCED = "retention_forced"      # B3: --force dropped unread messages
+EV_DRAIN = "drain"                            # B3: agent handed back state on exit
+# B3 note: B6 (#81) also pencilled in an EV_PERSISTENCE_MODE event. Deliberately
+#   NOT added: persistence is a property of the server, not of anything that
+#   happens on the bus, so there is no event-shaped moment to emit it at — a
+#   periodic emitter would just be a metric pretending to be an event. `bus
+#   doctor` reports the mode instead (see redis_persistence).
+# B6-TODO(#81): B2 (#82) adds EV_LEASE_REJECT + EV_POSTPUSH_MISMATCH here and
+#   emits them from _leased_push on force-with-lease rejection / ls-remote drift.
+# B6-TODO(#81): B4 adds EV_SELFCONTINUE_BUDGET_EXHAUSTED.
+EVENT_TYPES = {EV_DONEGATE_BLOCK, EV_RECONNECT, EV_RETENTION_BLOCKED,
+               EV_RETENTION_FORCED, EV_DRAIN}
+
+# Identity stamped on events emitted by operator/system commands that have no
+# --as agent of their own (retention). Not an agent id: nothing polls as "bus".
+SYSTEM_AGENT = "bus"
+
+_EVENT_VALUE_MAX = 200
+# Anything URL/URI-shaped is treated as potentially sensitive (tokens ride in
+# query strings, presigned URLs, etc.) and dropped — events carry only scalars.
+_EVENT_REDACT_RE = re.compile(r"://")
+_EVENT_REDACTED = "<redacted>"
+
+
+def redact_event_fields(fields):
+    """Backstop for the event payload: events are meant to carry only
+    non-sensitive scalars (agent ids, issue numbers, short shas, counts,
+    booleans). Callers should pass an allowlisted dict; this coerces each value
+    to a safe scalar and replaces anything non-scalar, over-long, or URL-shaped
+    with '<redacted>' so a careless caller can't leak a secret/URL/token or dump
+    a raw exception onto the bus."""
+    safe = {}
+    for k, v in fields.items():
+        if v is None or isinstance(v, int):  # bool is an int subclass
+            safe[k] = v
+        elif isinstance(v, str):
+            safe[k] = _EVENT_REDACTED if (
+                len(v) > _EVENT_VALUE_MAX or _EVENT_REDACT_RE.search(v)) else v
+        else:
+            safe[k] = _EVENT_REDACTED
+    return safe
+
+
+def announce_event(r, room, frm, event, fields, topic=""):
+    """Emit a structured event onto the room stream. `event` must be a known
+    EVENT_TYPES member; `fields` is an allowlisted scalar map (passed through
+    redact_event_fields as defence-in-depth). The event lives in a kind='event'
+    message body as a JSON envelope — it broadcasts like a kind='system'
+    announce() (so it shows in poll/tail) and `bus events` is the structured,
+    type-filterable view of the same records."""
+    if event not in EVENT_TYPES:
+        raise ValueError(f"unknown event type {event!r}")
+    payload = {"schema_version": EVENT_SCHEMA_VERSION, "event": event,
+               "fields": redact_event_fields(fields)}
+    r.xadd(k_stream(room),
+           make_fields(frm, "all", json.dumps(payload, ensure_ascii=False),
+                       kind="event", topic=topic))
+
+
+def parse_event(msg):
+    """Decode a kind='event' message body into its event envelope dict, or None
+    if the message isn't a well-formed event (wrong kind / bad JSON / missing
+    the required "event" field)."""
+    if msg.get("kind") != "event":
+        return None
+    try:
+        payload = json.loads(msg["body"])
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict) or "event" not in payload:
+        return None
+    return payload
 
 
 def read_result_code(delivered):
@@ -307,6 +473,8 @@ def fields_to_msg(msg_id, fields):
         "reply_to": fields.get("reply_to", ""),
         "kind": fields.get("kind", "msg"),
         "body": fields.get("body", ""),
+        # Legacy messages predate the stamp → treat a missing field as version 0.
+        "schema_version": int(fields.get("schema_version", 0)),
     }
 
 
@@ -396,10 +564,33 @@ def cmd_wait(r, args):
     We advance the cursor past every message we see (even ones not for us),
     then keep blocking on the remaining time budget so unrelated traffic
     doesn't make us return empty.
+
+    Survives a Redis restart: a dropped connection rebuilds the client and
+    re-blocks from the SAME cursor (which lives in Redis, so it is exactly where
+    we left off, and AOF carries it across the restart). Reconnect time is charged
+    against the caller's budget AND capped by it, so `--timeout` still bounds the
+    call even when Redis never comes back.
     """
-    import time
     touch_presence(r, args.room, args.as_agent)
     deadline = time.monotonic() + args.timeout
+
+    def revive():
+        """Rebuild the client after the server went away. Returns False when it
+        is not coming back inside our budget."""
+        nonlocal r
+        fresh = reconnect(args.url, deadline=deadline)
+        if fresh is None:
+            sys.stderr.write("bus wait: lost Redis and could not reconnect\n")
+            return False
+        r = fresh
+        # Presence expired while we were disconnected; re-register, then say so on
+        # the stream. Both are writes, so they can only run AFTER the reconnect
+        # succeeded — never announce a reconnect to a dead Redis.
+        touch_presence(r, args.room, args.as_agent)
+        announce_event(r, args.room, args.as_agent, EV_RECONNECT,
+                       {"agent": args.as_agent, "room": args.room, "cmd": "wait"})
+        return True
+
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -410,12 +601,30 @@ def cmd_wait(r, args):
         # the client socket read timeout and crash). Floor at 1ms; XREAD BLOCK 0
         # would block forever. The outer loop re-blocks on the remaining budget.
         block_ms = max(1, min(BLOCK_CHUNK_MS, int(remaining * 1000)))
-        delivered, last_seen = read_from_cursor(
-            r, args.room, args.as_agent, block_ms=block_ms,
-            topic=args.topic, reply_to=args.reply_to
-        )
+        try:
+            delivered, last_seen = read_from_cursor(
+                r, args.room, args.as_agent, block_ms=block_ms,
+                topic=args.topic, reply_to=args.reply_to
+            )
+        except REDIS_GONE:
+            if not revive():
+                return RC_REDIS_DOWN
+            continue  # nothing was read; re-block from the same (unmoved) cursor
+        # The messages are in hand. Advancing the cursor is a SEPARATE failure:
+        # it must never be able to discard them. If the server dies on this write
+        # we still deliver — a message re-read on the next turn is at-least-once
+        # (which this bus already is, see connect()), but a swallowed __SHUTDOWN__
+        # would be unrecoverable, and that is exactly what dropping `delivered`
+        # here would do.
         if last_seen:
-            r.set(k_cursor(args.room, args.as_agent), last_seen)
+            try:
+                r.set(k_cursor(args.room, args.as_agent), last_seen)
+            except REDIS_GONE:
+                if not delivered:
+                    if not revive():
+                        return RC_REDIS_DOWN
+                    continue
+                # else: fall through and deliver what we already read.
         if delivered:
             for m in delivered:
                 emit(m, args.json)
@@ -457,6 +666,47 @@ def cmd_history(r, args):
     entries = r.xrange(k_stream(args.room), count=args.n)
     for msg_id, fields in entries:
         emit(fields_to_msg(msg_id, fields), args.json)
+    return 0
+
+
+EVENT_SCAN_CAP = 2000  # how far `bus events` scans back to find matching events
+
+
+def cmd_events(r, args):
+    """List recent structured events (kind='event') on the room stream, oldest
+    -first, optionally filtered to a single --type. Human table by default; one
+    JSON object per line with --json. Scans back a bounded window so a filtered
+    view shows real matches, not "last n raw then filtered to maybe zero"."""
+    if args.type and args.type not in EVENT_TYPES:
+        sys.stderr.write(f"bus events: unknown --type {args.type!r}; "
+                         f"known: {', '.join(sorted(EVENT_TYPES))}\n")
+        return 1
+    window = r.xrevrange(k_stream(args.room), count=EVENT_SCAN_CAP)  # newest-first
+    rows = []
+    for mid, fields in window:
+        if fields.get("kind") != "event":  # cheap skip before building the msg dict
+            continue
+        msg = fields_to_msg(mid, fields)
+        payload = parse_event(msg)
+        if payload is None:
+            continue
+        if args.type and payload.get("event") != args.type:
+            continue
+        rows.append((mid, msg, payload))
+        if len(rows) >= args.n:
+            break
+    for mid, msg, payload in reversed(rows):  # oldest-first
+        if args.json:
+            # Explicit stream fields last so the authoritative id/from/topic win
+            # over any id/from/topic a raw event body might carry.
+            print(json.dumps({**payload, "id": mid, "from": msg["from"],
+                              "topic": msg["topic"]}, ensure_ascii=False))
+        else:
+            flat = " ".join(f"{terminal_line(k)}={terminal_line(v)}"
+                            for k, v in payload.get("fields", {}).items())
+            print(f"{terminal_line(mid)}  {terminal_line(msg['from'])}  "
+                  f"{terminal_line(payload.get('event', '?'))}"
+                  f"{'  ' + flat if flat else ''}")
     return 0
 
 
@@ -539,37 +789,97 @@ def cursor_has_unread_before(r, stream, cursor, boundary):
     return bool(r.xrange(stream, f"({cursor}", f"({boundary}", count=1))
 
 
+def safe_trim_room(r, room, keep, force=False, dry_run=False):
+    """Cursor-aware retention for ONE room. The single trim path — `bus prune`
+    and any scheduled retention job both go through here, so neither can invent
+    its own (unsafe) bound.
+
+    Returns a result dict: {room, keep, total, boundary, behind, blocked,
+    trimmed, removed, remaining}, where `behind` is [{agent, cursor}] for every
+    agent whose cursor still has unread messages below the keep-window boundary,
+    and `blocked` means the trim was refused to protect them.
+
+    Why never `XADD MAXLEN` / `XTRIM MAXLEN`: a maxlen trim drops the oldest N
+    entries by count, with no idea where anyone's cursor is — it silently deletes
+    messages a lagging agent has not read. This trims by MINID at a boundary
+    already checked against every cursor. If a writer appends between the scan
+    and the trim, MINID may keep MORE than `keep`, but it can never move the
+    deletion boundary forward onto unread messages we did not check.
+
+    Emitting the retention events lives HERE, with the trim, not in `cmd_prune`:
+    the whole point of the seam is that a second caller (a scheduled retention
+    job) cannot trim — or refuse to trim — without leaving the same audit trail.
+
+    `dry_run` computes the identical decision and reports it, writing nothing at
+    all: no trim, and no event either.
+    """
+    stream = k_stream(room)
+    total = r.xlen(stream)
+    result = {"room": room, "keep": keep, "total": total, "boundary": None,
+              "behind": [], "blocked": False, "trimmed": False,
+              "removed": 0, "remaining": total}
+    if total <= keep:
+        return result
+    boundary = r.xrevrange(stream, count=keep)[-1][0]  # oldest id we'd keep
+    result["boundary"] = boundary
+    for key in r.scan_iter(match=k_cursor(room, "*")):
+        cval = r.get(key)
+        if cval and cursor_has_unread_before(r, stream, cval, boundary):
+            result["behind"].append({"agent": key.rsplit(":", 1)[-1], "cursor": cval})
+    result["behind"].sort(key=lambda b: b["agent"])
+    behind = result["behind"]
+    result["blocked"] = bool(behind) and not force
+    if dry_run:
+        return result
+    # Payloads are counts and ids only — an agent id is charset-checked (`ident`)
+    # and a cursor/boundary is a stream id, so neither can smuggle free text onto
+    # the stream.
+    if result["blocked"]:
+        announce_event(r, room, SYSTEM_AGENT, EV_RETENTION_BLOCKED,
+                       {"room": room, "keep": keep, "total": total,
+                        "boundary": boundary, "behind": len(behind)})
+        return result
+    result["removed"] = xtrim_minid(r, stream, boundary)
+    result["remaining"] = r.xlen(stream)
+    result["trimmed"] = True
+    if behind:  # --force: we dropped messages someone had not read
+        # Emitted AFTER the trim, or the trim would delete the very event that
+        # records it.
+        announce_event(r, room, SYSTEM_AGENT, EV_RETENTION_FORCED,
+                       {"room": room, "keep": keep, "removed": result["removed"],
+                        "boundary": boundary, "behind": len(behind)})
+    return result
+
+
 def cmd_prune(r, args):
     """Trim a room's stream to the newest --keep messages. DESTRUCTIVE. Refuses
     if any agent's cursor is behind the keep-window (would drop unread), unless
-    --force. Never auto-runs; operator-invoked only."""
-    stream = k_stream(args.room)
-    total = r.xlen(stream)
-    if total <= args.keep:
-        print(f"room {args.room}: {total} messages <= keep {args.keep}; nothing to trim")
-        return 0
-    boundary = r.xrevrange(stream, count=args.keep)[-1][0]  # oldest id we'd keep
-    behind = []
-    for key in r.scan_iter(match=k_cursor(args.room, "*")):
-        cval = r.get(key)
-        if cval and cursor_has_unread_before(r, stream, cval, boundary):
-            behind.append((key.rsplit(":", 1)[-1], cval))
-    if behind and not args.force:
-        who = ", ".join(f"{terminal_line(a)}@{terminal_line(c)}" for a, c in behind)
+    --force. Never auto-runs; operator-invoked only. Presentation only — the
+    retention decision, the trim and its events all belong to safe_trim_room."""
+    res = safe_trim_room(r, args.room, args.keep, force=args.force,
+                         dry_run=args.dry_run)
+    behind = res["behind"]
+    if args.json:
+        print(json.dumps({**res, "dry_run": args.dry_run}))
+    elif res["boundary"] is None:
+        print(f"room {args.room}: {res['total']} messages <= keep {args.keep}; nothing to trim")
+    elif res["blocked"]:
+        who = ", ".join(f"{terminal_line(b['agent'])}@{terminal_line(b['cursor'])}"
+                        for b in behind)
         sys.stderr.write(
             f"bus prune: REFUSING — {len(behind)} agent cursor(s) behind the keep-window "
-            f"boundary {terminal_line(boundary)}; trimming would drop unread messages ({who}). "
+            f"boundary {terminal_line(res['boundary'])}; trimming would drop unread messages ({who}). "
             f"Re-run with --force to override.\n")
-        return 1
-    if behind:
-        sys.stderr.write(f"bus prune: --force: dropping unread for {len(behind)} lagging agent(s)\n")
-    # Trim by the checked boundary, not by MAXLEN. If a writer appends between
-    # the cursor scan and trim, MINID may keep more than --keep, but it cannot
-    # move the deletion boundary forward and drop unread messages we did not
-    # check.
-    removed = xtrim_minid(r, stream, boundary)
-    print(f"pruned room {args.room}: removed {removed}, kept {r.xlen(stream)} (was {total})")
-    return 0
+    elif args.dry_run:
+        print(f"room {args.room}: would trim below {res['boundary']} "
+              f"(total {res['total']}, keep {args.keep}); no cursor is behind")
+    else:
+        print(f"pruned room {args.room}: removed {res['removed']}, "
+              f"kept {res['remaining']} (was {res['total']})")
+        if behind:
+            sys.stderr.write(f"bus prune: --force: dropped unread for "
+                             f"{len(behind)} lagging agent(s)\n")
+    return 1 if res["blocked"] else 0
 
 
 def _is_huddle_lock(holder):
@@ -600,7 +910,9 @@ def stale_lock_info(r, issue, present_set=None):
     return holder, r.ttl(k_lock(issue))
 
 
-def compare_delete_lock(r, issue, holder):
+def compare_delete(r, key, value):
+    """Atomically DEL `key`, but only while it still holds `value`. Deleting a
+    token someone else now owns is the whole failure mode this prevents."""
     return r.eval(
         """
         if redis.call('GET', KEYS[1]) == ARGV[1] then
@@ -608,20 +920,39 @@ def compare_delete_lock(r, issue, holder):
         end
         return 0
         """,
-        1, k_lock(issue), holder,
+        1, key, value,
     )
 
 
-def compare_set_huddle_meta(r, issue, holder, meta_json):
-    return r.eval(
-        """
+def compare_delete_lock(r, issue, holder):
+    return compare_delete(r, k_lock(issue), holder)
+
+
+def compare_set_huddle_meta(r, issue, holder, meta_json, pen_holder=None):
+    keys = [k_lock(issue), k_huddle(issue)]
+    argv = [holder, meta_json]
+    script = """
         if redis.call('GET', KEYS[1]) == ARGV[1] then
             redis.call('SET', KEYS[2], ARGV[2])
             return 1
         end
         return 0
-        """,
-        2, k_lock(issue), k_huddle(issue), holder, meta_json,
+        """
+    if pen_holder is not None:
+        keys.extend([k_pen(issue), k_penchal(issue)])
+        argv.append(pen_holder)
+        script = """
+        if redis.call('GET', KEYS[1]) == ARGV[1] then
+            redis.call('SET', KEYS[2], ARGV[2])
+            redis.call('SET', KEYS[3], ARGV[3])
+            redis.call('DEL', KEYS[4])
+            return 1
+        end
+        return 0
+        """
+    return r.eval(
+        script,
+        len(keys), *keys, *argv,
     )
 
 
@@ -669,6 +1000,117 @@ def cmd_reap(r, args):
             sys.stderr.write(f"bus reap --release {target}: lock changed while releasing — refusing\n")
             return 1
         print(f"released stale lock on #{target} (was {terminal_line(holder)})")
+    return 0
+
+
+def _issue_sort(issue):
+    return int(issue) if str(issue).isdigit() else 0
+
+
+def _held_by(r, pattern, agent):
+    """Issue numbers whose key under `pattern` is currently owned by `agent`.
+    One MGET for the whole match, as cmd_agents does — not a GET per key."""
+    keys = list(r.scan_iter(match=pattern))
+    vals = r.mget(keys) if keys else []  # MGET of an empty list is an error
+    held = [k.rsplit(":", 1)[-1] for k, v in zip(keys, vals) if v == agent]
+    held.sort(key=_issue_sort)
+    return held
+
+
+def _unpushed_pen_issues(r, agent, issues):
+    """Of `issues`, the ones whose registered worktree still holds commits that
+    have reached no remote — work the next driver would not inherit."""
+    risky = []
+    for issue in issues:
+        meta = _ws_meta(r, issue, agent)
+        # No registered worktree (or it's already gone) means there is no local
+        # work to strand. worktree_unpushed fails closed on an unreadable repo,
+        # so the isdir check keeps a removed worktree from wedging drain forever.
+        if not meta or not os.path.isdir(meta["path"]):
+            continue
+        if worktree_unpushed(meta["path"], meta["base_commit"]):
+            risky.append(issue)
+    return risky
+
+
+def cmd_drain(r, args):
+    """Graceful shutdown: hand back the volatile state this agent holds so peers
+    aren't left waiting on a process that is leaving.
+
+    Releases the write pen on every huddle this agent drives (CAS, so a pen that
+    has already moved on is never stolen) and clears the agent's presence keys.
+    A released pen is unheld, and `pen take` grabs an unheld pen immediately, so
+    peers resume at once instead of waiting out PEN_TAKE_GRACE. The huddle's
+    `driver` metadata is cleared with the pen — leaving it set would make
+    `huddle status` name a driver that `pen status` says does not exist.
+
+    Deliberately NOT done:
+      * closing the huddle — a unilateral close would drive straight through the
+        done-gate while other participants are still live and still signing off;
+      * releasing claim locks — a claim is durable work state, mirrored on the gh
+        issue; dropping it silently invites a second agent to re-claim
+        half-finished work. Held claims are reported, not touched.
+
+    Clearing presence is what lets `bus reap` see this agent's claim locks as
+    stale — but note it ALSO drops the agent out of the done-gate's
+    present-participant check, so a huddle can then close without its sign-off.
+    That is why an EV_DRAIN event is always emitted, even when no pen moved: a
+    drain must never be a silent way to disappear from a gate.
+
+    Fail-closed: refuses while a pen we hold has committed-but-unpushed work,
+    because the next driver would build on a tip that is missing it.
+    """
+    agent = args.as_agent
+    pens = _held_by(r, "bus:pen:issue:*", agent)
+    locks = _held_by(r, "bus:lock:issue:*", agent)
+    pen_sessions = {}
+    for issue in pens:
+        meta = _huddle_meta(r, issue)
+        pen_sessions[issue] = huddle_meta_holder(meta, issue) if meta else _NO_HUDDLE_SESSION
+    risky = _unpushed_pen_issues(r, agent, pens)
+    if risky and not args.force:
+        sys.stderr.write(
+            f"bus drain: REFUSING — you hold the pen on "
+            f"{', '.join('#' + terminal_line(i) for i in risky)} with committed-but-unpushed "
+            f"work. Run `bus pen checkpoint --as {agent} --issue <N>` first, or --force to "
+            f"drop the pen and strand it.\n")
+        return 1
+    released = []
+    for issue in pens:
+        if _release_pen_driver(r, issue, agent, pen_sessions[issue]):
+            released.append(issue)
+    for issue in released:
+        announce(r, args.room, agent,
+                 f"draining on shutdown: released the write pen on #{issue} "
+                 f"(unheld — any participant may `pen take` it now)",
+                 topic=f"issue-{issue}")
+        # Scalars only: an issue number and booleans. Nothing free-text.
+        announce_event(r, args.room, agent, EV_DRAIN,
+                       {"agent": agent, "issue": _issue_sort(issue),
+                        "pen_released": True, "unpushed": issue in risky},
+                       topic=f"issue-{issue}")
+    # A drain with no pen to release still leaves the gate: dropping presence is
+    # what removes us from the done-gate's present-participant check. Emit the
+    # departure itself so that is never silent (the per-pen events above already
+    # cover the pens; this is the one that fires regardless).
+    announce_event(r, args.room, agent, EV_DRAIN,
+                   {"agent": agent, "pens_released": len(released),
+                    "claims_held": len(locks), "presence_cleared": True})
+    # Presence last: while we still hold it, the announces above are attributable
+    # to a live agent. Agent ids and room names are charset-checked, so neither
+    # can smuggle a glob into this match. DEL is variadic and returns the count,
+    # so every room clears in one round-trip.
+    stale = list(r.scan_iter(match=f"bus:presence:*:{agent}"))
+    cleared = r.delete(*stale) if stale else 0
+    if args.json:
+        print(json.dumps({"agent": agent, "pens_released": released,
+                          "presence_cleared": cleared, "claims_held": locks,
+                          "unpushed": risky}))
+        return 0
+    print(f"{agent} drained: released {len(released)} pen(s), cleared {cleared} presence key(s)")
+    if locks:
+        print("  claims still held (durable — release explicitly, or let `bus reap` see them "
+              f"stale now that presence is gone): {', '.join('#' + terminal_line(i) for i in locks)}")
     return 0
 
 
@@ -738,6 +1180,13 @@ def cmd_watch(r, args):
     so watching a room doesn't perturb the agents working in it. Shows the last
     -n messages for context, then blocks for new ones until Ctrl-C. With
     --topic, only messages with that topic are shown (context and live).
+
+    Survives a Redis restart by rebuilding the client and re-blocking from the
+    same `last` id. That id is local (watch has no persisted cursor), so it MUST
+    be carried across the reconnect — resetting to "$" would silently swallow
+    every message published while the server was down. Reconnects are reported on
+    stderr, never as an EV_RECONNECT event: an observer that wrote to the stream
+    would no longer be an observer.
     """
     topic = args.topic
     last = "$"  # "$" = only messages added after we start blocking
@@ -745,12 +1194,30 @@ def cmd_watch(r, args):
         newest = emit_recent(r, args.room, args.n, args.json, topic=topic)
         if newest:
             last = newest  # continue strictly after the newest RAW message
+    if last == "$":
+        # Pin "$" to a concrete id before we ever block. "$" is re-resolved by
+        # whatever client evaluates it, so carrying it across a reconnect would
+        # silently skip everything published during the outage (`-n 0`, or an
+        # empty room at start-up, are the ways to get here). An empty stream has
+        # no id to pin to — and nothing to miss either, since a server that is
+        # down accepts no writes.
+        newest_raw = r.xrevrange(k_stream(args.room), count=1)
+        if newest_raw:
+            last = newest_raw[0][0]
     sys.stdout.flush()
     try:
         while True:
             # block in chunks under SOCKET_TIMEOUT (block=0 would block forever
             # and trip the client socket read timeout); loop on empty returns.
-            resp = r.xread({k_stream(args.room): last}, block=BLOCK_CHUNK_MS)
+            try:
+                resp = r.xread({k_stream(args.room): last}, block=BLOCK_CHUNK_MS)
+            except REDIS_GONE:
+                r = reconnect(args.url)
+                if r is None:
+                    sys.stderr.write("bus watch: lost Redis and could not reconnect\n")
+                    return RC_REDIS_DOWN
+                sys.stderr.write(f"bus watch: reconnected to Redis; resuming after {last}\n")
+                continue
             if not resp:
                 continue
             _, entries = resp[0]
@@ -827,21 +1294,38 @@ def cmd_claim(r, args):
                 f"resolve manually (bus release/status) before reclaiming\n")
             return 1
     won = r.set(lock, args.as_agent, nx=True, ex=args.ttl)
+    # `not won` does NOT mean "somebody else has it" — it can also mean WE have it.
+    # Connection retries (see connect()) re-send a SET NX whose reply was lost, and
+    # the re-send then finds the key its own first attempt created, reporting a loss
+    # for the attempt that actually won. So the invocation that truly claimed the
+    # issue can land here. Returning early on that path would skip the worktree, the
+    # gh label and the announce — leaving an agent holding a claim with no worktree,
+    # working the coordinator's main tree, which is exactly what the rollback below
+    # exists to prevent. Everything after this is idempotent, so re-running it is
+    # both safe and the fix: a re-sent claim, or an operator re-running `bus claim`,
+    # converges on the fully set-up state instead of a half-claimed one.
+    held_already = False
     if not won:
         holder = r.get(lock)
-        if holder == args.as_agent:
-            print(f"you ({args.as_agent}) already hold issue #{args.issue}")
-            return 0
-        sys.stderr.write(f"issue #{args.issue} already claimed by {holder}\n")
-        return 1
+        if holder != args.as_agent:
+            sys.stderr.write(f"issue #{args.issue} already claimed by {holder}\n")
+            return 1
+        held_already = True
+        print(f"you ({args.as_agent}) already hold issue #{args.issue}; ensuring setup")
     # If --worktree, set up isolation BEFORE writing the gh label, so a failure
     # rolls the claim back cleanly — an agent must never hold a claim with no
     # worktree and then silently work the coordinator's main tree.
     if getattr(args, "worktree", False):
         rc, path = ws_create(r, args.room, args.as_agent, args.issue, base=args.base)
         if rc != 0:
-            r.delete(lock)
-            sys.stderr.write(f"bus claim: worktree setup failed; rolled back the claim on #{args.issue}\n")
+            if held_already:
+                # The lock predates this invocation — rolling it back would drop a
+                # claim we did not create here (and possibly abandon real work).
+                sys.stderr.write(f"bus claim: worktree setup failed on #{args.issue}; "
+                                 f"keeping the claim you already held\n")
+            else:
+                r.delete(lock)
+                sys.stderr.write(f"bus claim: worktree setup failed; rolled back the claim on #{args.issue}\n")
             return 1
     # We won the lock. Reflect to gh + announce. If gh fails, keep the lock
     # (the announce still tells others), but surface the error.
@@ -929,16 +1413,47 @@ def cmd_init(args):
     return 0
 
 
+def redis_persistence(r):
+    """How this Redis would survive a restart: 'aof', 'rdb', or 'none'.
+
+    AOF is what the bus needs — claim locks, the write pen and huddle metadata
+    are all live coordination state, and an RDB snapshot loses everything since
+    the last save point. Returns None when the mode can't be read (a managed
+    Redis may disable CONFIG entirely), which is 'unknown', never 'broken'."""
+    try:
+        cfg = r.config_get("appendonly", "save")
+    except Exception:  # noqa: BLE001 - an unreadable mode is a diagnostic gap, not a fault
+        return None
+    if not isinstance(cfg, dict):
+        return None
+    if cfg.get("appendonly") == "yes":
+        return "aof"
+    return "rdb" if (cfg.get("save") or "").strip() else "none"
+
+
 def cmd_doctor(r_url):
     ok = True
-    # Redis
+    # Redis. The connect probe and the persistence probe are reported separately
+    # on purpose: a server that is UP but won't answer CONFIG is a healthy bus
+    # with an unknown durability mode, and must never be printed as "redis: FAIL".
     try:
         r = connect(r_url)
-        print(f"redis: OK ({r_url})")
     except Exception as e:  # noqa: BLE001
         print(f"redis: FAIL ({r_url}) -> {e}")
         print("  start it: ./scripts/start-redis.sh   (or: brew services start redis)")
         ok = False
+    else:
+        print(f"redis: OK ({r_url})")
+        mode = redis_persistence(r)
+        if mode == "aof":
+            print("redis persistence: OK (appendonly)")
+        elif mode is None:
+            print("redis persistence: unknown (could not read CONFIG)")
+        else:
+            # Not a hard failure — a scratch bus is fine volatile — but the pen,
+            # the claim locks and huddle metadata all die with the server.
+            print(f"redis persistence: WARN ({mode}) — a restart drops claims/pen/huddle state")
+            print("  fix: ./scripts/start-redis.sh   (enables appendonly)")
     # gh
     rc, out, err = gh(["auth", "status"], check=False)
     if rc == 0:
@@ -1198,6 +1713,250 @@ def _huddle_meta(r, issue):
     return json.loads(raw) if raw else None
 
 
+_NO_PEN_EXPECT = object()
+_NO_HUDDLE_SESSION = object()
+
+
+def _set_driver(r, issue, driver, expect=None, pen_to=None,
+                pen_expect=_NO_PEN_EXPECT, clear_challenge=False,
+                expected_session=None, driver_must_be_participant=False,
+                challenge_expect=None):
+    """Rewrite ONLY the huddle's `driver` field, preserving every other field.
+
+    The metadata is one JSON blob, so a read-modify-SET of it is a lost-update
+    race against `huddle join`, which grows `participants` under its own
+    WATCH/MULTI: a join committing between the read and the SET is silently
+    erased, and the done-gate then closes the huddle with that participant
+    present and never signed off. Re-reading the whole dict inside the watched
+    window is what keeps the join.
+
+    `expect` makes it a compare-and-set on the CURRENT driver, evaluated inside
+    the transaction — on a stale read, `drain` could otherwise clear a driver a
+    concurrent `pen take` had just installed.
+
+    Not `_mutate_json`: that recreates a deleted key from `default` (resurrecting
+    a closed huddle as a participant-less stub) and has no abort path.
+
+    When `pen_to`/`pen_expect` are supplied, the pen key is moved in the same
+    transaction as the metadata write. That makes the result load-bearing: a
+    closed huddle or moved pen aborts before `k_pen` changes.
+
+    `expected_session` binds a stale caller to the exact huddle it read before
+    any checkpoint/presence/race window. Issue numbers are reusable after
+    close+reopen, so checking only the pen holder is not enough.
+
+    Returns True if the driver was written; False if the huddle is gone,
+    `expect` did not match, `expected_session` did not match, `driver` is not a
+    current participant, or `pen_expect` did not match. Corrupt metadata raises
+    (like `_huddle_meta`) rather than silently no-opping — a driver write we
+    can't complete must be loud. (`cmd_huddle_join` instead prints and returns 1
+    on corrupt metadata; here some callers discard the return value, so raising
+    is the only way the failure surfaces at all.)
+    """
+    key = k_huddle(issue)
+    pen_key = k_pen(issue) if pen_to is not None or pen_expect is not _NO_PEN_EXPECT else None
+    chal_key = k_penchal(issue) if clear_challenge else None
+    with r.pipeline() as pipe:
+        while True:
+            try:
+                watch_keys = [key]
+                if pen_key:
+                    watch_keys.append(pen_key)
+                if chal_key:
+                    watch_keys.append(chal_key)
+                pipe.watch(*watch_keys)
+                raw = pipe.get(key)
+                if not raw:
+                    pipe.unwatch()
+                    return False
+                meta = json.loads(raw)
+                if expected_session is not None and huddle_meta_holder(meta, issue) != expected_session:
+                    pipe.unwatch()
+                    return False
+                if expect is not None and meta.get("driver") != expect:
+                    pipe.unwatch()
+                    return False
+                if driver_must_be_participant and driver not in meta.get("participants", []):
+                    pipe.unwatch()
+                    return False
+                current_pen = pipe.get(pen_key) if pen_key else None
+                current_chal = pipe.get(chal_key) if chal_key else None
+                if challenge_expect is not None and current_chal != challenge_expect:
+                    already_done = (
+                        pen_to is not None and current_pen == pen_to
+                        and meta.get("driver") == driver
+                        and current_chal is None
+                    )
+                    pipe.unwatch()
+                    return already_done
+                if pen_expect is not _NO_PEN_EXPECT and current_pen != pen_expect:
+                    already_done = (
+                        pen_to is not None and current_pen == pen_to
+                        and meta.get("driver") == driver
+                        and (not chal_key or current_chal is None)
+                    )
+                    pipe.unwatch()
+                    return already_done
+                meta["driver"] = driver
+                pipe.multi()
+                if pen_to is not None:
+                    pipe.set(pen_key, pen_to)
+                pipe.set(key, json.dumps(meta))
+                if chal_key:
+                    pipe.delete(chal_key)
+                pipe.execute()
+                return True
+            except redis.WatchError:
+                continue  # a join (or another pen op) landed; re-read and retry
+
+
+def _release_pen_driver(r, issue, agent, expected_session):
+    """Release `agent`'s pen and clear huddle.driver in one watched update.
+
+    A drain snapshots pens before it releases them. If the issue closes and
+    reopens in that window, the new huddle may legitimately have the same agent
+    holding the pen; `expected_session` prevents the stale drain from deleting
+    that new pen. The already-released branch is intentional: if Redis lost the
+    EXEC reply and retries the transaction after the first attempt landed, the
+    second pass sees pen gone + driver blank and still reports success.
+    """
+    huddle_key = k_huddle(issue)
+    pen_key = k_pen(issue)
+    with r.pipeline() as pipe:
+        while True:
+            try:
+                pipe.watch(huddle_key, pen_key)
+                raw = pipe.get(huddle_key)
+                current_pen = pipe.get(pen_key)
+                if expected_session is _NO_HUDDLE_SESSION:
+                    if raw:
+                        pipe.unwatch()
+                        return False
+                    if current_pen == agent:
+                        pipe.multi()
+                        pipe.delete(pen_key)
+                        pipe.execute()
+                        return True
+                    pipe.unwatch()
+                    return current_pen is None
+                if not raw:
+                    pipe.unwatch()
+                    return False
+                meta = json.loads(raw)
+                if huddle_meta_holder(meta, issue) != expected_session:
+                    pipe.unwatch()
+                    return False
+                if current_pen == agent and meta.get("driver") == agent:
+                    meta["driver"] = ""
+                    pipe.multi()
+                    pipe.delete(pen_key)
+                    pipe.set(huddle_key, json.dumps(meta))
+                    pipe.execute()
+                    return True
+                pipe.unwatch()
+                return current_pen is None and meta.get("driver") == ""
+            except redis.WatchError:
+                continue
+
+
+def _record_pen_challenge(r, issue, challenger, reason, expected_session, expected_driver):
+    """Record/refresh a challenge only for the huddle and pen holder observed."""
+    huddle_key = k_huddle(issue)
+    pen_key = k_pen(issue)
+    chal_key = k_penchal(issue)
+    with r.pipeline() as pipe:
+        while True:
+            try:
+                pipe.watch(huddle_key, pen_key, chal_key)
+                raw = pipe.get(huddle_key)
+                if not raw:
+                    pipe.unwatch()
+                    return False
+                meta = json.loads(raw)
+                if huddle_meta_holder(meta, issue) != expected_session:
+                    pipe.unwatch()
+                    return False
+                if challenger not in meta.get("participants", []):
+                    pipe.unwatch()
+                    return False
+                if pipe.get(pen_key) != expected_driver:
+                    pipe.unwatch()
+                    return False
+                pipe.multi()
+                pipe.set(chal_key, json.dumps({
+                    "challenger": challenger,
+                    "reason": reason,
+                    "ts": now_iso(),
+                    "session": expected_session,
+                    "driver": expected_driver,
+                }))
+                pipe.execute()
+                return True
+            except redis.WatchError:
+                continue
+
+
+def _delete_huddle_state(r, issue, expected_session):
+    """Delete huddle volatile keys only if metadata still belongs to this session."""
+    huddle_key = k_huddle(issue)
+    with r.pipeline() as pipe:
+        while True:
+            try:
+                pipe.watch(huddle_key)
+                raw = pipe.get(huddle_key)
+                if raw:
+                    meta = json.loads(raw)
+                    if huddle_meta_holder(meta, issue) != expected_session:
+                        pipe.unwatch()
+                        return False
+                pipe.multi()
+                if raw:
+                    pipe.delete(huddle_key, k_pen(issue), k_penchal(issue),
+                                k_signoff(issue), k_block(issue))
+                pipe.execute()
+                return True
+            except redis.WatchError:
+                continue
+
+
+def _delete_pen_challenge(r, issue, driver, challenge_raw):
+    """Delete a challenge only if it is still the same challenge for this session."""
+    chal_key = k_penchal(issue)
+    huddle_key = k_huddle(issue)
+    pen_key = k_pen(issue)
+    try:
+        chal = json.loads(challenge_raw)
+    except json.JSONDecodeError:
+        raise
+    expected_session = chal.get("session")
+    if not expected_session or chal.get("driver") != driver:
+        return False
+    with r.pipeline() as pipe:
+        while True:
+            try:
+                pipe.watch(huddle_key, pen_key, chal_key)
+                if pipe.get(chal_key) != challenge_raw:
+                    pipe.unwatch()
+                    return False
+                raw = pipe.get(huddle_key)
+                if not raw:
+                    pipe.unwatch()
+                    return False
+                meta = json.loads(raw)
+                if huddle_meta_holder(meta, issue) != expected_session:
+                    pipe.unwatch()
+                    return False
+                if pipe.get(pen_key) != driver:
+                    pipe.unwatch()
+                    return False
+                pipe.multi()
+                pipe.delete(chal_key)
+                pipe.execute()
+                return True
+            except redis.WatchError:
+                continue
+
+
 def create_shared_branch(main, base, branch, allow_stale=False):
     """Push an empty `branch` at origin/`base`'s tip. Returns (rc, base_commit_or_err).
     No worktree is created here — per-driver worktrees are a later (pen) stage."""
@@ -1215,9 +1974,19 @@ def create_shared_branch(main, base, branch, allow_stale=False):
     rc, out, _ = git(main, "ls-remote", "--heads", "origin", branch, check=False)
     if rc == 0 and out.strip():
         return 1, f"remote branch {branch} already exists (leftover huddle?); remove it first"
-    rc, _, err = git(main, "push", "origin", f"{base_commit}:refs/heads/{branch}", check=False)
-    if rc != 0:
-        return 1, f"git push {branch} failed: {err}"
+    # Atomic create. A plain `push base:refs/heads/branch` is create-OR-fast-forward:
+    # if a racing writer created `branch` between the ls-remote check above and this
+    # push, it would silently fast-forward THEIR branch (or no-op on an equal tip)
+    # instead of failing. Empty-expect `--force-with-lease=refs/heads/branch:` requires
+    # the remote ref to NOT exist, so a race is rejected (stale info); `--porcelain`
+    # lets us confirm we actually created it (`[new branch]`) rather than any other
+    # outcome. (B2 git-ref collision hardening; see #82.)
+    rc, out, err = git(main, "push", "--porcelain",
+                       f"--force-with-lease=refs/heads/{branch}:",
+                       "origin", f"{base_commit}:refs/heads/{branch}", check=False)
+    if rc != 0 or "[new branch]" not in out:
+        return 1, (f"atomic create of {branch} failed (racing writer or leftover branch?); "
+                   f"refusing to fast-forward an existing ref: {err or out or 'no [new branch]'}")
     return 0, base_commit
 
 
@@ -1292,9 +2061,16 @@ def cmd_huddle_open(r, args):
                 f"expired; resolve manually (bus release/status) before opening a huddle\n")
             return 1
     won = r.set(lock, session, nx=True, ex=args.ttl)
-    if not won:
+    if not won and r.get(lock) != session:
         sys.stderr.write(f"bus huddle open: issue #{issue} already locked by {r.get(lock)}\n")
         return 1
+    # `not won` but the lock already holds OUR session token: a connection retry
+    # re-sent this very SET NX after its reply was lost, so our own first attempt
+    # is what's in there. The token is 16 random bytes, so nobody else can be
+    # holding it — proceed as the winner. Bailing out here instead would strand the
+    # issue under a phantom huddle lock with no metadata and no branch, which
+    # `bus reap` deliberately refuses to free (_is_huddle_lock) and `bus release`
+    # cannot touch — an unrecoverable lock short of a manual redis-cli DEL.
     # Set up the shared branch BEFORE the gh label, so a failure rolls the lock
     # back cleanly — no huddle should hold the issue lock with no branch.
     rc, val = create_shared_branch(main, args.base, branch, allow_stale=args.allow_stale)
@@ -1310,13 +2086,12 @@ def cmd_huddle_open(r, args):
         "driver": args.as_agent, "branch": branch, "base": args.base,
         "base_commit": base_commit, "session": session, "status": "open",
         "created_at": now_iso()})
-    if not compare_set_huddle_meta(r, issue, session, meta_json):
+    if not compare_set_huddle_meta(r, issue, session, meta_json, pen_holder=args.as_agent):
         rc, cleanup_msg = cleanup_lost_huddle_branch(r, issue, main, branch, base_commit)
         sys.stderr.write(
             f"bus huddle open: lost lock on #{issue} after branch creation; "
             f"aborted before metadata/GitHub writes. {cleanup_msg}\n")
         return 1
-    r.set(k_pen(issue), args.as_agent)  # opener holds the write pen initially
     touch_presence(r, args.room, args.as_agent)
     # gh is best-effort: the lock + branch + metadata already exist, so a gh
     # outage must not abort a live huddle (mirrors cmd_claim).
@@ -1435,6 +2210,13 @@ def cmd_huddle_close(r, args):
     if not getattr(args, "force", False):
         ok, reasons = donegate(r, issue, meta, args.as_agent)
         if not ok:
+            # Structured signal (B6, #81): surface the blocked close for tooling.
+            # Emit the COUNT of open reasons only — the reason strings embed
+            # untrusted user --block text and must never ride the event layer.
+            announce_event(r, args.room, args.as_agent, EV_DONEGATE_BLOCK,
+                           {"issue": issue, "closer": args.as_agent,
+                            "open_reasons": len(reasons)},
+                           topic=f"issue-{issue}")
             sys.stderr.write(f"bus huddle close: #{issue} not done — {len(reasons)} open:\n")
             for why in reasons:
                 sys.stderr.write(f"  - {why}\n")
@@ -1443,10 +2225,10 @@ def cmd_huddle_close(r, args):
     # Advance the label ONLY if we still legitimately hold the session lock.
     # compare_delete_lock returns 1 iff the lock was ours (atomic, no TOCTOU); a
     # 0 means it already expired or was reaped — possibly re-acquired by someone
-    # else — so advancing status:pr-open would clobber their state. Either way we
-    # ALWAYS clear the metadata: close is the only orphan-cleanup path and must
-    # never leave meta behind (meta has no TTL; the lock does).
-    owned = compare_delete_lock(r, issue, huddle_meta_holder(meta, issue))
+    # else — so advancing status:pr-open would clobber their state. Cleanup is
+    # also session-bound: a delayed close must not delete a reopened huddle.
+    session = huddle_meta_holder(meta, issue)
+    owned = compare_delete_lock(r, issue, session)
     err = None
     if owned:
         try:
@@ -1456,8 +2238,10 @@ def cmd_huddle_close(r, args):
                check=False)
         except Exception as e:  # noqa: BLE001 - report and continue
             err = str(e)
-    r.delete(k_huddle(issue), k_pen(issue), k_penchal(issue),
-             k_signoff(issue), k_block(issue))  # all huddle state dies with it
+    if not _delete_huddle_state(r, issue, session):
+        sys.stderr.write(f"bus huddle close: huddle #{issue} changed sessions while closing; "
+                         "left current huddle state intact\n")
+        return 1
     announce(r, args.room, args.as_agent, f"closed huddle on #{issue}",
              topic=f"issue-{issue}")
     print(f"{args.as_agent} closed huddle on #{issue}")
@@ -1552,10 +2336,56 @@ def cmd_pen_status(r, args):
     return 0
 
 
+def _synced_tip(path, shared):
+    """The origin/<shared> tip huddle_worktree just fetched — the commit our push must
+    lease against. Deliberately NOT a re-fetch: a re-fetch would silently adopt a racing
+    writer's push as our base and defeat the collision guard. Returns the sha, or None if
+    the shared ref can't be resolved (huddle_worktree should have caught that first)."""
+    rc, tip, _ = git(path, "rev-parse", "--verify", f"origin/{shared}", check=False)
+    return tip if rc == 0 else None
+
+
+def _leased_push(path, shared, integrated):
+    """Push worktree HEAD to origin/`shared`, LEASED against `integrated` (the tip we
+    last synced down), then VERIFY the remote actually advanced to our HEAD.
+
+    The pen is meant to guarantee a single writer, but a git-ref collision (a racing
+    push/branch/delete against the same origin) can still move the shared ref between
+    our sync and our push. A plain push would then be rejected as non-ff (noisy) or, if
+    the remote moved to a commit our HEAD still fast-forwards, advance a base we never
+    reviewed. Leasing against `integrated` makes a moved ref REJECT (never clobbers a
+    peer's commit); the post-push ls-remote check catches a mismatch (e.g. our push
+    half-landed then got overwritten).
+
+    Returns (rc, head_sha, err): rc 0 = pushed and verified; rc 1 = BLOCKING
+    (lease reject or post-push mismatch — caller must not advance any state)."""
+    rc, head, _ = git(path, "rev-parse", "HEAD", check=False)
+    # Never force a non-ff: HEAD must descend from the tip we're leasing against, or a
+    # lease-authorized force could discard the commit currently on `integrated`.
+    rc2, _, _ = git(path, "merge-base", "--is-ancestor", integrated, "HEAD", check=False)
+    if rc2 != 0:
+        return 1, head, (f"HEAD {head[:8]} does not descend from the synced tip "
+                         f"{integrated[:8]}; refusing to force (diverged — recover manually)")
+    lease = f"refs/heads/{shared}:{integrated}"
+    rc3, out, err = git(path, "push", "--porcelain", f"--force-with-lease={lease}",
+                        "origin", f"HEAD:{shared}", check=False)
+    if rc3 != 0:
+        # B6-TODO(#81): emit structured event type="lease-reject" (BLOCKING) here.
+        return 1, head, (f"leased push rejected — another writer moved {shared} since our "
+                         f"last sync (git-ref collision): {err or out}")
+    rc4, rout, _ = git(path, "ls-remote", "--heads", "origin", shared, check=False)
+    remote_sha = rout.split()[0] if (rc4 == 0 and rout.strip()) else ""
+    if remote_sha != head:
+        # B6-TODO(#81): emit structured event type="post-push-mismatch" (BLOCKING) here.
+        return 1, head, (f"post-push mismatch: remote {shared} is {remote_sha[:8] or '(none)'}, "
+                         f"expected {head[:8]}; run `bus huddle recover`")
+    return 0, head, ""
+
+
 def cmd_pen_checkpoint(r, args):
     """Pen holder: stage + commit + push WIP to the shared branch (one command —
-    MB-SPEED: no manual git ceremony). Fast-forward push; the pen guarantees a
-    single writer so it stays linear."""
+    MB-SPEED: no manual git ceremony). The push is leased against the tip we synced
+    down (via `_leased_push`) so a git-ref collision is rejected, never clobbered."""
     issue = args.issue
     if not _require_pen(r, issue, args.as_agent, "checkpoint"):
         return 1
@@ -1567,6 +2397,11 @@ def cmd_pen_checkpoint(r, args):
         return 1
     path = huddle_worktree(r, main, issue, args.as_agent)
     if not path:
+        return 1
+    integrated = _synced_tip(path, huddle_branch(issue))
+    if not integrated:
+        sys.stderr.write(f"bus pen checkpoint: cannot resolve synced tip of "
+                         f"origin/{huddle_branch(issue)} on #{issue}\n")
         return 1
     git(path, "add", "-A", check=False)
     rc, _, _ = git(path, "diff", "--cached", "--quiet", check=False)
@@ -1580,14 +2415,14 @@ def cmd_pen_checkpoint(r, args):
     if rc == 0:
         print(f"pen checkpoint: nothing to commit on #{issue}")
         return 0
-    # push HEAD to the shared branch (fast-forward — flushes a fresh commit AND
-    # any prior unpushed commits a retry is recovering).
-    rc, _, err = git(path, "push", "origin", f"HEAD:{huddle_branch(issue)}", check=False)
+    # push HEAD to the shared branch, leased against the synced tip (flushes a fresh
+    # commit AND any prior unpushed commits a retry is recovering). A moved ref is
+    # rejected, not clobbered; a post-push mismatch is caught.
+    rc, head, err = _leased_push(path, huddle_branch(issue), integrated)
     if rc != 0:
-        sys.stderr.write(f"bus pen checkpoint: push failed (not fast-forward? another "
-                         f"writer pushed — the pen was violated): {err}\n")
+        sys.stderr.write(f"bus pen checkpoint: {err}\n")
         return 1
-    rc, tip, _ = git(path, "rev-parse", "--short", "HEAD", check=False)
+    tip = head[:7]
     announce(r, args.room, args.as_agent, f"checkpointed #{issue} (tip {tip})",
              topic=f"issue-{issue}")
     print(f"{args.as_agent} checkpointed #{issue} to {huddle_branch(issue)} (tip {tip})")
@@ -1606,6 +2441,7 @@ def cmd_pen_pass(r, args):
     if not meta:
         sys.stderr.write(f"bus pen pass: no huddle on #{issue}\n")
         return 1
+    session = huddle_meta_holder(meta, issue)
     if args.to not in meta["participants"]:
         sys.stderr.write(f"bus pen pass: {args.to} is not a participant of #{issue}'s "
                          f"huddle (they must `bus huddle join` first)\n")
@@ -1616,10 +2452,12 @@ def cmd_pen_pass(r, args):
         sys.stderr.write(f"bus pen pass: checkpoint failed to push; keeping the pen with "
                          f"{args.as_agent}. Fix the push, then retry the pass.\n")
         return 1
-    r.set(k_pen(issue), args.to)
-    meta["driver"] = args.to
-    r.set(k_huddle(issue), json.dumps(meta))
-    r.delete(k_penchal(issue))  # a pass settles any open challenge (concession)
+    if not _set_driver(r, issue, args.to, pen_to=args.to, pen_expect=args.as_agent,
+                       clear_challenge=True, expected_session=session,
+                       driver_must_be_participant=True):
+        sys.stderr.write(f"bus pen pass: huddle or pen changed while passing #{issue}; "
+                         "not moving the pen\n")
+        return 1
     announce(r, args.room, args.as_agent, f"passed the pen on #{issue} to {args.to}",
              topic=f"issue-{issue}")
     print(f"{args.as_agent} passed the pen on #{issue} to {args.to}")
@@ -1637,6 +2475,7 @@ def cmd_pen_take(r, args):
     if not meta:
         sys.stderr.write(f"bus pen take: no huddle on #{issue}\n")
         return 1
+    session = huddle_meta_holder(meta, issue)
     if args.as_agent not in meta["participants"]:
         sys.stderr.write(f"bus pen take: you must be a huddle participant first "
                          f"(`bus huddle join`)\n")
@@ -1646,42 +2485,57 @@ def cmd_pen_take(r, args):
     if driver == args.as_agent:
         print(f"you ({args.as_agent}) already hold the pen on #{issue}")
         return 0
+    if not driver:
+        # Nobody holds the pen — a driver drained on shutdown, or the key lapsed.
+        # There is no incumbent to protect, so the grace window has nothing to
+        # protect: an unheld pen is simply free. Without this, an unheld pen still
+        # costs a challenger the full PEN_TAKE_GRACE and the huddle can't make a
+        # single write until it expires.
+        if not _set_driver(r, issue, args.as_agent, pen_to=args.as_agent,
+                           pen_expect=None, clear_challenge=True,
+                           expected_session=session,
+                           driver_must_be_participant=True):
+            sys.stderr.write(f"bus pen take: huddle or pen changed while taking #{issue}; "
+                             "not moving the pen\n")
+            return 1
+        announce(r, args.room, args.as_agent,
+                 f"took the unheld pen on #{issue}", topic=f"issue-{issue}")
+        print(f"{args.as_agent} took the unheld pen on #{issue}")
+        return 0
     raw = r.get(k_penchal(issue))
-    chal = json.loads(raw) if raw else None
     driver_absent = not _holder_present(r, driver)
-    # Force-take ONLY when the driver is absent AND this challenger's challenge has
-    # aged past the grace window. Absent-presence alone is too weak (idle≠dead, the
-    # reap lesson) — and pen ops now refresh presence, so an actively-driving agent
-    # stays live and can't be taken from. The grace gives a driver whose presence
-    # merely lapsed time to reappear (any op re-touches presence).
-    if driver_absent and chal and chal.get("challenger") == args.as_agent:
-        age = (datetime.now(timezone.utc) - datetime.fromisoformat(chal["ts"])).total_seconds()
-        if age >= PEN_TAKE_GRACE:
-            r.set(k_pen(issue), args.as_agent)
-            meta["driver"] = args.as_agent
-            r.set(k_huddle(issue), json.dumps(meta))
-            r.delete(k_penchal(issue))
-            announce(r, args.room, args.as_agent,
-                     f"took the pen on #{issue} (driver {driver} absent past grace)",
-                     topic=f"issue-{issue}")
-            print(f"{args.as_agent} took the pen on #{issue} (driver {driver} absent past grace)")
-            return 0
-    # otherwise record/refresh the challenge (never an instant steal)
-    r.set(k_penchal(issue), json.dumps(
-        {"challenger": args.as_agent, "reason": args.reason, "ts": now_iso()}))
+    # Operator decision (#94): a driver with NO presence anywhere is treated as
+    # gone — take the pen IMMEDIATELY rather than recording a challenge and waiting
+    # out PEN_TAKE_GRACE. Pen ops refresh presence, so an actively-driving agent is
+    # never absent; this fires only for a drained/vanished driver, and a draining
+    # driver's own release must not strand the huddle. The take stays CAS-guarded
+    # (pen_expect=driver + expected_session + challenge_expect), so it aborts
+    # cleanly if the driver reappears or the huddle changes mid-take. Trade-off:
+    # this drops the brief-heartbeat-lapse grace in favour of immediate progress.
     if driver_absent:
+        if not _set_driver(r, issue, args.as_agent, pen_to=args.as_agent,
+                           pen_expect=driver, clear_challenge=True,
+                           expected_session=session,
+                           driver_must_be_participant=True,
+                           challenge_expect=raw):
+            sys.stderr.write(f"bus pen take: huddle or pen changed while taking #{issue}; "
+                             "not moving the pen\n")
+            return 1
         announce(r, args.room, args.as_agent,
-                 f"challenges for the pen on #{issue} (driver {driver} absent; reason: "
-                 f"{args.reason}). Re-run `pen take` after {PEN_TAKE_GRACE}s to force if "
-                 f"{driver} doesn't return.", topic=f"issue-{issue}")
-        print(f"{args.as_agent} challenged #{issue}; driver absent — force-take available "
-              f"in {PEN_TAKE_GRACE}s")
-    else:
-        announce(r, args.room, args.as_agent,
-                 f"challenges for the pen on #{issue} (reason: {args.reason}). "
-                 f"driver {driver} must `pen pass --to {args.as_agent}` or `pen deny`.",
+                 f"took the pen on #{issue} (driver {driver} absent)",
                  topic=f"issue-{issue}")
-        print(f"{args.as_agent} challenged for the pen on #{issue}; driver {driver} must respond")
+        print(f"{args.as_agent} took the pen on #{issue} (driver {driver} absent)")
+        return 0
+    # driver PRESENT — record/refresh the challenge (never an instant steal)
+    if not _record_pen_challenge(r, issue, args.as_agent, args.reason, session, driver):
+        sys.stderr.write(f"bus pen take: huddle or pen changed while challenging #{issue}; "
+                         "not recording challenge\n")
+        return 1
+    announce(r, args.room, args.as_agent,
+             f"challenges for the pen on #{issue} (reason: {args.reason}). "
+             f"driver {driver} must `pen pass --to {args.as_agent}` or `pen deny`.",
+             topic=f"issue-{issue}")
+    print(f"{args.as_agent} challenged for the pen on #{issue}; driver {driver} must respond")
     return 0
 
 
@@ -1696,7 +2550,10 @@ def cmd_pen_deny(r, args):
         sys.stderr.write(f"bus pen deny: no open challenge on #{issue}\n")
         return 1
     chal = json.loads(raw)
-    r.delete(k_penchal(issue))
+    if not _delete_pen_challenge(r, issue, args.as_agent, raw):
+        sys.stderr.write(f"bus pen deny: challenge changed while denying #{issue}; "
+                         "not deleting it\n")
+        return 1
     announce(r, args.room, args.as_agent,
              f"denied {chal['challenger']}'s pen challenge on #{issue} "
              f"(reason: {args.reason}); keeps the pen.", topic=f"issue-{issue}")
@@ -1812,9 +2669,53 @@ def donegate(r, issue, meta, closer):
     return (len(reasons) == 0), reasons
 
 
+def cmd_huddle_recover(r, args):
+    """Recover a driver's committed-but-unpushed work after a push mismatch or a
+    git-ref collision. Re-syncs to the TRUE current remote tip and re-pushes, leased,
+    only when our HEAD cleanly fast-forwards it — NEVER resetting away local commits
+    and NEVER forcing over a genuine divergence. Idempotent: safe to re-run.
+
+    Only the pen holder may recover — recovery pushes to the shared branch, which the
+    single-writer pen invariant reserves to the holder."""
+    issue = args.issue
+    if not _require_pen(r, issue, args.as_agent, "recover"):
+        return 1
+    touch_presence(r, args.room, args.as_agent)
+    try:
+        main = main_repo_dir()
+    except RuntimeError as e:
+        sys.stderr.write(f"bus huddle recover: {e}\n")
+        return 1
+    shared = huddle_branch(issue)
+    # huddle_worktree freshly fetches origin/<shared> and syncs the worktree without
+    # ever discarding committed-but-unpushed work (it skips the reset when HEAD isn't
+    # an ancestor of the shared tip).
+    path = huddle_worktree(r, main, issue, args.as_agent)
+    if not path:
+        return 1
+    integrated = _synced_tip(path, shared)
+    if not integrated:
+        sys.stderr.write(f"bus huddle recover: shared branch origin/{shared} missing; "
+                         f"cannot recover safely (was the huddle closed?)\n")
+        return 1
+    _, head, _ = git(path, "rev-parse", "HEAD", check=False)
+    if head == integrated:
+        print(f"recover #{issue}: already in sync at {head[:8]}; nothing to recover")
+        return 0
+    rc, head, err = _leased_push(path, shared, integrated)
+    if rc != 0:
+        sys.stderr.write(f"bus huddle recover: {err}\n")
+        return 1
+    announce(r, args.room, args.as_agent, f"recovered #{issue} (tip {head[:7]})",
+             topic=f"issue-{issue}")
+    print(f"{args.as_agent} recovered #{issue} -> {shared} at {head[:8]}")
+    return 0
+
+
 def cmd_huddle(r, args):
     return {"open": cmd_huddle_open, "join": cmd_huddle_join,
-            "status": cmd_huddle_status, "close": cmd_huddle_close}[args.huddle_cmd](r, args)
+            "status": cmd_huddle_status, "close": cmd_huddle_close,
+            "recover": cmd_huddle_recover}[args.huddle_cmd](r, args)
 
 
 # ---- argparse --------------------------------------------------------------
@@ -1885,6 +2786,11 @@ def build_parser():
     h = sub.add_parser("history", help="full room log")
     h.add_argument("-n", type=int, default=1000)
 
+    ev = sub.add_parser("events", help="recent structured events (JSON observability layer)")
+    ev.add_argument("-n", type=int, default=20, help="max events to show (default 20)")
+    ev.add_argument("--type", type=ident, default=None,
+                    help="only this event type, e.g. donegate_block")
+
     wt = sub.add_parser("watch", help="live-follow all messages in a room (observer, Ctrl-C to stop)")
     wt.add_argument("-n", type=int, default=10, help="show last N for context before following (default 10)")
     _topic(wt)
@@ -1897,6 +2803,13 @@ def build_parser():
     pr = sub.add_parser("prune", help="trim a room to the newest --keep messages (destructive, guarded)")
     pr.add_argument("--keep", type=positive_int, default=5000, help="messages to keep (default 5000)")
     pr.add_argument("--force", action="store_true", help="trim even if it drops unread for lagging agents")
+    pr.add_argument("--dry-run", dest="dry_run", action="store_true",
+                    help="report what would be trimmed (and who is lagging); write nothing")
+
+    dr = sub.add_parser("drain", help="graceful shutdown: release your pens + presence (claims kept)")
+    _as(dr)
+    dr.add_argument("--force", action="store_true",
+                    help="drop the pen even with committed-but-unpushed work (strands it)")
 
     rp = sub.add_parser("reap", help="list stale issue locks (holder absent); --release <issue> to free ONE")
     rp.add_argument("--release", type=positive_int, default=None, metavar="ISSUE",
@@ -1956,6 +2869,9 @@ def build_parser():
     hc = hdsub.add_parser("close", help="close the huddle (done-gate: all present signed off, no blocks)")
     _as(hc); _issue(hc)
     hc.add_argument("--force", action="store_true", help="close even if the done-gate isn't met")
+    hr = hdsub.add_parser("recover", help="re-push a driver's unpushed work after a push "
+                                          "mismatch / git-ref collision (never resets or forces)")
+    _as(hr); _issue(hr)
 
     pn = sub.add_parser("pen", help="huddle write pen: who commits to the shared branch")
     pnsub = pn.add_subparsers(dest="pen_cmd", required=True)
@@ -1987,11 +2903,12 @@ def build_parser():
 # command -> handler. Membership here also means "this command needs Redis".
 DISPATCH = {
     "send": cmd_send, "poll": cmd_poll, "wait": cmd_wait,
-    "tail": cmd_tail, "history": cmd_history, "watch": cmd_watch, "join": cmd_join,
+    "tail": cmd_tail, "history": cmd_history, "events": cmd_events,
+    "watch": cmd_watch, "join": cmd_join,
     "agents": cmd_agents, "claim": cmd_claim, "release": cmd_release,
     "renew": cmd_renew, "status": cmd_status,
     "thread": cmd_thread, "inbox": cmd_inbox, "prune": cmd_prune,
-    "reap": cmd_reap, "board": cmd_board, "ws": cmd_ws,
+    "reap": cmd_reap, "drain": cmd_drain, "board": cmd_board, "ws": cmd_ws,
     "huddle": cmd_huddle, "pen": cmd_pen,
     "signoff": cmd_signoff, "unblock": cmd_unblock,
 }
@@ -2008,7 +2925,7 @@ def main(argv=None):
     except Exception as e:  # noqa: BLE001
         sys.stderr.write(f"bus: cannot reach Redis at {args.url}: {e}\n")
         sys.stderr.write("  run `bus doctor` or start Redis: ./scripts/start-redis.sh\n")
-        return 3
+        return RC_REDIS_DOWN
     return DISPATCH[args.cmd](r, args)
 
 
