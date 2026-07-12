@@ -190,6 +190,27 @@ def test_stop_hook_max_turns_does_not_consume_delivered_message(tmp_path):
     assert not (tmp_path / "bus-sequence.idx").exists()
 
 
+def test_stop_hook_max_turns_still_self_continues_active_turn(tmp_path):
+    run_hook, bus_dir = make_hook_runner(
+        tmp_path,
+        [
+            '0|[{"id":"1","body":"claim issue"}]',
+            '0|[{"id":"2","body":"should remain queued"}]',
+        ],
+        max_turns=1,
+    )
+    active_file = bus_dir / f"active-{AGENT}"
+    done_marker = bus_dir / f"turn-done-{AGENT}"
+
+    parse_block(run_hook())
+    reason = parse_block(run_hook())
+
+    assert active_file.exists()
+    assert reason.startswith("CONTINUE your current task")
+    assert f"touch {done_marker}" in reason
+    assert (tmp_path / "bus-sequence.idx").read_text().strip() == "1"
+
+
 def test_stop_hook_ignores_non_numeric_state_without_command_substitution(tmp_path):
     pwned = tmp_path / "pwned"
     run_hook, bus_dir = make_hook_runner(
