@@ -233,7 +233,6 @@ def test_real_redis_drain_keeps_a_join_that_lands_mid_meta_write(
 
     try:
         _seed_huddle(r, bus_module, issue, ["agent-d", "agent-a"], "agent-d")
-        r.set(bus_module.k_pen(issue), "agent-d", ex=60)
         monkeypatch.setattr(bus_module, "_unpushed_pen_issues", lambda *_a: [])
         state = _fire_once_on_huddle_read(
             monkeypatch, r, bus_module, issue,
@@ -326,7 +325,6 @@ def test_real_redis_drain_does_not_clear_a_driver_a_concurrent_take_installed(
 
     try:
         _seed_huddle(r, bus_module, issue, ["agent-d", "agent-a"], "agent-d")
-        r.set(bus_module.k_pen(issue), "agent-d", ex=60)
         monkeypatch.setattr(bus_module, "_unpushed_pen_issues", lambda *_a: [])
         # Fires after drain has already CAS-deleted the pen key, so agent-a finds
         # the pen unheld and takes it for real.
@@ -358,7 +356,6 @@ def test_real_redis_pen_pass_keeps_a_join_that_lands_mid_meta_write(
 
     try:
         _seed_huddle(r, bus_module, issue, ["agent-d", "agent-a"], "agent-d")
-        r.set(bus_module.k_pen(issue), "agent-d", ex=60)
         # The handoff's git commit+push is not what's under test here.
         monkeypatch.setattr(bus_module, "cmd_pen_checkpoint", lambda _r, _args: 0)
         state = _fire_once_on_huddle_read(
@@ -892,7 +889,6 @@ def test_real_redis_pen_pass_into_a_huddle_closed_mid_flight_leaves_no_pen(
 
     try:
         _seed_huddle(r, bus_module, issue, ["agent-d", "agent-a"], "agent-d")
-        r.set(bus_module.k_pen(issue), "agent-d", ex=60)
         monkeypatch.setattr(bus_module, "cmd_pen_checkpoint", lambda _r, _args: 0)
         state = _fire_once_on_huddle_read(
             monkeypatch, r, bus_module, issue,
@@ -926,7 +922,6 @@ def test_real_redis_drain_clears_driver_when_release_reply_was_lost(
 
     try:
         _seed_huddle(r, bus_module, issue, ["agent-d", "agent-a"], "agent-d")
-        r.set(bus_module.k_pen(issue), "agent-d", ex=60)
         monkeypatch.setattr(bus_module, "_unpushed_pen_issues", lambda *_a: [])
         real_release = bus_module._release_pen_driver
 
