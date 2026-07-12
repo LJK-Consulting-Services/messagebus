@@ -1704,8 +1704,11 @@ def _set_driver(r, issue, driver, expect=None):
     a closed huddle as a participant-less stub) and has no abort path.
 
     Returns True if the driver was written; False if the huddle is gone or
-    `expect` did not match. Corrupt metadata raises, as it does everywhere else
-    that parses this key — a huddle nobody can read is not a no-op.
+    `expect` did not match. Corrupt metadata raises (like `_huddle_meta`) rather
+    than silently no-opping — a driver write we can't complete must be loud.
+    (`cmd_huddle_join` instead prints and returns 1 on corrupt metadata; here
+    the callers discard the return value, so raising is the only way the failure
+    surfaces at all.)
     """
     key = k_huddle(issue)
     with r.pipeline() as pipe:
