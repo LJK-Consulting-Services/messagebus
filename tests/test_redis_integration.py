@@ -673,6 +673,17 @@ def _fire_once_on_multi(monkeypatch, r, action):
     huddle key first and the challenge key later, so a write injected at the huddle read
     is still visible to the plain `challenge_expect` compare that follows. Only a write
     landing after ALL the reads leaves the WATCH as the sole thing that can catch it.
+
+    Key-matching the CHALLENGE key instead (a `key=` axis on the existing helper) would
+    sit in the same window today, but only because the challenge key happens to be the
+    last thing read before EXEC. Hooking `multi()` says "after every read" directly, so
+    it keeps pinning the WATCH if those reads are ever reordered.
+
+    There is deliberately no key filter: this fires on the first `multi()` of ANY
+    pipeline. That is precise only because nothing earlier in the driver-absent take
+    opens one -- `touch_presence`, `_holder_present` and `_huddle_meta` all go through
+    the plain client, so `_set_driver`'s is the first. A caller that opens a pipeline
+    before the one under test would need the filter.
     """
     state = {"fired": False}
     orig_pipeline = r.pipeline
@@ -705,10 +716,8 @@ def test_real_redis_take_aborts_on_a_challenge_raised_inside_the_watched_window(
     the take's MULTI silently destroys the rival challenge and the challenger waits
     forever on a driver who was never told they were challenged.
 
-    Injected at `multi()`, i.e. after every read: drop `chal_key` from the
-    `pipe.watch(...)` line and this test goes red while the rest of the suite stays
-    green. Injected at the huddle read instead, it would pass either way -- the compare
-    would catch the rival and the WATCH would never be exercised.
+    Drop `chal_key` from the `pipe.watch(...)` line and this test goes red while the
+    rest of the suite stays green.
     """
     issue = _issue_id()
     r = bus_module.connect(redis_url)
@@ -721,6 +730,46 @@ def test_real_redis_take_aborts_on_a_challenge_raised_inside_the_watched_window(
         r.set(bus_module.k_pen(issue), "agent-d", ex=60)
         mine = json.dumps({"challenger": "agent-a", "reason": "d is gone"})
         r.set(bus_module.k_penchal(issue), mine)
+        theirs = json.dumps({"challenger": "agent-c", "reason": "i want it too"})
+
+        state = _fire_once_on_multi(
+            monkeypatch, r, lambda: rival.set(bus_module.k_penchal(issue), theirs))
+
+        rc = bus_module.cmd_pen_take(
+            r, ns(issue=issue, as_agent="agent-a", reason="d is gone",
+                  room="integration"))
+
+        assert state["fired"], "the rival challenge never landed -- race not exercised"
+        assert rc == 1, "the take committed against a challenge it never saw"
+        assert verify.get(bus_module.k_pen(issue)) == "agent-d", "pen moved anyway"
+        assert verify.get(bus_module.k_penchal(issue)) == theirs, \
+            "the rival challenge was silently deleted by the take's MULTI"
+    finally:
+        _delete_issue_keys(verify, bus_module, issue)
+
+
+def test_real_redis_take_with_no_prior_challenge_aborts_when_one_is_raised(
+    bus_module, ns, redis_url, monkeypatch,
+):
+    """#112: `challenge_expect=None` means "I expect NO challenge", not "skip the check".
+
+    The absent-driver take reads the challenge key before the transaction; when nothing
+    is recorded it passes `challenge_expect=None`. That used to SKIP the compare
+    entirely, so a rival challenge raised inside the watched window was deleted by the
+    take's MULTI without ever being read -- the same silent-destruction bug as the
+    non-empty case, on the path that is arguably more likely (no challenge is the
+    common state). Making `challenge_expect` required, with `_ANY_CHALLENGE` as the
+    explicit "any value is moot" opt-out, turns `None` back into a real expectation.
+    """
+    issue = _issue_id()
+    r = bus_module.connect(redis_url)
+    verify = bus_module.connect(redis_url)
+    rival = bus_module.connect(redis_url)
+
+    try:
+        _seed_huddle(r, bus_module, issue, ["agent-d", "agent-a", "agent-c"], "agent-d")
+        r.set(bus_module.k_pen(issue), "agent-d", ex=60)
+        # NO challenge recorded -> cmd_pen_take passes challenge_expect=None.
         theirs = json.dumps({"challenger": "agent-c", "reason": "i want it too"})
 
         state = _fire_once_on_multi(

@@ -571,6 +571,7 @@ def test_set_driver_refuses_a_stale_session(bus_module, fake_redis):
     moved = bus_module._set_driver(
         fake_redis, 79, "bob", pen_to="bob", pen_expect="alice",
         expected_session="huddle:issue-79:a-previous-session",
+        challenge_expect=bus_module._ANY_CHALLENGE,
     )
 
     assert moved is False
@@ -588,6 +589,7 @@ def test_set_driver_refuses_a_driver_who_is_not_a_participant(bus_module, fake_r
     moved = bus_module._set_driver(
         fake_redis, 79, "mallory", pen_to="mallory", pen_expect="alice",
         expected_session=meta["session"],
+        challenge_expect=bus_module._ANY_CHALLENGE,
     )
 
     assert moved is False

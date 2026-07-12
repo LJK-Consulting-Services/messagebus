@@ -1839,9 +1839,17 @@ def _huddle_meta(r, issue):
 
 _NO_HUDDLE_SESSION = object()
 
+# "whatever challenge is there, it is moot" — the pen is being moved by an act that
+# resolves any challenge regardless of its contents (a concede, or a take of a pen
+# nobody holds). Spelled as a sentinel rather than a default so that a caller moving
+# the pen away from a PRESENT holder cannot drop the CAS by omission: the MULTI
+# DELETEs the challenge key unconditionally, so a caller with no `challenge_expect`
+# destroys a rival challenge it never read.
+_ANY_CHALLENGE = object()
+
 
 def _set_driver(r, issue, driver, *, pen_to, pen_expect, expected_session,
-                challenge_expect=None):
+                challenge_expect):
     """Move the pen and rewrite the huddle's `driver`, in one transaction.
 
     The metadata is one JSON blob, so a read-modify-SET of it is a lost-update
@@ -1900,7 +1908,7 @@ def _set_driver(r, issue, driver, *, pen_to, pen_expect, expected_session,
                 already_done = (current_pen == pen_to
                                 and meta.get("driver") == driver
                                 and current_chal is None)
-                if challenge_expect is not None and current_chal != challenge_expect:
+                if challenge_expect is not _ANY_CHALLENGE and current_chal != challenge_expect:
                     pipe.unwatch()
                     return already_done
                 if current_pen != pen_expect:
@@ -2648,7 +2656,7 @@ def cmd_pen_pass(r, args):
                          f"{args.as_agent}. Fix the push, then retry the pass.\n")
         return 1
     if not _set_driver(r, issue, args.to, pen_to=args.to, pen_expect=args.as_agent,
-                       expected_session=session):
+                       expected_session=session, challenge_expect=_ANY_CHALLENGE):
         sys.stderr.write(f"bus pen pass: huddle or pen changed while passing #{issue}; "
                          "not moving the pen\n")
         return 1
@@ -2668,7 +2676,8 @@ def _take_unheld_pen(r, args, issue, session):
     cleared with it — it named a holder who no longer exists.
     """
     if not _set_driver(r, issue, args.as_agent, pen_to=args.as_agent,
-                       pen_expect=None, expected_session=session):
+                       pen_expect=None, expected_session=session,
+                       challenge_expect=_ANY_CHALLENGE):
         sys.stderr.write(f"bus pen take: huddle or pen changed while taking #{issue}; "
                          "not moving the pen\n")
         return 1
