@@ -299,20 +299,36 @@ class HuddleGateTest(unittest.TestCase):
 
 @unittest.skipIf(fakeredis is None, "fakeredis not installed")
 class MutateJsonTest(unittest.TestCase):
-    """The WATCH/MULTI compare-and-set that guards block/sign-off lists."""
-    KEY = "bus:test:json"
+    """The WATCH/MULTI compare-and-set that guards block/sign-off lists.
+
+    Every write is bound to a huddle session (#115), so each case seeds a live
+    huddle first — an unbound `_mutate_json` no longer exists to test.
+    """
+    ISSUE = 4242
+    SESSION = "huddle:issue-4242:tok"
 
     def setUp(self):
         self.r = fakeredis.FakeStrictRedis(decode_responses=True)
+        self.KEY = bus.k_signoff(self.ISSUE)
+        self._open_huddle(self.SESSION)
+
+    def _open_huddle(self, session):
+        self.r.set(bus.k_huddle(self.ISSUE), json.dumps({
+            "issue": self.ISSUE, "participants": ["agent-a"], "driver": "agent-a",
+            "session": session, "status": "open"}))
+
+    def _mutate(self, fn, default, session=None):
+        return bus._mutate_json(self.r, self.KEY, fn, default, self.ISSUE,
+                                self.SESSION if session is None else session)
 
     def test_applies_fn_to_missing_default(self):
-        out = bus._mutate_json(self.r, self.KEY, lambda d: {**d, "a": 1}, {})
+        out = self._mutate(lambda d: {**d, "a": 1}, {})
         self.assertEqual(out, {"a": 1})
         self.assertEqual(json.loads(self.r.get(self.KEY)), {"a": 1})
 
     def test_composes_across_calls(self):
-        bus._mutate_json(self.r, self.KEY, lambda d: {**d, "a": 1}, {})
-        out = bus._mutate_json(self.r, self.KEY, lambda d: {**d, "b": 2}, {})
+        self._mutate(lambda d: {**d, "a": 1}, {})
+        out = self._mutate(lambda d: {**d, "b": 2}, {})
         self.assertEqual(out, {"a": 1, "b": 2})
 
     def test_retries_on_concurrent_write(self):
@@ -328,10 +344,39 @@ class MutateJsonTest(unittest.TestCase):
                 self.r.set(self.KEY, json.dumps({"n": 100}))
             return {"n": d.get("n", 0) + 1}
 
-        out = bus._mutate_json(self.r, self.KEY, fn, {})
+        out = self._mutate(fn, {})
         # after the retry it should have seen n=100 and incremented to 101
         self.assertEqual(out, {"n": 101})
         self.assertTrue(state["clashed"])
+
+    # ---- #115: the write is bound to the huddle session ----------------------
+
+    def test_refuses_and_writes_nothing_when_the_huddle_is_gone(self):
+        """The resurrect. Pre-fix this SET the key back into existence for a
+        huddle that no longer exists — no TTL, no owner, nothing to reap it."""
+        self.r.delete(bus.k_huddle(self.ISSUE))
+
+        self.assertIsNone(self._mutate(lambda d: {**d, "a": 1}, {}))
+        self.assertIsNone(self.r.get(self.KEY), "resurrected a key for a dead huddle")
+
+    def test_refuses_a_write_in_flight_across_a_close_and_reopen(self):
+        """The half that clearing-on-open cannot close: the write lands AFTER the
+        next huddle already opened, so it would poison a session that never saw it."""
+        self.r.delete(bus.k_huddle(self.ISSUE))
+        self._open_huddle("huddle:issue-4242:NEW-session")   # a different huddle
+
+        # a signoff still carrying the OLD session's token
+        self.assertIsNone(self._mutate(lambda d: {**d, "a": 1}, {}))
+        self.assertIsNone(self.r.get(self.KEY), "poisoned the next huddle on the issue")
+
+    def test_still_writes_when_the_session_is_unchanged(self):
+        """The guard must not be so strict it refuses the ordinary path — a join
+        rewrites the meta blob but keeps the session, and that must still write."""
+        meta = json.loads(self.r.get(bus.k_huddle(self.ISSUE)))
+        meta["participants"].append("agent-b")           # a concurrent huddle join
+        self.r.set(bus.k_huddle(self.ISSUE), json.dumps(meta))
+
+        self.assertEqual(self._mutate(lambda d: {**d, "a": 1}, {}), {"a": 1})
 
 
 if __name__ == "__main__":

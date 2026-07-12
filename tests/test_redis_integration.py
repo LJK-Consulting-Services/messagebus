@@ -664,3 +664,147 @@ def test_real_redis_drain_clears_driver_when_release_reply_was_lost(
         assert meta["participants"] == ["agent-d", "agent-a"]  # nothing else disturbed
     finally:
         _delete_issue_keys(verify, bus_module, issue)
+
+
+# ---- #115: a block/sign-off that outlives the close it raced ------------------
+#
+# `_mutate_json` ends in an unconditional SET that starts from `default` when the
+# key is absent, so it RESURRECTS a key a concurrent close just deleted. Watching
+# only the value key cannot see that — the close deletes the HUDDLE, not this key,
+# so nothing the WATCH covers ever changes and EXEC commits. The leaked key has no
+# TTL, close is its only deleter, and `huddle open` does not clear it, so the NEXT
+# huddle on the issue is born blocked by an objection against code that no longer
+# exists.
+#
+# These need a real server: the guarantee under test is Redis's own WATCH/MULTI
+# abort semantics, and each one also FAILS against the pre-fix bus, which is what
+# makes them evidence rather than decoration.
+
+
+def test_real_redis_a_block_racing_the_close_it_lands_behind_leaves_no_block(
+    bus_module, ns, redis_url, monkeypatch, capsys,
+):
+    """The window is between `cmd_signoff`'s meta read (huddle still live, so the
+    participant check passes) and its `_mutate_json` write. A close committing in
+    there used to leave a fully-formed block behind on a dead huddle."""
+    issue = _issue_id()
+    r = bus_module.connect(redis_url)
+    verify = bus_module.connect(redis_url)
+    closer = bus_module.connect(redis_url)
+
+    try:
+        _seed_huddle(r, bus_module, issue, ["agent-a", "agent-b"], "agent-a")
+        state = _fire_once_on_huddle_read(
+            monkeypatch, r, bus_module, issue,
+            lambda: _delete_issue_keys(closer, bus_module, issue))
+
+        rc = bus_module.cmd_signoff(r, ns(
+            issue=issue, as_agent="agent-b", room="integration",
+            block="found a data-loss bug, do NOT merge"))
+
+        assert state["fired"], "the concurrent close never landed — race not exercised"
+        assert rc == 1
+        assert verify.get(bus_module.k_huddle(issue)) is None
+        assert verify.get(bus_module.k_block(issue)) is None, \
+            "a block was resurrected onto a huddle that had already closed"
+        assert "closed while you were blocking" in capsys.readouterr().err
+    finally:
+        _delete_issue_keys(verify, bus_module, issue)
+
+
+def test_real_redis_a_signoff_racing_the_close_it_lands_behind_leaves_no_signoff(
+    bus_module, ns, redis_url, monkeypatch, capsys,
+):
+    """Same window, the sign-off half. A leaked k_signoff is the symmetric poison:
+    the next huddle starts with sign-offs from a session nobody in it took part in."""
+    issue = _issue_id()
+    r = bus_module.connect(redis_url)
+    verify = bus_module.connect(redis_url)
+    closer = bus_module.connect(redis_url)
+
+    try:
+        _seed_huddle(r, bus_module, issue, ["agent-a", "agent-b"], "agent-a")
+        monkeypatch.setattr(bus_module, "_shared_tip", lambda _issue: "e" * 40)
+        state = _fire_once_on_huddle_read(
+            monkeypatch, r, bus_module, issue,
+            lambda: _delete_issue_keys(closer, bus_module, issue))
+
+        rc = bus_module.cmd_signoff(r, ns(
+            issue=issue, as_agent="agent-b", room="integration", block=None))
+
+        assert state["fired"], "the concurrent close never landed — race not exercised"
+        assert rc == 1
+        assert verify.get(bus_module.k_signoff(issue)) is None, \
+            "a sign-off was resurrected onto a huddle that had already closed"
+        assert "closed while you were signing off" in capsys.readouterr().err
+    finally:
+        _delete_issue_keys(verify, bus_module, issue)
+
+
+def test_real_redis_a_block_in_flight_across_a_reopen_does_not_poison_the_new_huddle(
+    bus_module, ns, redis_url, monkeypatch, capsys,
+):
+    """The half that clearing the keys at `huddle open` could NOT have fixed.
+
+    Here the write lands after the next huddle is already OPEN, so there is no
+    later open left to mop it up: the block would sit in k_block, `donegate` would
+    read it (it reads k_block unconditionally), and the new huddle could not close
+    until someone unblocked an objection raised against a session that is gone.
+    Only binding the write to the session it was raised in refuses this.
+    """
+    issue = _issue_id()
+    r = bus_module.connect(redis_url)
+    verify = bus_module.connect(redis_url)
+    other = bus_module.connect(redis_url)
+
+    def close_then_reopen():
+        _delete_issue_keys(other, bus_module, issue)
+        # a brand-new huddle on the same issue: _seed_huddle mints its own session
+        _seed_huddle(other, bus_module, issue, ["agent-c"], "agent-c")
+        other.set(bus_module.k_huddle(issue), json.dumps({
+            **json.loads(other.get(bus_module.k_huddle(issue))),
+            "session": f"huddle:issue-{issue}:SECOND"}), ex=60)
+
+    try:
+        _seed_huddle(r, bus_module, issue, ["agent-a", "agent-b"], "agent-a")
+        state = _fire_once_on_huddle_read(
+            monkeypatch, r, bus_module, issue, close_then_reopen)
+
+        rc = bus_module.cmd_signoff(r, ns(
+            issue=issue, as_agent="agent-b", room="integration",
+            block="stale objection from the PREVIOUS huddle"))
+
+        assert state["fired"], "the reopen never landed — race not exercised"
+        assert rc == 1
+        # the new huddle survives, and is NOT born blocked
+        assert json.loads(verify.get(bus_module.k_huddle(issue)))["session"] \
+            == f"huddle:issue-{issue}:SECOND"
+        assert verify.get(bus_module.k_block(issue)) is None, \
+            "the new huddle was born blocked by the previous session's objection"
+        assert "closed while you were blocking" in capsys.readouterr().err
+    finally:
+        _delete_issue_keys(verify, bus_module, issue)
+
+
+def test_real_redis_unblock_with_no_huddle_leaves_no_key_behind(
+    bus_module, ns, redis_url, capsys,
+):
+    """`cmd_unblock` never read the huddle at all, so its mutate started from the
+    `[]` default and SET it back — reporting "you have no block" while leaving a
+    live, TTL-less k_block on an issue with no huddle."""
+    issue = _issue_id()
+    r = bus_module.connect(redis_url)
+    verify = bus_module.connect(redis_url)
+
+    try:
+        assert verify.get(bus_module.k_huddle(issue)) is None   # no huddle, by construction
+
+        rc = bus_module.cmd_unblock(
+            r, ns(issue=issue, as_agent="agent-a", room="integration"))
+
+        assert rc == 1
+        assert verify.get(bus_module.k_block(issue)) is None, \
+            "unblock created a block key on an issue that has no huddle"
+        assert "no huddle" in capsys.readouterr().err
+    finally:
+        _delete_issue_keys(verify, bus_module, issue)

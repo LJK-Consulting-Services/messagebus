@@ -2799,13 +2799,36 @@ def _shared_tip(issue):
     return out if rc == 0 else None
 
 
-def _mutate_json(r, key, fn, default):
+def _mutate_json(r, key, fn, default, issue, expected_session):
     """WATCH/MULTI read-modify-write of a JSON value at `key`; retries on a
-    concurrent write so a block/signoff isn't lost to a lost-update race."""
+    concurrent write so a block/signoff isn't lost to a lost-update race.
+    Returns the new value, or None if the huddle is gone / a new session holds
+    the issue — in which case nothing is written.
+
+    The session guard is load-bearing, not defensive. The write is an
+    unconditional SET that starts from `default` when the key is absent, so it
+    RESURRECTS a key a concurrent `huddle close` just deleted. Watching `key`
+    alone cannot see that: close deletes the huddle, not this key's value, so
+    EXEC commits happily and leaves an untethered block/signoff behind with no
+    TTL and no owning session. `huddle open` doesn't clear these keys either
+    (CAS_SET_META_PEN_LUA deletes only k_penchal), so the next huddle on the
+    issue is born blocked by an objection against code that no longer exists.
+    Watching the huddle key and re-reading the session inside the window closes
+    both halves: the huddle being GONE, and a DIFFERENT session now holding it
+    (a write that was in flight across a close+reopen). Same shape as
+    _record_pen_challenge (#115)."""
+    huddle_key = k_huddle(issue)
     with r.pipeline() as pipe:
         while True:
             try:
-                pipe.watch(key)
+                pipe.watch(key, huddle_key)
+                raw_meta = pipe.get(huddle_key)
+                if not raw_meta:
+                    pipe.unwatch()
+                    return None
+                if huddle_meta_holder(json.loads(raw_meta), issue) != expected_session:
+                    pipe.unwatch()
+                    return None
                 raw = pipe.get(key)
                 new = fn(json.loads(raw) if raw else default)
                 pipe.multi()
@@ -2828,11 +2851,16 @@ def cmd_signoff(r, args):
     if args.as_agent not in meta["participants"]:
         sys.stderr.write(f"bus signoff: you must be a huddle participant\n")
         return 1
+    session = huddle_meta_holder(meta, issue)
     touch_presence(r, args.room, args.as_agent)
     if args.block:
-        _mutate_json(r, k_block(issue),
-                     lambda bl: [b for b in bl if b["agent"] != args.as_agent]
-                                + [{"agent": args.as_agent, "reason": args.block}], [])
+        if _mutate_json(r, k_block(issue),
+                        lambda bl: [b for b in bl if b["agent"] != args.as_agent]
+                                   + [{"agent": args.as_agent, "reason": args.block}], [],
+                        issue, session) is None:
+            sys.stderr.write(f"bus signoff: the huddle on #{issue} closed while you were "
+                             f"blocking; nothing recorded\n")
+            return 1
         announce(r, args.room, args.as_agent, f"BLOCKED #{issue}: {args.block}",
                  topic=f"issue-{issue}")
         print(f"{args.as_agent} blocked #{issue}: {terminal_line(args.block)}")
@@ -2841,7 +2869,11 @@ def cmd_signoff(r, args):
     if not tip:
         sys.stderr.write(f"bus signoff: cannot read the shared branch tip\n")
         return 1
-    _mutate_json(r, k_signoff(issue), lambda s: {**s, args.as_agent: tip}, {})
+    if _mutate_json(r, k_signoff(issue), lambda s: {**s, args.as_agent: tip}, {},
+                    issue, session) is None:
+        sys.stderr.write(f"bus signoff: the huddle on #{issue} closed while you were "
+                         f"signing off; nothing recorded\n")
+        return 1
     announce(r, args.room, args.as_agent, f"signed off on #{issue} at {tip[:8]}",
              topic=f"issue-{issue}")
     print(f"{args.as_agent} signed off on #{issue} (tip {tip[:8]})")
@@ -2851,6 +2883,16 @@ def cmd_signoff(r, args):
 def cmd_unblock(r, args):
     """Remove your own block from a huddle."""
     issue = args.issue
+    # Read the huddle first. Without this the mutate below resurrects k_block on
+    # an issue that has no huddle at all: absent key -> start from `default` ->
+    # unconditional SET, so an unblock against a closed huddle LEAVES a key
+    # behind (an empty one, but with no TTL and no owner) even as it reports
+    # "you have no block" (#115).
+    meta = _huddle_meta(r, issue)
+    if not meta:
+        sys.stderr.write(f"bus unblock: no huddle on #{issue}\n")
+        return 1
+    session = huddle_meta_holder(meta, issue)
     removed = {"any": False}
 
     def drop(bl):
@@ -2858,7 +2900,10 @@ def cmd_unblock(r, args):
         removed["any"] = len(kept) != len(bl)
         return kept
 
-    _mutate_json(r, k_block(issue), drop, [])
+    if _mutate_json(r, k_block(issue), drop, [], issue, session) is None:
+        sys.stderr.write(f"bus unblock: the huddle on #{issue} closed while you were "
+                         f"unblocking\n")
+        return 1
     if not removed["any"]:
         sys.stderr.write(f"bus unblock: you have no block on #{issue}\n")
         return 1
