@@ -29,6 +29,15 @@ class BusFakeRedis(fakeredis.FakeRedis):
                 self.set(meta_key, meta_json)
                 return 1
             return 0
+        if numkeys == 4:
+            lock_key, meta_key, pen_key, chal_key = keys
+            holder, meta_json, pen_holder = argv
+            if self.get(lock_key) == holder:
+                self.set(meta_key, meta_json)
+                self.set(pen_key, pen_holder)
+                self.delete(chal_key)
+                return 1
+            return 0
         return super().eval(_script, numkeys, *args)
 
 

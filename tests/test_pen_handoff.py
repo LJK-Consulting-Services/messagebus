@@ -366,9 +366,14 @@ def test_pen_take_challenge_close_reopen_race_does_not_seed_new_huddle(
     assert fake_redis.xlen(bus_module.k_stream("main")) == 0
 
 
-def test_pen_take_stale_challenge_from_old_huddle_does_not_force_take(
+def test_pen_take_absent_driver_taken_immediately_stale_challenge_irrelevant(
     bus_module, fake_redis, ns, monkeypatch, capsys
 ):
+    # #94: an absent driver (no presence anywhere) is treated as gone, so the pen
+    # is taken IMMEDIATELY — no PEN_TAKE_GRACE wait. A challenge lingering from a
+    # prior huddle session is irrelevant: the take is justified by absence, not by
+    # any challenge. (This intentionally drops the earlier brief-lapse grace; pen
+    # ops refresh presence, so a live driver is never absent.)
     meta = huddle_meta(bus_module, driver="alice")
     meta["session"] = "huddle:issue-79:new"
     old = (datetime.now(timezone.utc) - timedelta(seconds=bus_module.PEN_TAKE_GRACE + 5))
@@ -384,10 +389,40 @@ def test_pen_take_stale_challenge_from_old_huddle_does_not_force_take(
     rc = bus_module.cmd_pen_take(fake_redis, ns(as_agent="bob", issue=79, reason="new huddle"))
 
     assert rc == 0
+    assert fake_redis.get(bus_module.k_pen(79)) == "bob"
+    meta_after = json.loads(fake_redis.get(bus_module.k_huddle(79)))
+    assert meta_after["driver"] == "bob"
+    assert fake_redis.get(bus_module.k_penchal(79)) is None  # stale challenge cleared
+    assert "took the pen" in capsys.readouterr().out
+
+
+def test_pen_take_force_aborts_when_challenge_refreshes_mid_take(
+    bus_module, fake_redis, ns, monkeypatch, capsys
+):
+    meta = huddle_meta(bus_module, driver="alice")
+    old = (datetime.now(timezone.utc) - timedelta(seconds=bus_module.PEN_TAKE_GRACE + 5))
+    stale = {
+        "challenger": "bob", "reason": "old", "ts": old.isoformat(),
+        "session": meta["session"], "driver": "alice",
+    }
+    fresh = {
+        "challenger": "bob", "reason": "fresh", "ts": datetime.now(timezone.utc).isoformat(),
+        "session": meta["session"], "driver": "alice",
+    }
+    fake_redis.set(bus_module.k_huddle(79), json.dumps(meta))
+    fake_redis.set(bus_module.k_pen(79), "alice")
+    fake_redis.set(bus_module.k_penchal(79), json.dumps(stale))
+
+    def refresh_before_force_take(_r, holder):
+        assert holder == "alice"
+        fake_redis.set(bus_module.k_penchal(79), json.dumps(fresh))
+        return False
+
+    monkeypatch.setattr(bus_module, "_holder_present", refresh_before_force_take)
+
+    rc = bus_module.cmd_pen_take(fake_redis, ns(as_agent="bob", issue=79, reason="force"))
+
+    assert rc == 1
     assert fake_redis.get(bus_module.k_pen(79)) == "alice"
-    challenge = json.loads(fake_redis.get(bus_module.k_penchal(79)))
-    assert challenge["challenger"] == "bob"
-    assert challenge["reason"] == "new huddle"
-    assert challenge["session"] == meta["session"]
-    assert challenge["driver"] == "alice"
-    assert "force-take available" in capsys.readouterr().out
+    assert json.loads(fake_redis.get(bus_module.k_penchal(79))) == fresh
+    assert "changed while taking" in capsys.readouterr().err
