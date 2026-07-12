@@ -47,13 +47,29 @@ def fake_redis():
 
 
 @pytest.fixture
-def ns():
+def ns(bus_module):
     def make(**kwargs):
-        defaults = {"room": "main", "json": False}
+        defaults = {"room": "main", "json": False, "url": bus_module.DEFAULT_URL}
         defaults.update(kwargs)
         return argparse.Namespace(**defaults)
 
     return make
+
+
+@pytest.fixture
+def events_of(bus_module):
+    """Every structured event on a room's stream, optionally one type only.
+
+    Takes the client so it works against both fakeredis and the real server the
+    durability tests spawn. `kind=None` returns all events — which is how a test
+    asserts that something (e.g. `bus watch`) emitted NONE.
+    """
+    def get(r, kind=None, room="main"):
+        decoded = (bus_module.parse_event(bus_module.fields_to_msg(mid, f))
+                   for mid, f in r.xrange(bus_module.k_stream(room)))
+        return [e for e in decoded if e and (kind is None or e["event"] == kind)]
+
+    return get
 
 
 @pytest.fixture

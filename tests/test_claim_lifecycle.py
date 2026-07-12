@@ -106,7 +106,17 @@ def test_claim_refuses_label_claimed_by_other_holder(
     assert fake_redis.xlen(bus_module.k_stream("main")) == 0
 
 
-def test_claim_already_held_by_same_agent_is_idempotent(bus_module, fake_redis, ns, no_github):
+def test_claim_already_held_by_same_agent_ensures_setup(bus_module, fake_redis, ns, no_github):
+    """Re-claiming an issue we already hold now RUNS the setup (label + announce)
+    instead of returning early.
+
+    It used to assert the opposite — that nothing was announced. That silence is
+    exactly the defect: connection retries (B3) re-send a SET NX whose reply was
+    lost, so the invocation that genuinely won the claim lands on this path, and
+    returning early left it with no worktree, no gh label and no announce. The
+    setup is idempotent, so running it here is safe and is what makes a re-sent
+    claim converge. A duplicate announce is fine — the bus is at-least-once.
+    """
     fake_redis.set(bus_module.k_lock(84), "alice")
 
     rc = bus_module.cmd_claim(
@@ -116,4 +126,5 @@ def test_claim_already_held_by_same_agent_is_idempotent(bus_module, fake_redis, 
 
     assert rc == 0
     assert fake_redis.get(bus_module.k_lock(84)) == "alice"
-    assert fake_redis.xlen(bus_module.k_stream("main")) == 0
+    bodies = [f["body"] for _, f in fake_redis.xrange(bus_module.k_stream("main"))]
+    assert bodies == ["claimed issue #84"]

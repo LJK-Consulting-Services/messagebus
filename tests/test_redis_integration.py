@@ -141,3 +141,222 @@ def test_real_redis_huddle_open_branch_failure_rolls_back_lock_with_lua(
         assert "rolled back the lock" in capsys.readouterr().err
     finally:
         _delete_issue_keys(r, bus_module, issue)
+
+
+# --- lost-update race on the huddle metadata blob -------------------------------
+#
+# `driver` and `participants` live in ONE JSON value. Any read-modify-write of it
+# races `huddle join`, which grows `participants` under WATCH/MULTI. These drive a
+# real concurrent write into the window between the read and the write and assert
+# the other field survives. Interleave is deterministic, not timing-dependent.
+
+
+def _seed_huddle(r, bus_module, issue, participants, driver):
+    session = f"huddle:issue-{issue}:session"
+    r.set(bus_module.k_lock(issue), session, ex=60)
+    r.set(bus_module.k_huddle(issue), json.dumps({
+        "issue": issue, "opener": participants[0], "participants": list(participants),
+        "driver": driver, "branch": bus_module.huddle_branch(issue), "base": "dev",
+        "base_commit": "0" * 40, "session": session, "status": "open",
+        "created_at": "2026-07-11T00:00:00+00:00"}), ex=60)
+
+
+def _fire_once_on_huddle_read(monkeypatch, r, bus_module, issue, action, where="any"):
+    """Run `action` (a concurrent writer, on its own connection) exactly once, the
+    first time the command under test READS the huddle key.
+
+    Hooks both read paths on purpose. The fixed code reads the key only through a
+    watching pipeline (`pipe.get`); the blind read-modify-write it replaces reads
+    it through the client (`r.get`). Hooking only one would make the mutation check
+    dishonest — it would never fire against one of the two versions, and the test
+    would fail for want of a concurrent write rather than for losing it.
+
+    where="pipeline" restricts the trigger to the watched window, which is how a
+    test pins the WATCH-abort-and-retry path specifically.
+    """
+    hkey = bus_module.k_huddle(issue)
+    state = {"fired": False}
+
+    def hook(get):
+        def wrapped(key, *a, **kw):
+            val = get(key, *a, **kw)
+            # one-shot: a retry must not re-fire, or the loop never settles
+            if key == hkey and not state["fired"]:
+                state["fired"] = True
+                action()
+            return val
+        return wrapped
+
+    if where == "any":
+        monkeypatch.setattr(r, "get", hook(r.get))
+    orig_pipeline = r.pipeline
+
+    def pipeline(*a, **kw):
+        pipe = orig_pipeline(*a, **kw)
+        pipe.get = hook(pipe.get)
+        return pipe
+
+    monkeypatch.setattr(r, "pipeline", pipeline)
+    return state
+
+
+def test_real_redis_drain_keeps_a_join_that_lands_mid_meta_write(
+    bus_module, ns, redis_url, monkeypatch,
+):
+    """drain clears its own `driver`; a join committing inside that window survives.
+
+    Losing it is not cosmetic: the done-gate only requires sign-off from
+    participants it can see, so an erased participant lets the huddle close with
+    its reviewer never having signed.
+    """
+    issue = _issue_id()
+    r = bus_module.connect(redis_url)
+    verify = bus_module.connect(redis_url)
+    joiner = bus_module.connect(redis_url)
+
+    try:
+        _seed_huddle(r, bus_module, issue, ["agent-d", "agent-a"], "agent-d")
+        r.set(bus_module.k_pen(issue), "agent-d", ex=60)
+        monkeypatch.setattr(bus_module, "_unpushed_pen_issues", lambda *_a: [])
+        state = _fire_once_on_huddle_read(
+            monkeypatch, r, bus_module, issue,
+            lambda: bus_module.cmd_huddle_join(
+                joiner, ns(issue=issue, as_agent="agent-b", room="integration")))
+
+        assert bus_module.cmd_drain(
+            r, ns(as_agent="agent-d", force=False, room="integration")) == 0
+
+        assert state["fired"], "the concurrent join never landed — race not exercised"
+        meta = json.loads(verify.get(bus_module.k_huddle(issue)))
+        assert meta["participants"] == ["agent-d", "agent-a", "agent-b"]
+        assert meta["driver"] == ""
+        assert verify.get(bus_module.k_pen(issue)) is None
+    finally:
+        _delete_issue_keys(verify, bus_module, issue)
+
+
+def test_real_redis_pen_take_keeps_a_join_that_lands_mid_meta_write(
+    bus_module, ns, redis_url, monkeypatch,
+):
+    """Same race on `pen take`'s unheld-pen path, which also rewrites `driver`."""
+    issue = _issue_id()
+    r = bus_module.connect(redis_url)
+    verify = bus_module.connect(redis_url)
+    joiner = bus_module.connect(redis_url)
+
+    try:
+        _seed_huddle(r, bus_module, issue, ["agent-d", "agent-a"], "")
+        state = _fire_once_on_huddle_read(
+            monkeypatch, r, bus_module, issue,
+            lambda: bus_module.cmd_huddle_join(
+                joiner, ns(issue=issue, as_agent="agent-b", room="integration")))
+
+        assert bus_module.cmd_pen_take(
+            r, ns(issue=issue, as_agent="agent-a", reason="driver left",
+                  room="integration")) == 0
+
+        assert state["fired"], "the concurrent join never landed — race not exercised"
+        meta = json.loads(verify.get(bus_module.k_huddle(issue)))
+        assert meta["participants"] == ["agent-d", "agent-a", "agent-b"]
+        assert meta["driver"] == "agent-a"
+        assert verify.get(bus_module.k_pen(issue)) == "agent-a"
+    finally:
+        _delete_issue_keys(verify, bus_module, issue)
+
+
+def test_real_redis_meta_write_retries_a_join_inside_the_watched_window(
+    bus_module, ns, redis_url, monkeypatch,
+):
+    """Pin the WATCH path itself: the join lands strictly BETWEEN the watched read
+    and EXEC, so the transaction must abort and re-read rather than commit a stale
+    participant list."""
+    issue = _issue_id()
+    r = bus_module.connect(redis_url)
+    verify = bus_module.connect(redis_url)
+    joiner = bus_module.connect(redis_url)
+
+    try:
+        _seed_huddle(r, bus_module, issue, ["agent-d", "agent-a"], "")
+        state = _fire_once_on_huddle_read(
+            monkeypatch, r, bus_module, issue,
+            lambda: bus_module.cmd_huddle_join(
+                joiner, ns(issue=issue, as_agent="agent-b", room="integration")),
+            where="pipeline")
+
+        assert bus_module.cmd_pen_take(
+            r, ns(issue=issue, as_agent="agent-a", reason="driver left",
+                  room="integration")) == 0
+
+        assert state["fired"], "nothing wrote inside the watched window"
+        meta = json.loads(verify.get(bus_module.k_huddle(issue)))
+        assert meta["participants"] == ["agent-d", "agent-a", "agent-b"]
+        assert meta["driver"] == "agent-a"
+    finally:
+        _delete_issue_keys(verify, bus_module, issue)
+
+
+def test_real_redis_drain_does_not_clear_a_driver_a_concurrent_take_installed(
+    bus_module, ns, redis_url, monkeypatch,
+):
+    """drain's "is the driver still me?" test is a CAS evaluated inside the
+    transaction. A `pen take` that grabs the pen drain just released, in the window
+    before drain rewrites the metadata, must keep its driver — on a stale read
+    drain would blank out a driver that is live and holding the pen."""
+    issue = _issue_id()
+    r = bus_module.connect(redis_url)
+    verify = bus_module.connect(redis_url)
+    taker = bus_module.connect(redis_url)
+
+    try:
+        _seed_huddle(r, bus_module, issue, ["agent-d", "agent-a"], "agent-d")
+        r.set(bus_module.k_pen(issue), "agent-d", ex=60)
+        monkeypatch.setattr(bus_module, "_unpushed_pen_issues", lambda *_a: [])
+        # Fires after drain has already CAS-deleted the pen key, so agent-a finds
+        # the pen unheld and takes it for real.
+        state = _fire_once_on_huddle_read(
+            monkeypatch, r, bus_module, issue,
+            lambda: bus_module.cmd_pen_take(
+                taker, ns(issue=issue, as_agent="agent-a", reason="d is draining",
+                          room="integration")))
+
+        assert bus_module.cmd_drain(
+            r, ns(as_agent="agent-d", force=False, room="integration")) == 0
+
+        assert state["fired"], "the concurrent take never landed — race not exercised"
+        assert verify.get(bus_module.k_pen(issue)) == "agent-a"
+        meta = json.loads(verify.get(bus_module.k_huddle(issue)))
+        assert meta["driver"] == "agent-a", "drain blanked a driver it no longer owned"
+    finally:
+        _delete_issue_keys(verify, bus_module, issue)
+
+
+def test_real_redis_pen_pass_keeps_a_join_that_lands_mid_meta_write(
+    bus_module, ns, redis_url, monkeypatch,
+):
+    """The fourth routed site: `pen pass` rewrites `driver` after checkpointing."""
+    issue = _issue_id()
+    r = bus_module.connect(redis_url)
+    verify = bus_module.connect(redis_url)
+    joiner = bus_module.connect(redis_url)
+
+    try:
+        _seed_huddle(r, bus_module, issue, ["agent-d", "agent-a"], "agent-d")
+        r.set(bus_module.k_pen(issue), "agent-d", ex=60)
+        # The handoff's git commit+push is not what's under test here.
+        monkeypatch.setattr(bus_module, "cmd_pen_checkpoint", lambda _r, _args: 0)
+        state = _fire_once_on_huddle_read(
+            monkeypatch, r, bus_module, issue,
+            lambda: bus_module.cmd_huddle_join(
+                joiner, ns(issue=issue, as_agent="agent-b", room="integration")))
+
+        assert bus_module.cmd_pen_pass(
+            r, ns(issue=issue, as_agent="agent-d", to="agent-a",
+                  room="integration")) == 0
+
+        assert state["fired"], "the concurrent join never landed — race not exercised"
+        meta = json.loads(verify.get(bus_module.k_huddle(issue)))
+        assert meta["participants"] == ["agent-d", "agent-a", "agent-b"]
+        assert meta["driver"] == "agent-a"
+        assert verify.get(bus_module.k_pen(issue)) == "agent-a"
+    finally:
+        _delete_issue_keys(verify, bus_module, issue)
