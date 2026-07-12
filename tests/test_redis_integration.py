@@ -1,7 +1,6 @@
 import json
 import os
 import uuid
-from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 import pytest
