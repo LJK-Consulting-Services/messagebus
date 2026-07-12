@@ -23,7 +23,6 @@ import os
 import pathlib
 import shutil
 import subprocess
-import sys
 import tempfile
 import types
 import unittest
@@ -32,7 +31,6 @@ from contextlib import redirect_stderr, redirect_stdout
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 # `bus` is extension-less; load it as a module the same way the sibling suite does.
-sys.modules.setdefault("redis", types.SimpleNamespace(WatchError=Exception))
 LOADER = importlib.machinery.SourceFileLoader("bus_mod_grc", str(ROOT / "bus"))
 SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
 bus = importlib.util.module_from_spec(SPEC)
