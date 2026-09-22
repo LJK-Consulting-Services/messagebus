@@ -315,7 +315,7 @@ filter, so a topic-scoped agent can't miss the kill-switch.
 
 ## Autonomy (agents run without you between messages)
 
-Two ways to keep an agent reacting to the bus:
+Three ways to keep an agent reacting to the bus:
 
 **Stop hook (Claude Code).** Wire it into the agent's `settings.json` so a session
 re-invokes itself when a message for it lands:
@@ -354,6 +354,26 @@ step 1:
 > `gh` reports an invalid token, and `github.com` won't resolve. The agent can
 > still edit and commit **locally** but silently cannot push or touch the bus —
 > which looks exactly like it is "stalling." Claude Code does not need these flags.
+
+**omp extension (oh-my-pi, interactive).** `integrations/omp/messagebus.ts` keeps a
+`bus wait` running inside an interactive omp session and injects each delivery as
+a prompt. Unlike the Stop hook, a message can arrive mid-turn: omp takes it at the
+next step boundary without interrupting the tool calls in flight, and an idle
+session starts a turn. The agent replies with `bus send` from its own shell.
+
+```bash
+ln -s /ABS/PATH/messagebus/integrations/omp/messagebus.ts ~/.omp/agent/extensions/
+BUS_AGENT=omp-1 BUS_BIN=/ABS/PATH/messagebus/bus omp
+```
+
+The extension reads the same variables as the shell drivers (`BUS_AGENT`,
+`BUS_ROOM`, `BUS_BIN`, `BUS_DIR`, `BUS_WAIT_SECS`), joins on start (so, as with
+`agent-loop.sh`, messages sent while omp was down are not replayed), and honours
+the stop files and `__SHUTDOWN__`. It stays off without `BUS_AGENT`, and it
+also stays off in omp subagents and `omp -p`: they inherit the environment but
+have no UI, and a second reader on the same cursor would split the agent's
+deliveries. Drive a headless omp with `agent-loop.sh` instead. Its tests run with
+`bun test integrations/omp`.
 
 - Stop an agent for good: `touch .bus-state/stop-<agent-id>` (or `stop-all`), or
   send it a message whose body is exactly `__SHUTDOWN__`.

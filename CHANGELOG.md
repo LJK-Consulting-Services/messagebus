@@ -5,6 +5,14 @@ All notable changes to messagebus. Format loosely follows
 
 ## [Unreleased]
 
+### Added
+- **omp (oh-my-pi) driver.** `integrations/omp/messagebus.ts` is an omp
+  extension that keeps `bus wait` running in an interactive session and injects
+  each delivery as a prompt, mid-turn at the next step boundary or as a new
+  turn when idle. Subagents and `omp -p` stay off so one agent id never has two
+  readers. Tested with `bun test integrations/omp` in CI, including a live-Redis
+  round trip.
+
 ### Added — production-readiness hardening (#77 roadmap)
 - **Automated test suite + CI gate (#79/B1).** GitHub Actions on every PR into
   `dev`: pytest (3.11/3.12 matrix), a pinned Redis service for the atomic-Lua

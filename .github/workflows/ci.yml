@@ -58,3 +58,10 @@ jobs:
         run: |
           python -m pytest --cov=. --cov-report=term-missing --cov-report=json:coverage.json
           python scripts/check-bus-coverage.py coverage.json
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
+      - name: omp extension tests
+        env:
+          BUS_INTEGRATION_REDIS_URL: redis://127.0.0.1:6379/0
+        run: bun test integrations/omp
