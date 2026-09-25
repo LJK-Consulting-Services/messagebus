@@ -9,6 +9,7 @@ import {
 	type WaitResult,
 	activate,
 	formatDelivery,
+	makeInjector,
 	readConfig,
 	runBridge,
 	spawnWait,
@@ -73,6 +74,59 @@ describe("formatDelivery", () => {
 		expect(text).toContain("hold VM captures");
 		expect(text).toContain("bus --room main send --from omp-1");
 		expect(text.indexOf("hold VM captures")).toBeGreaterThan(text.indexOf("BEGIN UNTRUSTED"));
+	});
+
+	test("says omp's own agent:// replies do not reach bus senders", () => {
+		expect(formatDelivery(CONFIG, MSG)).toContain("agent://");
+	});
+});
+
+describe("makeInjector", () => {
+	type Delivered = { id: string; from: string; to: string; body: string; ts: number };
+	function harness(session: { deliverIrcMessage(m: Delivered): Promise<unknown> } | undefined) {
+		const asides: string[] = [];
+		const logs: string[] = [];
+		const inject = makeInjector({
+			findMain: async () => session,
+			aside: text => asides.push(text),
+			log: msg => logs.push(msg),
+			now: () => 42,
+		});
+		return { inject, asides, logs };
+	}
+
+	test("delivers as an IRC message to Main, so an active wait wakes", async () => {
+		const got: Delivered[] = [];
+		const { inject, asides } = harness({ deliverIrcMessage: async m => void got.push(m) });
+		await inject("hello");
+		expect(asides).toEqual([]);
+		expect(got).toHaveLength(1);
+		expect(got[0]).toMatchObject({ from: "messagebus", to: "Main", body: "hello", ts: 42 });
+	});
+
+	test("gives each delivery its own id", async () => {
+		const got: Delivered[] = [];
+		const { inject } = harness({ deliverIrcMessage: async m => void got.push(m) });
+		await inject("a");
+		await inject("b");
+		expect(got[0].id).not.toBe(got[1].id);
+	});
+
+	test("falls back to an aside when omp has no Main session", async () => {
+		const { inject, asides } = harness(undefined);
+		await inject("hello");
+		expect(asides).toEqual(["hello"]);
+	});
+
+	test("falls back to an aside and logs when IRC delivery throws", async () => {
+		const { inject, asides, logs } = harness({
+			deliverIrcMessage: async () => {
+				throw new Error("disposed");
+			},
+		});
+		await inject("hello");
+		expect(asides).toEqual(["hello"]);
+		expect(logs.join(" ")).toContain("disposed");
 	});
 });
 
