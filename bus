@@ -22,8 +22,11 @@ Commands:
   thread   print the full reply_to thread containing a message id
   inbox    peek unread messages for you (directed or questions); cursor untouched
   prune    trim a room to the newest --keep messages (destructive, guarded)
-  join     register presence and set your cursor to "now"
+  join     register presence and set your cursor to "now" (--replay: the start; --group/--role/--model ...)
   agents   list agents currently present in a room
+  state    set your roster state (working | waiting)
+  title    print or set the room title
+  roster   members with role, model, state, groups and presence
   claim    atomically claim a gh issue (Redis lock + status label); --worktree
   release  release a claim you hold
   renew    extend the TTL on a claim you hold (long-running tasks)
@@ -70,6 +73,9 @@ PEN_TAKE_GRACE = 120  # seconds an absent driver has to reappear before a force-
 def k_stream(room):   return f"bus:stream:{room}"
 def k_cursor(room, a): return f"bus:cursor:{room}:{a}"
 def k_presence(room, a): return f"bus:presence:{room}:{a}"
+def k_member(room, a): return f"bus:member:{room}:{a}"
+def k_groups(room, a): return f"bus:groups:{room}:{a}"
+def k_meta(room):      return f"bus:meta:{room}"
 def k_lock(issue):    return f"bus:lock:issue:{issue}"
 def k_worktree(issue, agent=None):
     base = f"bus:worktree:issue:{issue}"
@@ -543,22 +549,33 @@ def fields_to_msg(msg_id, fields):
     }
 
 
-def deliverable(msg, agent, topic=None, reply_to=None):
+def addressed_to(to, agent, groups=()):
+    """`to` is a comma list of ids, `@name`s and `all`; `@name` matches the
+    agent with that id or any member of group `name`, resolved at read time."""
+    targets = to.split(",")
+    if "all" in targets or agent in targets:
+        return True
+    mentions = {t[1:] for t in targets if t.startswith("@")}
+    return agent in mentions or bool(mentions & set(groups))
+
+
+def deliverable(msg, agent, topic=None, reply_to=None, groups=(), replay_floor=None):
     """True if this message should be shown to `agent`.
 
     `topic` / `reply_to`, if given, narrow delivery (exact match) — but NEITHER
     filters the shutdown signal. A scoped listener (one topic, or awaiting one
     reply) must never let its own scoping swallow a `--to all __SHUTDOWN__`
-    kill-switch, so __SHUTDOWN__ always passes both filters.
+    kill-switch, so __SHUTDOWN__ always passes both filters. The one exception
+    is a shutdown at or before `replay_floor`: it stopped an earlier swarm, not
+    an agent that joined with --replay after it.
     """
-    addressed = msg["to"] == "all" or msg["to"] == agent
-    if not addressed:
+    if not addressed_to(msg["to"], agent, groups):
         return False
     is_shutdown = msg["body"].strip() == SHUTDOWN
     if msg["from"] == agent and not is_shutdown:
         return False  # suppress self-echo, except a self-addressed shutdown
     if is_shutdown:
-        return True   # stop signal bypasses every narrowing filter
+        return not (replay_floor and _id_key(msg["id"]) <= _id_key(replay_floor))
     if topic and msg["topic"] != topic:
         return False  # topic narrows chatter, never the stop signal
     if reply_to and msg["reply_to"] != reply_to:
@@ -580,6 +597,9 @@ def cmd_send(r, args):
                          reply_to=args.reply_to or "")
     msg_id = r.xadd(k_stream(args.room), fields)
     touch_presence(r, args.room, args.frm)
+    for name in unknown_mentions(r, args.room, args.to):
+        sys.stderr.write(f"bus send: warning: no agent or group '@{name}' in room={args.room} yet; "
+                         "it will be delivered if one joins with --replay\n")
     if args.json:
         print(json.dumps({"id": msg_id, "room": args.room}))
     else:
@@ -595,6 +615,8 @@ def read_from_cursor(r, room, agent, block_ms=None, count=100, topic=None, reply
     re-read on the next poll.
     """
     cur = r.get(k_cursor(room, agent)) or "0-0"
+    groups = r.smembers(k_groups(room, agent))
+    replay_floor = r.hget(k_member(room, agent), "replay_floor")
     kwargs = {"count": count}
     if block_ms is not None:
         kwargs["block"] = block_ms
@@ -605,7 +627,7 @@ def read_from_cursor(r, room, agent, block_ms=None, count=100, topic=None, reply
         for msg_id, fields in entries:
             last_seen = msg_id
             msg = fields_to_msg(msg_id, fields)
-            if deliverable(msg, agent, topic, reply_to):
+            if deliverable(msg, agent, topic, reply_to, groups, replay_floor):
                 delivered.append(msg)
     return delivered, last_seen
 
@@ -820,15 +842,17 @@ def cmd_inbox(r, args):
     peek_cap = 1000
     resp = r.xread({k_stream(args.room): cur}, count=peek_cap)  # bounded peek, no block
     entries = resp[0][1] if resp else []
+    groups = r.smembers(k_groups(args.room, args.as_agent))
     items = []
     for mid, f in entries:
         m = fields_to_msg(mid, f)
         if m["from"] == args.as_agent:
             continue
-        directed = m["to"] == args.as_agent
+        addressed = addressed_to(m["to"], args.as_agent, groups)
+        directed = addressed and m["to"] != "all"
         # a question counts only if it's actually addressed to me (or broadcast);
         # a question aimed at another agent is not my inbox.
-        if directed or (m["kind"] == "question" and m["to"] == "all"):
+        if directed or (m["kind"] == "question" and addressed):
             items.append(m)
     if len(entries) == peek_cap:
         sys.stderr.write(f"bus inbox: showing the oldest {peek_cap} unread; more remain — poll to advance\n")
@@ -1324,12 +1348,98 @@ def cmd_join(r, args):
             info_id = last[0][0]
     except redis.ResponseError:
         pass
-    r.set(k_cursor(args.room, args.as_agent), info_id)
+    cursor = "0-0" if args.replay else info_id
+    r.set(k_cursor(args.room, args.as_agent), cursor)
     touch_presence(r, args.room, args.as_agent)
+    record_member(r, args, info_id)
     if args.json:
-        print(json.dumps({"joined": args.as_agent, "room": args.room, "cursor": info_id}))
+        print(json.dumps({"joined": args.as_agent, "room": args.room, "cursor": cursor}))
     else:
-        print(f"{args.as_agent} joined room={args.room} (cursor at {info_id})")
+        print(f"{args.as_agent} joined room={args.room} (cursor at {cursor})")
+    return 0
+
+
+MEMBER_FIELDS = ("role", "harness", "model", "workspace", "conversation")
+
+
+def record_member(r, args, head_id):
+    fields = {f: getattr(args, f) for f in MEMBER_FIELDS if getattr(args, f, None)}
+    fields["joined"] = now_iso()
+    if args.replay:
+        fields["replay_floor"] = head_id
+    r.hset(k_member(args.room, args.as_agent), mapping=fields)
+    if args.group:
+        r.sadd(k_groups(args.room, args.as_agent), *args.group)
+
+
+def room_names(r, room):
+    """Every agent id and group name the room knows about."""
+    names = set()
+    for pattern in (k_member(room, "*"), k_presence(room, "*"), k_groups(room, "*")):
+        for key in r.scan_iter(match=pattern):
+            names.add(key.rsplit(":", 1)[-1])
+    for key in r.scan_iter(match=k_groups(room, "*")):
+        names |= r.smembers(key)
+    return names
+
+
+def unknown_mentions(r, room, to):
+    mentions = [t[1:] for t in to.split(",") if t.startswith("@")]
+    if not mentions:
+        return []
+    known = room_names(r, room)
+    return [m for m in mentions if m not in known]
+
+
+def cmd_state(r, args):
+    fields = {"state": args.state, "state_at": now_iso()}
+    if args.doing:
+        fields["doing"] = args.doing
+    r.hset(k_member(args.room, args.as_agent), mapping=fields)
+    touch_presence(r, args.room, args.as_agent)
+    return 0
+
+
+def cmd_usage(r, args):
+    key = k_member(args.room, args.as_agent)
+    pipe = r.pipeline()
+    pipe.hincrby(key, "tokens_in", args.tokens_in)
+    pipe.hincrby(key, "tokens_out", args.tokens_out)
+    pipe.hincrby(key, "turns", 1)
+    if args.cost is not None:
+        pipe.hincrbyfloat(key, "cost_usd", args.cost)
+    pipe.execute()
+    return 0
+
+
+def cmd_title(r, args):
+    if args.text:
+        r.hset(k_meta(args.room), "title", args.text)
+    print(r.hget(k_meta(args.room), "title") or args.room)
+    return 0
+
+
+def roster_entry(r, room, agent):
+    member = r.hgetall(k_member(room, agent))
+    member.pop("replay_floor", None)
+    return {"agent": agent, **member,
+            "groups": sorted(r.smembers(k_groups(room, agent))),
+            "present": bool(r.exists(k_presence(room, agent)))}
+
+
+def cmd_roster(r, args):
+    agents = set()
+    for pattern in (k_member(args.room, "*"), k_presence(args.room, "*")):
+        agents |= {key.rsplit(":", 1)[-1] for key in r.scan_iter(match=pattern)}
+    roster = [roster_entry(r, args.room, a) for a in sorted(agents)]
+    if args.json:
+        print(json.dumps(roster))
+        return 0
+    for m in roster:
+        state = m.get("state", "?") if m["present"] else "gone"
+        groups = ",".join("@" + g for g in m["groups"])
+        print(f"{terminal_line(m['agent'])}\t{state}\t{terminal_line(m.get('role', ''))}\t"
+              f"{terminal_line(m.get('model', ''))}\t{terminal_line(groups)}")
     return 0
 
 
@@ -2962,6 +3072,20 @@ def ident(value):
     return value
 
 
+_RECIPIENT_RE = re.compile(r"^@?[A-Za-z0-9._-]+$")
+
+
+def recipients(value):
+    parts = value.split(",")
+    bad = [p for p in parts if not _RECIPIENT_RE.match(p)]
+    if bad:
+        raise argparse.ArgumentTypeError(
+            f"'{value}': each recipient must be an id, @name or 'all' ([A-Za-z0-9._-]+)")
+    if "all" in parts:
+        return "all"
+    return ",".join(dict.fromkeys(parts))
+
+
 def positive_int(value):
     if not value.isdigit() or int(value) < 1:
         raise argparse.ArgumentTypeError(f"'{value}' must be a positive integer")
@@ -2992,7 +3116,8 @@ def build_parser():
 
     s = sub.add_parser("send", help="publish a message")
     s.add_argument("--from", dest="frm", type=ident, required=True, help="your agent id")
-    s.add_argument("--to", default="all", type=ident, help="recipient agent id or 'all' (default all)")
+    s.add_argument("--to", default="all", type=recipients,
+                   help="comma list of agent ids, @name (agent or group) and 'all' (default all)")
     # default=None (not "") so argparse doesn't run `ident` on the empty default
     # and reject a plain send with no topic; cmd_send maps None -> "".
     s.add_argument("--topic", type=ident, default=None, help="optional topic slug, e.g. issue-42 (must be filter-safe: [A-Za-z0-9._-]+)")
@@ -3045,8 +3170,26 @@ def build_parser():
 
     sub.add_parser("board", help="table of gh issues + status + lock holder + presence")
 
-    _as(sub.add_parser("join", help="register presence, cursor to now"))
+    j = sub.add_parser("join", help="register presence, cursor to now (or the start with --replay)")
+    _as(j)
+    j.add_argument("--replay", action="store_true",
+                   help="start the cursor at the beginning of the room so the backlog is delivered")
+    j.add_argument("--group", action="append", type=ident, help="join group NAME (repeatable); reached as @NAME")
+    for field in MEMBER_FIELDS:
+        j.add_argument(f"--{field}", help=f"record this member's {field} for the roster")
     sub.add_parser("agents", help="list present agents")
+    st = sub.add_parser("state", help="set your roster state: working or waiting")
+    _as(st)
+    st.add_argument("state", choices=("working", "waiting", "retired"))
+    st.add_argument("--doing", help="one line on what you are doing now, shown on the board")
+    us = sub.add_parser("usage", help="add one turn's token usage to your roster totals")
+    _as(us)
+    us.add_argument("--tokens-in", type=int, default=0)
+    us.add_argument("--tokens-out", type=int, default=0)
+    us.add_argument("--cost", type=float, default=None, help="USD for this turn, when the harness reports it")
+    ti = sub.add_parser("title", help="print the room title, or set it")
+    ti.add_argument("text", nargs="?")
+    sub.add_parser("roster", help="members with role, model, state, groups and presence")
 
     c = sub.add_parser("claim", help="atomically claim a gh issue")
     _as(c); _issue(c)
@@ -3141,6 +3284,7 @@ DISPATCH = {
     "reap": cmd_reap, "drain": cmd_drain, "board": cmd_board, "ws": cmd_ws,
     "huddle": cmd_huddle, "pen": cmd_pen,
     "signoff": cmd_signoff, "unblock": cmd_unblock,
+    "state": cmd_state, "usage": cmd_usage, "title": cmd_title, "roster": cmd_roster,
 }
 
 
