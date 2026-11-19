@@ -362,7 +362,10 @@ class BoardState:
         return models.pop() if len(models) == 1 else ""
 
     def finished(self):
-        return bool(self.posts) and self.posts[-1].kind == "done"
+        if not self.posts:
+            return False
+        last = self.posts[-1]
+        return bus.ends_swarm({"body": last.body, "kind": last.kind}, self.info(last.sender).get("role"))
 
     def status(self, name):
         info = self.info(name)

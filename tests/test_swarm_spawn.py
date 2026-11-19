@@ -84,6 +84,16 @@ class SwarmSpawnE2E(BusE2E):
         self.assertIn("second", self.seat_calls()[1]["prompt"])
         self.assertNotIn("\nfirst\n", self.seat_calls()[1]["prompt"])
 
+    def test_worker_killed_mid_wake_gets_the_post_again_on_respawn(self):
+        out = self.spawn("--as", "w1", "--harness", "cmd")
+        self.bus("send", "--from", "coord", "--to", "w1", "SLEEP then work")
+        self.wait_for(lambda: len(self.seat_calls()) == 1)
+        os.kill(out["pid"], signal.SIGKILL)
+        self.wait_for(lambda: subprocess.run(["kill", "-0", str(out["pid"])], capture_output=True).returncode)
+        self.spawn("--as", "w1", "--harness", "cmd")
+        self.wait_for(lambda: len(self.seat_calls()) == 2, timeout=40)
+        self.assertIn("SLEEP then work", self.seat_calls()[1]["prompt"])
+
     def test_spawn_rejects_unknown_seat(self):
         res = subprocess.run([sys.executable, SPAWN, "--url", URL, "--room", self.room, "--as", "w3",
                               "--harness", "nope"], capture_output=True, text=True, env=self.env)

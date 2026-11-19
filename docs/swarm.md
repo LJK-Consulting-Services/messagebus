@@ -61,8 +61,13 @@ delivered. On each wake it:
 5. posts a `system` message to the coordinator when the seat exits non-zero;
 6. sets `waiting`.
 
-A `--kind done` post or `__SHUTDOWN__` addressed to the member retires it: the worker sets `retired`, keeps the post's
-first line as `doing`, and exits. A second worker with the same id exits with code 3.
+`__SHUTDOWN__`, or a `--kind done` post from a member whose roster role is `coordinator`, retires the member: the worker
+sets `retired`, keeps the post's first line as `doing`, and exits. A `done` from anyone else is an ordinary post. The
+board uses the same rule (`bus.ends_swarm`) for its `✓ finished` header. A second worker with the same id exits with
+code 3.
+
+The worker commits its cursor after the wake, not before. A worker killed mid-wake and respawned with `swarm-spawn`
+gets the same posts again.
 
 | seat kind | first wake | later wakes |
 |---|---|---|

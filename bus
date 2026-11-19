@@ -563,6 +563,14 @@ def is_stop(msg):
     return msg["body"].strip() == SHUTDOWN or msg.get("kind") == "done"
 
 
+def ends_swarm(msg, sender_role):
+    """The one rule for "this post ends the swarm", shared by swarm-worker and swarm-board: __SHUTDOWN__ from anyone
+    (the bus kill switch), or `--kind done` from a member whose roster role is coordinator."""
+    if msg["body"].strip() == SHUTDOWN:
+        return True
+    return msg.get("kind") == "done" and sender_role == "coordinator"
+
+
 def deliverable(msg, agent, topic=None, reply_to=None, groups=(), replay_floor=None):
     """True if this message should be shown to `agent`.
 

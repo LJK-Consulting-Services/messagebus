@@ -300,6 +300,13 @@ class SwarmBoardTests(unittest.IsolatedAsyncioTestCase):
             await self.load(app, pilot)
             self.assertNotIn("finished", text_of(app.query_one("#header")))
 
+    async def test_done_from_a_non_coordinator_is_not_finished(self):
+        self.post(5, "w1", "all", "I declare victory", kind="done")
+        app = self.make_app()
+        async with app.run_test(size=SIZE) as pilot:
+            await self.load(app, pilot)
+            self.assertNotIn("finished", text_of(app.query_one("#header")))
+
     async def test_working_without_presence_is_gone(self):
         self.r.delete(f"bus:presence:{ROOM}:w1")
         app = self.make_app()

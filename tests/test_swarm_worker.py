@@ -92,7 +92,11 @@ class BusE2E(unittest.TestCase):
         return subprocess.run([sys.executable, BUS, "--url", URL, "--room", self.room, *args],
                               input=stdin, capture_output=True, text=True, env=self.env)
 
+    def join_coordinator(self):
+        self.bus("join", "--as", "coord", "--role", "coordinator")
+
     def start_worker(self, agent="w1", **env):
+        self.join_coordinator()
         self.bus("join", "--as", agent, "--replay", "--role", "worker", "--harness", "cmd")
         p = subprocess.Popen([sys.executable, WORKER, agent, "cmd"], env=dict(self.env, **env),
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -191,6 +195,7 @@ class SwarmWorkerE2E(BusE2E):
         self.assertNotEqual(self.member()["state"], "retired")
 
     def test_replayed_done_from_an_earlier_swarm_is_skipped(self):
+        self.join_coordinator()
         self.bus("send", "--from", "coord", "--to", "all", "--kind", "done", "old swarm over")
         self.bus("send", "--from", "coord", "--to", "@w1", "new brief")
         p = self.start_worker(SWARM_COORDINATOR="coord")

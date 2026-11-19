@@ -111,15 +111,21 @@ class Worker:
         bus.touch_presence(self.r, self.room, self.agent)
 
     def wait(self):
+        """(posts for this member, the cursor to commit once they are handled). Posts not for the member are
+        skipped at once; posts for it are committed only after the wake, so a worker killed mid-wake gets them
+        again when it is respawned."""
         deadline = time.monotonic() + self.wait_secs
         while time.monotonic() < deadline:
             bus.touch_presence(self.r, self.room, self.agent)
             delivered, last_seen = bus.read_from_cursor(self.r, self.room, self.agent, block_ms=bus.BLOCK_CHUNK_MS)
-            if last_seen:
-                self.r.set(bus.k_cursor(self.room, self.agent), last_seen)
             if delivered:
-                return delivered
-        return []
+                return delivered, last_seen
+            if last_seen:
+                self.commit(last_seen)
+        return [], None
+
+    def commit(self, cursor):
+        self.r.set(bus.k_cursor(self.room, self.agent), cursor)
 
     def post(self, to, body, kind="msg"):
         self.r.xadd(bus.k_stream(self.room), bus.make_fields(self.agent, to, body, kind=kind))
@@ -221,20 +227,19 @@ class Worker:
     def loop(self):
         self.set_state("waiting")
         while not self.should_stop():
-            msgs = self.wait()
+            msgs, cursor = self.wait()
             finished = [m for m in msgs if self.ends_swarm(m)]
             if finished:
+                self.commit(cursor)
                 self.set_state("retired", doing=(finished[-1]["body"].strip().splitlines() or [""])[0][:200])
                 return 0
             if msgs:
                 self.wake_safely(msgs)
+                self.commit(cursor)
         return 0
 
     def ends_swarm(self, msg):
-        """__SHUTDOWN__ from anyone (the bus kill switch); `done` only from the coordinator."""
-        if msg["body"].strip() == bus.SHUTDOWN:
-            return True
-        return msg["kind"] == "done" and msg["from"] == self.coordinator
+        return bus.ends_swarm(msg, self.r.hget(bus.k_member(self.room, msg["from"]), "role"))
 
     def wake_safely(self, msgs):
         try:
