@@ -47,8 +47,8 @@ bus --room swarm-x roster [--json]
 - `state` is `working`, `waiting` or `retired`. `--doing` is the one-line status the board shows.
 - `usage` adds one turn's tokens, and its cost when the harness reports it, to the member's totals. `--tokens-in`
   counts only input the model processed fresh; `--tokens-cached` counts prompt-cache reads, which re-send the same
-  context on every API call and would otherwise swamp the total. The board's `tok` figures leave cache reads out and
-  show them as `cached` in the member detail.
+  context on every API call and would otherwise swamp the total. The board header shows both (`1.4M tok · +9M cached`), each
+  card shows `tok`, and member detail splits in, out and cached. Cache reads still count toward a plan's limits.
 - `roster` lists every member, including ones whose presence has expired (`present: false`).
 
 ## Workers
