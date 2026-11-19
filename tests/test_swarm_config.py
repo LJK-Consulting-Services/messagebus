@@ -1,11 +1,14 @@
 """Seat choice by intelligence band and quota headroom (scripts/swarm_config.py), plus the agy workspace snapshot."""
 import importlib.machinery
 import importlib.util
+import json
 import os
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
+from unittest import mock
 
 SCRIPTS = os.path.join(os.path.dirname(__file__), os.pardir, "scripts")
 sys.path.insert(0, SCRIPTS)
@@ -76,6 +79,52 @@ def load_worker():
     mod = importlib.util.module_from_spec(spec)
     loader.exec_module(mod)
     return mod
+
+
+OMP_TURN_END = {"type": "turn_end", "message": {
+    "role": "assistant", "content": [{"type": "text", "text": "ok"}],
+    "usage": {"input": 4, "output": 4, "cacheRead": 49533, "cacheWrite": 7245, "totalTokens": 56786,
+              "cost": {"total": 0.0389346}}}}
+
+
+class SeatOutputTest(unittest.TestCase):
+    """Event shapes taken from real seat runs (omp `-p --mode json`, 2026-11-19)."""
+
+    def test_omp_turn_end_usage_cost_and_text(self):
+        worker = load_worker()
+        lines = [{"type": "session", "id": "01a1f292"}, {"type": "message_end", "message": {"role": "user"}},
+                 OMP_TURN_END, {"type": "agent_end", "messages": []}]
+        out = worker.parse_output("\n".join(json.dumps(line) for line in lines))
+        self.assertEqual((out["in"], out["out"], out["text"]), (56782, 4, "ok"))
+        self.assertAlmostEqual(out["cost"], 0.0389346)
+
+    def test_claude_result_still_parses(self):
+        worker = load_worker()
+        line = {"type": "result", "result": "done", "session_id": "s1", "total_cost_usd": 0.5,
+                "usage": {"input_tokens": 10, "output_tokens": 2, "cache_read_input_tokens": 90}}
+        out = worker.parse_output(json.dumps(line))
+        self.assertEqual((out["in"], out["out"], out["cost"], out["session"], out["text"]), (100, 2, 0.5, "s1", "done"))
+
+    def test_seat_without_stdin_gets_a_closed_empty_stdin(self):
+        worker = load_worker()
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen.update(kwargs)
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+        w = types.SimpleNamespace(seat={"kind": "omp"}, workspace=None, seat_timeout=5)
+        with mock.patch.object(worker.subprocess, "run", fake_run), \
+                mock.patch.dict(worker.SEATS, {"omp": lambda *_: (["omp"], None, {})}):
+            worker.Worker.invoke(w, "prompt", "sid")
+        self.assertEqual(seen["input"], "")
+
+    def test_prompts_name_this_checkouts_bus(self):
+        worker = load_worker()
+        w = types.SimpleNamespace(agent="w1", room="r", coordinator="coordinator")
+        self.assertIn(worker.BUS_PATH, worker.Worker.render(w, []))
+        self.assertIn(worker.BUS_PATH, worker.Worker.system_prompt(w))
+        self.assertNotIn("{BUS}", worker.Worker.system_prompt(w))
 
 
 class SnapshotTest(unittest.TestCase):
