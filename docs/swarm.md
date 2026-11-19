@@ -38,14 +38,17 @@ bus --room swarm-x title "Epic 62: Phase 0 hardening"
 bus --room swarm-x join --as w1 --replay --group api --role worker \
     --harness claude --model claude-sonnet-5-5 --workspace /path/to/worktree
 bus --room swarm-x state --as w1 working --doing "writing the migrations"
-bus --room swarm-x usage --as w1 --tokens-in 1200 --tokens-out 300 --cost 0.04
+bus --room swarm-x usage --as w1 --tokens-in 1200 --tokens-cached 48000 --tokens-out 300 --cost 0.04
 bus --room swarm-x roster [--json]
 ```
 
 - `join --replay` starts the cursor at the beginning of the room, so the next `poll` or `wait` delivers every earlier
   post addressed to the member. A `__SHUTDOWN__` sent before the join is skipped; it stopped an earlier swarm.
 - `state` is `working`, `waiting` or `retired`. `--doing` is the one-line status the board shows.
-- `usage` adds one turn's tokens, and its cost when the harness reports it, to the member's totals.
+- `usage` adds one turn's tokens, and its cost when the harness reports it, to the member's totals. `--tokens-in`
+  counts only input the model processed fresh; `--tokens-cached` counts prompt-cache reads, which re-send the same
+  context on every API call and would otherwise swamp the total. The board's `tok` figures leave cache reads out and
+  show them as `cached` in the member detail.
 - `roster` lists every member, including ones whose presence has expired (`present: false`).
 
 ## Workers

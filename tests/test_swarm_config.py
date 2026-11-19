@@ -121,7 +121,7 @@ class SeatOutputTest(unittest.TestCase):
         lines = [{"type": "session", "id": "01a1f292"}, {"type": "message_end", "message": {"role": "user"}},
                  OMP_TURN_END, {"type": "agent_end", "messages": []}]
         out = worker.parse_output("\n".join(json.dumps(line) for line in lines))
-        self.assertEqual((out["in"], out["out"], out["text"]), (56782, 4, "ok"))
+        self.assertEqual((out["in"], out["cached"], out["out"], out["text"]), (7249, 49533, 4, "ok"))
         self.assertAlmostEqual(out["cost"], 0.0389346)
 
     def test_claude_result_still_parses(self):
@@ -129,7 +129,15 @@ class SeatOutputTest(unittest.TestCase):
         line = {"type": "result", "result": "done", "session_id": "s1", "total_cost_usd": 0.5,
                 "usage": {"input_tokens": 10, "output_tokens": 2, "cache_read_input_tokens": 90}}
         out = worker.parse_output(json.dumps(line))
-        self.assertEqual((out["in"], out["out"], out["cost"], out["session"], out["text"]), (100, 2, 0.5, "s1", "done"))
+        self.assertEqual((out["in"], out["cached"], out["out"], out["cost"], out["session"], out["text"]),
+                         (10, 90, 2, 0.5, "s1", "done"))
+
+    def test_codex_cached_tokens_come_out_of_input(self):
+        worker = load_worker()
+        line = {"type": "turn.completed", "usage": {"input_tokens": 149236, "cached_input_tokens": 139264,
+                                                    "output_tokens": 649}}
+        out = worker.parse_output(json.dumps(line))
+        self.assertEqual((out["in"], out["cached"], out["out"]), (9972, 139264, 649))
 
     def test_seat_without_stdin_gets_a_closed_empty_stdin(self):
         worker = load_worker()

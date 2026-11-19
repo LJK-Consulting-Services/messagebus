@@ -113,7 +113,8 @@ class SwarmBoardTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(app.state.color("aaa-new"), colors[:6])
 
     async def test_header_totals_and_card_usage(self):
-        self.r.hset(f"bus:member:{ROOM}:w1", mapping={"tokens_in": 1_000_000, "tokens_out": 234_567, "cost_usd": 1.5})
+        self.r.hset(f"bus:member:{ROOM}:w1", mapping={"tokens_in": 1_000_000, "tokens_out": 234_567, "cost_usd": 1.5,
+                                                      "tokens_cached": 9_000_000})
         self.r.hset(f"bus:member:{ROOM}:coordinator", mapping={"tokens_in": 100_000, "tokens_out": 28_000, "cost_usd": 0.42})
         app = self.make_app()
         async with app.run_test(size=SIZE) as pilot:
@@ -141,7 +142,7 @@ class SwarmBoardTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_detail_shows_usage_groups_and_harness(self):
         self.r.hset(f"bus:member:{ROOM}:w1", mapping={"harness": "omp", "tokens_in": 1234, "tokens_out": 56,
-                                                      "turns": 7, "cost_usd": 0.5})
+                                                      "tokens_cached": 870_000, "turns": 7, "cost_usd": 0.5})
         self.r.sadd(f"bus:groups:{ROOM}:w1", "api", "ui")
         app = self.make_app()
         async with app.run_test(size=SIZE) as pilot:
@@ -150,7 +151,7 @@ class SwarmBoardTests(unittest.IsolatedAsyncioTestCase):
             detail = text_of(app.query_one("#detail"))
             self.assertIn("harness       omp", detail)
             self.assertIn("@api @ui", detail)
-            self.assertIn("in 1.2k / out 56 · 7 turns · $0.50", detail)
+            self.assertIn("in 1.2k / out 56 · cached 870k · 7 turns · $0.50", detail)
             self.assertIn("working", detail)
 
     async def test_recipients_shown_after_sender_unless_all(self):

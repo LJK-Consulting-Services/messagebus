@@ -132,7 +132,7 @@ class SwarmWorkerE2E(BusE2E):
         self.bus("send", "--from", "coord", "--to", "w1", "do the thing")
         self.wait_for(lambda: any(p["body"] == "ack" for p in self.posts()))
         m = self.wait_for(lambda: self.member().get("turns") == "1" and self.member())
-        self.assertEqual((m["tokens_in"], m["tokens_out"]), ("1000", "10"))
+        self.assertEqual((m["tokens_in"], m["tokens_cached"], m["tokens_out"]), ("100", "900", "10"))
         self.assertAlmostEqual(float(m["cost_usd"]), 0.25)
         self.wait_for(lambda: self.member().get("state") == "waiting")
         self.assertIn("do the thing", self.seat_calls()[0]["prompt"])

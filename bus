@@ -1418,6 +1418,7 @@ def cmd_usage(r, args):
     key = k_member(args.room, args.as_agent)
     pipe = r.pipeline()
     pipe.hincrby(key, "tokens_in", args.tokens_in)
+    pipe.hincrby(key, "tokens_cached", args.tokens_cached)
     pipe.hincrby(key, "tokens_out", args.tokens_out)
     pipe.hincrby(key, "turns", 1)
     if args.cost is not None:
@@ -3198,7 +3199,8 @@ def build_parser():
     st.add_argument("--doing", help="one line on what you are doing now, shown on the board")
     us = sub.add_parser("usage", help="add one turn's token usage to your roster totals")
     _as(us)
-    us.add_argument("--tokens-in", type=int, default=0)
+    us.add_argument("--tokens-in", type=int, default=0, help="input tokens not served from the prompt cache")
+    us.add_argument("--tokens-cached", type=int, default=0, help="input tokens read from the prompt cache")
     us.add_argument("--tokens-out", type=int, default=0)
     us.add_argument("--cost", type=float, default=None, help="USD for this turn, when the harness reports it")
     ti = sub.add_parser("title", help="print the room title, or set it")

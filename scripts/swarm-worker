@@ -132,11 +132,14 @@ class Worker:
 
     def record_usage(self, usage):
         key = bus.k_member(self.room, self.agent)
-        self.r.hincrby(key, "tokens_in", usage["in"])
-        self.r.hincrby(key, "tokens_out", usage["out"])
-        self.r.hincrby(key, "turns", 1)
+        pipe = self.r.pipeline()
+        pipe.hincrby(key, "tokens_in", usage["in"])
+        pipe.hincrby(key, "tokens_cached", usage["cached"])
+        pipe.hincrby(key, "tokens_out", usage["out"])
+        pipe.hincrby(key, "turns", 1)
         if usage["cost"] is not None:
-            self.r.hincrbyfloat(key, "cost_usd", usage["cost"])
+            pipe.hincrbyfloat(key, "cost_usd", usage["cost"])
+        pipe.execute()
 
     # ---- one wake -------------------------------------------------------------
     def heartbeat(self, done):
@@ -379,9 +382,11 @@ def json_objects(text):
 
 
 def usage_tokens(usage):
-    tokens_in = sum(usage.get(k) or 0 for k in
-                    ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
-    return tokens_in, usage.get("output_tokens") or 0
+    """(fresh in, cache reads, out). Claude reports cache reads apart from input; Codex counts them inside input."""
+    codex_cached = usage.get("cached_input_tokens") or 0
+    fresh = (usage.get("input_tokens") or 0) - codex_cached + (usage.get("cache_creation_input_tokens") or 0)
+    cached = (usage.get("cache_read_input_tokens") or 0) + codex_cached
+    return fresh, cached, usage.get("output_tokens") or 0
 
 
 def omp_turn(obj):
@@ -404,31 +409,31 @@ def final_text(obj):
 
 
 def usage_of(obj):
-    """(tokens in, tokens out, cost or None) for one event: claude's result and codex's turn.completed carry a
+    """(fresh in, cache reads, out, cost or None) for one event: claude's result and codex's turn.completed carry a
     top-level `usage`; omp's turn_end carries `message.usage` with its own key names and the cost inside."""
     if isinstance(obj.get("usage"), dict):
-        tokens_in, tokens_out = usage_tokens(obj["usage"])
         cost = obj.get("total_cost_usd")
-        return tokens_in, tokens_out, None if cost is None else float(cost)
+        return (*usage_tokens(obj["usage"]), None if cost is None else float(cost))
     usage = (omp_turn(obj) or {}).get("usage")
     if not isinstance(usage, dict):
         return None
-    tokens_in = sum(usage.get(k) or 0 for k in ("input", "cacheRead", "cacheWrite"))
+    fresh = (usage.get("input") or 0) + (usage.get("cacheWrite") or 0)
     cost = (usage.get("cost") or {}).get("total")
-    return tokens_in, usage.get("output") or 0, None if cost is None else float(cost)
+    return fresh, usage.get("cacheRead") or 0, usage.get("output") or 0, None if cost is None else float(cost)
 
 
 def parse_output(text):
-    out = {"session": "", "in": 0, "out": 0, "cost": None, "text": ""}
+    out = {"session": "", "in": 0, "cached": 0, "out": 0, "cost": None, "text": ""}
     for obj in json_objects(text):
         out["session"] = obj.get("session_id") or obj.get("thread_id") or out["session"]
         out["text"] = final_text(obj) or out["text"]
         usage = usage_of(obj)
         if usage:
             out["in"] += usage[0]
-            out["out"] += usage[1]
-            if usage[2] is not None:
-                out["cost"] = (out["cost"] or 0) + usage[2]
+            out["cached"] += usage[1]
+            out["out"] += usage[2]
+            if usage[3] is not None:
+                out["cost"] = (out["cost"] or 0) + usage[3]
     return out
 
 

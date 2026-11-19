@@ -290,7 +290,7 @@ bus agents                                   # who is present
 bus drain    --as A [--force]                # graceful exit: release your pens + presence (claims kept)
 bus roster                                   # members: role, harness, model, state, groups, presence
 bus state    --as A working|waiting|retired [--doing "what I'm on"]
-bus usage    --as A --tokens-in N --tokens-out N [--cost USD]   # add one turn to A's totals
+bus usage    --as A --tokens-in N --tokens-out N [--tokens-cached N] [--cost USD]   # add one turn to A's totals
 bus title    ["Room title"]                  # print or set
 
 # task coordination (needs BUS_GH_REPO + gh)

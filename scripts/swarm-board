@@ -645,6 +645,8 @@ def usage_detail(info):
     parts = []
     if info.get("tokens_in") is not None or info.get("tokens_out") is not None:
         parts.append(f"in {short_count(to_number(info.get('tokens_in')))} / out {short_count(to_number(info.get('tokens_out')))}")
+    if to_number(info.get("tokens_cached")):
+        parts.append(f"cached {short_count(to_number(info.get('tokens_cached')))}")
     if info.get("turns") is not None:
         parts.append(plural(to_number(info.get("turns")), "turn"))
     if info.get("cost_usd") is not None:

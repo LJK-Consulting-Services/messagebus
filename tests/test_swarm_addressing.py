@@ -167,10 +167,11 @@ class SwarmRedisTest(unittest.TestCase):
         self.assertEqual(self.r.hget(bus.k_member(ROOM, "w1"), "doing"), "writing migrations")
 
     def test_usage_accumulates_tokens_turns_and_cost(self):
-        self.run_cmd(bus.cmd_usage, as_agent="w1", tokens_in=100, tokens_out=20, cost=0.5)
-        self.run_cmd(bus.cmd_usage, as_agent="w1", tokens_in=50, tokens_out=5, cost=None)
+        self.run_cmd(bus.cmd_usage, as_agent="w1", tokens_in=100, tokens_cached=900, tokens_out=20, cost=0.5)
+        self.run_cmd(bus.cmd_usage, as_agent="w1", tokens_in=50, tokens_cached=0, tokens_out=5, cost=None)
         member = self.r.hgetall(bus.k_member(ROOM, "w1"))
-        self.assertEqual((member["tokens_in"], member["tokens_out"], member["turns"]), ("150", "25", "2"))
+        self.assertEqual((member["tokens_in"], member["tokens_cached"], member["tokens_out"], member["turns"]),
+                         ("150", "900", "25", "2"))
         self.assertAlmostEqual(float(member["cost_usd"]), 0.5)
 
     def test_roster_shows_harness(self):
