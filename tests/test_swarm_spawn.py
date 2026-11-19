@@ -73,6 +73,35 @@ class SwarmSpawnE2E(BusE2E):
         second = self.spawn("--as", "w2", config=config)
         self.assertEqual((first["harness"], second["harness"]), ("cmd", "other"))
 
+    def spread_config(self):
+        picker = os.path.join(self.tmp, "picker.py")
+        with open(picker, "w") as f:
+            f.write('import json, time\ntime.sleep(0.5)\nprint(json.dumps({"cmd": 20, "other": 15}))\n')
+        return (f"seats:\n  cmd:\n    kind: cmd\n  other:\n    kind: cmd\n"
+                f"models:\n  - {{model: smart-1, index: 55, seats: [cmd, other]}}\n"
+                f"roles:\n  worker: {{min: 50, max: 60}}\n"
+                f"spread_penalty: 10\npicker: [{sys.executable}, {picker}]\n")
+
+    def test_concurrent_spawns_still_spread(self):
+        path = os.path.join(self.tmp, "swarm.yaml")
+        with open(path, "w") as f:
+            f.write(self.spread_config())
+        env = dict(self.env, SWARM_CONFIG=path)
+        procs = [subprocess.Popen([sys.executable, SPAWN, "--url", URL, "--room", self.room, "--as", agent],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+                 for agent in ("w1", "w2")]
+        outs = [json.loads(p.communicate(timeout=60)[0]) for p in procs]
+        self.pids = [o["pid"] for o in outs]
+        self.assertEqual(sorted(o["harness"] for o in outs), ["cmd", "other"])
+
+    def test_respawn_keeps_its_seat_instead_of_counting_itself(self):
+        config = self.spread_config()
+        first = self.spawn("--as", "w1", config=config)
+        os.kill(first["pid"], signal.SIGKILL)
+        self.wait_for(lambda: subprocess.run(["kill", "-0", str(first["pid"])], capture_output=True).returncode)
+        again = self.spawn("--as", "w1", config=config)
+        self.assertEqual((first["harness"], again["harness"]), ("cmd", "cmd"))
+
     def test_spawn_refuses_a_member_that_is_running(self):
         self.spawn("--as", "w1", "--harness", "cmd")
         self.wait_for(lambda: self.member().get("state") == "waiting")

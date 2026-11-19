@@ -44,22 +44,26 @@ def headroom(cfg):
     return json.loads(out.stdout.strip().splitlines()[-1])
 
 
-def room_load(r, cfg, room):
-    """Live (not retired) members per quota pool in this room."""
+def room_load(r, cfg, room, agent):
+    """Live members per quota pool in this room: present, not retired, and not the member being spawned (a respawn
+    must not count its own previous seat against itself)."""
     load = {}
     for key in r.scan_iter(match=bus.k_member(room, "*")):
+        name = key.rsplit(":", 1)[-1]
         member = r.hgetall(key)
-        if member.get("state") == "retired" or not member.get("harness"):
+        if name == agent or member.get("state") == "retired" or not member.get("harness"):
             continue
-        name = swarm_config.pool(cfg, member["harness"])
-        load[name] = load.get(name, 0) + 1
+        if not r.exists(bus.k_presence(room, name)):
+            continue
+        seat_pool = swarm_config.pool(cfg, member["harness"])
+        load[seat_pool] = load.get(seat_pool, 0) + 1
     return load
 
 
 def pick_seat(cfg, args, r):
     if args.harness:
         return {"harness": args.harness, "model": args.model, "effort": args.effort}
-    chosen = swarm_config.choose(cfg, args.role, headroom(cfg), room_load(r, cfg, args.room))
+    chosen = swarm_config.choose(cfg, args.role, headroom(cfg), room_load(r, cfg, args.room, args.agent))
     return {"harness": chosen["harness"], "model": args.model or chosen["model"],
             "effort": args.effort or chosen["effort"]}
 
@@ -149,9 +153,12 @@ def main():
     refuse_if_running(args)
     cfg = swarm_config.load()
     r = bus.connect(args.url)
-    seat = pick_seat(cfg, args, r)
-    swarm_config.seat(cfg, seat["harness"])
-    join(r, args, seat)
+    # Pick and join under one per-room lock: two spawns that both read the room before either joined would otherwise
+    # pick the same seat.
+    with r.lock(f"bus:lock:spawn:{args.room}", timeout=60, blocking_timeout=60):
+        seat = pick_seat(cfg, args, r)
+        swarm_config.seat(cfg, seat["harness"])
+        join(r, args, seat)
     post_brief(r, args)
     pid, log = start_worker(args, seat)
     print(json.dumps({"agent": args.agent, "harness": seat["harness"], "model": seat["model"], "pid": pid, "log": log}))
