@@ -1,0 +1,52 @@
+# Swarm seats: which harnesses swarm-spawn may start, and how.
+# Copy to ~/.config/messagebus/swarm.yaml (or point SWARM_CONFIG at it) and edit.
+#
+# Each seat has a `kind` that picks the adapter in scripts/swarm-worker:
+#   claude  `<launcher> -p --output-format json`, one session resumed across wakes
+#   codex   `codex exec --json`, resumed with `codex exec resume <thread>`
+#   omp     `omp -p --mode json`, one --session-dir per worker
+#   agy     read-only reviewer; the worker posts its output to the board
+#   cmd     any command; prompt on stdin, JSON usage lines on stdout
+# `launcher` (claude) or `command` (agy, cmd) is the argv prefix to run.
+
+seats:
+  claude:
+    kind: claude
+    launcher: [claude]
+  # A second Claude account with its own config dir:
+  # claude-work:
+  #   kind: claude
+  #   launcher: [env, CLAUDE_CONFIG_DIR=/Users/me/.claude-work, claude]
+  codex:
+    kind: codex
+  omp:
+    kind: omp
+  agy:
+    kind: agy
+    command: [agy]
+
+# Models the swarm may use, with an intelligence score (for example the Artificial Analysis
+# Intelligence Index) and the seats that can run each one. `effort` is passed to codex.
+models:
+  - {model: claude-sonnet-5-5, index: 55, seats: [claude]}
+  - {model: gpt-6.2-sol, index: 57, seats: [codex], effort: high}
+  - {model: gemini-4-neon-xhigh, index: 61, seats: [agy]}
+
+# Each role gets a band of model scores, so one swarm runs at one level of intelligence.
+# A role with `writes: false` may use read-only seats (agy).
+roles:
+  worker: {min: 54, max: 58}
+  verifier: {min: 57, max: 62, writes: false}
+
+# Optional: a command that prints each seat's spare quota as JSON, for example
+#   {"claude": 16.2, "codex": -28.6, "agy": null}
+# A higher number wins inside the band; "throttled" skips the seat; null uses unknown_score.
+# Without a picker every seat scores unknown_score, and the smarter model wins ties.
+# picker: [usage, --scores]
+unknown_score: 0
+
+# Extra flags for every claude seat (headless runs cannot answer permission prompts).
+claude_flags: >-
+  --permission-mode acceptEdits
+  --allowedTools Edit Write Read Glob Grep Bash(git:*) Bash(gh:*) Bash(bus:*)
+  Bash(python:*) Bash(pytest:*) Bash(ls:*) Bash(cat:*) Bash(mkdir:*)

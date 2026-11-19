@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""Add one member to a swarm: pick a seat, join it to the room, post its brief, start its worker.
+
+Usage:
+  swarm-spawn --room R --as ID [--role worker] [--harness SEAT --model M] [--effort E]
+              [--group G]... [--workspace DIR] [--brief FILE|-] [--from coordinator]
+
+Without --harness, the role's intelligence band in the swarm config picks the models, and the seat with the most
+unused quota (the config's `picker` command) serves one (see examples/swarm.yaml). The member joins with
+--replay before its worker starts, so the brief and anything posted earlier reach it. Prints one JSON line:
+{"agent", "harness", "model", "pid", "log"}.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+
+import swarm_config
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+BUS_PATH = os.environ.get("BUS_BIN", os.path.join(ROOT, "bus"))
+WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "swarm-worker")
+
+
+def load_bus():
+    loader = importlib.machinery.SourceFileLoader("bus_cli", BUS_PATH)
+    spec = importlib.util.spec_from_loader("bus_cli", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+bus = load_bus()
+
+
+def headroom(cfg):
+    if not cfg["picker"]:
+        return {}
+    out = subprocess.run(list(cfg["picker"]), capture_output=True, text=True, check=True)
+    return json.loads(out.stdout.strip().splitlines()[-1])
+
+
+def pick_seat(cfg, args):
+    if args.harness:
+        return {"harness": args.harness, "model": args.model, "effort": args.effort}
+    chosen = swarm_config.choose(cfg, args.role, headroom(cfg))
+    return {"harness": chosen["harness"], "model": args.model or chosen["model"],
+            "effort": args.effort or chosen["effort"]}
+
+
+def join(r, args, seat):
+    argv = ["--room", args.room, "join", "--as", args.agent, "--replay", "--role", args.role,
+            "--harness", seat["harness"]]
+    for flag, value in (("--model", seat["model"]), ("--workspace", args.workspace)):
+        if value:
+            argv += [flag, value]
+    for group in args.group or []:
+        argv += ["--group", group]
+    with open(os.devnull, "w") as quiet:
+        stdout, sys.stdout = sys.stdout, quiet
+        try:
+            bus.cmd_join(r, bus.build_parser().parse_args(argv))
+        finally:
+            sys.stdout = stdout
+
+
+def post_brief(r, args):
+    if not args.brief:
+        return
+    text = sys.stdin.read() if args.brief == "-" else open(args.brief).read()
+    r.xadd(bus.k_stream(args.room), bus.make_fields(args.frm, "@" + args.agent, text.strip(), topic="brief"))
+
+
+def start_worker(args, seat):
+    state_dir = os.path.join(os.environ.get("BUS_DIR", os.path.join(ROOT, ".bus-state")), args.room)
+    os.makedirs(state_dir, exist_ok=True)
+    log = os.path.join(state_dir, f"{args.agent}.log")
+    argv = [sys.executable, WORKER, args.agent, seat["harness"]]
+    for flag, value in (("--model", seat["model"]), ("--effort", seat["effort"]), ("--workspace", args.workspace)):
+        if value:
+            argv += [flag, value]
+    env = dict(os.environ, BUS_URL=args.url, BUS_ROOM=args.room, SWARM_COORDINATOR=args.frm)
+    with open(log, "a") as out:
+        proc = subprocess.Popen(argv, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                env=env, start_new_session=True)
+    return proc.pid, log
+
+
+def main():
+    p = argparse.ArgumentParser(prog="swarm-spawn")
+    p.add_argument("--url", default=os.environ.get("BUS_URL", bus.DEFAULT_URL))
+    p.add_argument("--room", type=bus.ident, default=os.environ.get("BUS_ROOM", bus.DEFAULT_ROOM))
+    p.add_argument("--as", dest="agent", type=bus.ident, required=True)
+    p.add_argument("--harness", help="seat name from the swarm config; omit to pick by role band")
+    p.add_argument("--effort", choices=("low", "medium", "high", "xhigh", "max"))
+    p.add_argument("--model")
+    p.add_argument("--role", default="worker")
+    p.add_argument("--group", action="append", type=bus.ident)
+    p.add_argument("--workspace")
+    p.add_argument("--brief", help="file with the member's brief, or - for stdin")
+    p.add_argument("--from", dest="frm", type=bus.ident, default="coordinator", help="who posts the brief")
+    args = p.parse_args()
+    cfg = swarm_config.load()
+    seat = pick_seat(cfg, args)
+    swarm_config.seat(cfg, seat["harness"])
+    r = bus.connect(args.url)
+    join(r, args, seat)
+    post_brief(r, args)
+    pid, log = start_worker(args, seat)
+    print(json.dumps({"agent": args.agent, "harness": seat["harness"], "model": seat["model"], "pid": pid, "log": log}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
