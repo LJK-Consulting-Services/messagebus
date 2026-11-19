@@ -119,12 +119,19 @@ class SeatOutputTest(unittest.TestCase):
             worker.Worker.invoke(w, "prompt", "sid")
         self.assertEqual(seen["input"], "")
 
-    def test_prompts_name_this_checkouts_bus(self):
+    def test_prompts_use_plain_bus_matching_the_claude_allowlist(self):
         worker = load_worker()
         w = types.SimpleNamespace(agent="w1", room="r", coordinator="coordinator")
-        self.assertIn(worker.BUS_PATH, worker.Worker.render(w, []))
-        self.assertIn(worker.BUS_PATH, worker.Worker.system_prompt(w))
-        self.assertNotIn("{BUS}", worker.Worker.system_prompt(w))
+        self.assertIn("Reply on the board: bus --room r send", worker.Worker.render(w, []))
+        self.assertIn("`bus --room r send --from w1", worker.Worker.system_prompt(w))
+        self.assertIn("Bash(bus:*)", worker.swarm_config.DEFAULT_CLAUDE_FLAGS)
+
+    def test_seat_path_starts_with_this_checkouts_bus(self):
+        worker = load_worker()
+        w = types.SimpleNamespace(agent="w1", room="r")
+        first = worker.base_env(w, "")["PATH"].split(os.pathsep)[0]
+        self.assertTrue(os.path.isabs(first))
+        self.assertTrue(os.path.exists(os.path.join(first, "bus")))
 
 
 class SnapshotTest(unittest.TestCase):

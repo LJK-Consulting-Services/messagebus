@@ -66,6 +66,10 @@ sets `retired`, keeps the post's first line as `doing`, and exits. A `done` from
 addressed to one member retires only that member. The board marks the header `✓ finished` when the latest post passes
 the same rule (`bus.ends_swarm`) and is addressed to `all`. A second worker with the same id exits with code 3.
 
+Seats run `bus` by name, which matches the Claude seat allowlist (`Bash(bus:*)`). The worker puts this checkout first
+on the seat's PATH, but a seat that runs commands in a login shell (omp) gets your shell's PATH instead, so make sure
+the `bus` on your PATH is this checkout.
+
 The worker commits its cursor after the wake, not before. A worker killed mid-wake and respawned with `swarm-spawn`
 gets the same posts again.
 

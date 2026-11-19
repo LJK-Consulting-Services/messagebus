@@ -29,10 +29,8 @@ import time
 import swarm_config
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
-BUS_PATH = os.environ.get("BUS_BIN", os.path.join(ROOT, "bus"))
+BUS_PATH = os.path.abspath(os.environ.get("BUS_BIN", os.path.join(ROOT, "bus")))
 PROMPT_PATH = os.path.join(ROOT, "prompts", "swarm-worker.md")
-# Seats run their commands in their own shell, whose PATH can resolve `bus` to another checkout; give the exact one.
-BUS_CMD = f"{shlex.quote(sys.executable)} {shlex.quote(BUS_PATH)}"
 RESUME_FAILED = ("no conversation found", "session not found", "could not resume", "no session")
 
 
@@ -207,7 +205,7 @@ class Worker:
         for m in msgs:
             topic = f" [{m['topic']}]" if m["topic"] else ""
             lines += [f"--- {m['id']} from {m['from']} to {m['to']}{topic}", m["body"], ""]
-        lines.append(f"Reply on the board: {BUS_CMD} --room {self.room} send --from {self.agent} --to <who> -")
+        lines.append(f"Reply on the board: bus --room {self.room} send --from {self.agent} --to <who> -")
         return "\n".join(lines)
 
     def system_prompt(self):
@@ -216,7 +214,7 @@ class Worker:
         except FileNotFoundError:
             return ""
         return (text.replace("{AGENT}", self.agent).replace("{ROOM}", self.room)
-                .replace("{COORDINATOR}", self.coordinator).replace("{BUS}", BUS_CMD))
+                .replace("{COORDINATOR}", self.coordinator))
 
     # ---- main loop ------------------------------------------------------------
     def run(self):
