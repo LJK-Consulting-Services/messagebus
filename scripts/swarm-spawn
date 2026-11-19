@@ -3,12 +3,13 @@
 
 Usage:
   swarm-spawn --room R --as ID [--role worker] [--harness SEAT --model M] [--effort E]
-              [--group G]... [--workspace DIR] [--brief FILE|-] [--from coordinator]
+              [--group G]... [--workspace DIR] [--base REF] [--brief FILE|-] [--from coordinator]
 
 Without --harness, the role's intelligence band in the swarm config picks the models, and the seat with the most
 unused quota (the config's `picker` command) serves one (see examples/swarm.yaml). The member joins with
 --replay before its worker starts, so the brief and anything posted earlier reach it. Prints one JSON line:
-{"agent", "harness", "model", "pid", "log"}.
+{"agent", "harness", "model", "pid", "log"}. Exits 3 when that member's worker is already running; a member whose
+worker is gone is respawned with its cursor kept.
 """
 import argparse
 import importlib.machinery
@@ -51,7 +52,28 @@ def pick_seat(cfg, args):
             "effort": args.effort or chosen["effort"]}
 
 
+def state_dir(args):
+    path = os.path.join(os.environ.get("BUS_DIR", os.path.join(ROOT, ".bus-state")), args.room)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def refuse_if_running(args):
+    try:
+        pid = int(open(os.path.join(state_dir(args), f"{args.agent}.pid")).read().strip())
+        os.kill(pid, 0)
+    except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError):
+        return
+    sys.stderr.write(f"swarm-spawn: {args.agent} is already running in room={args.room} (pid {pid})\n")
+    sys.exit(3)
+
+
 def join(r, args, seat):
+    """First spawn joins with --replay. A respawn (the member exists, its worker is gone) keeps its cursor, so the
+    new worker picks up where the old one stopped instead of re-running every earlier post."""
+    if r.exists(bus.k_member(args.room, args.agent)):
+        rejoin(r, args, seat)
+        return
     argv = ["--room", args.room, "join", "--as", args.agent, "--replay", "--role", args.role,
             "--harness", seat["harness"]]
     for flag, value in (("--model", seat["model"]), ("--workspace", args.workspace)):
@@ -67,6 +89,14 @@ def join(r, args, seat):
             sys.stdout = stdout
 
 
+def rejoin(r, args, seat):
+    fields = {"role": args.role, "harness": seat["harness"], "model": seat["model"], "workspace": args.workspace}
+    r.hset(bus.k_member(args.room, args.agent), mapping={k: v for k, v in fields.items() if v})
+    if args.group:
+        r.sadd(bus.k_groups(args.room, args.agent), *args.group)
+    bus.touch_presence(r, args.room, args.agent)
+
+
 def post_brief(r, args):
     if not args.brief:
         return
@@ -75,14 +105,14 @@ def post_brief(r, args):
 
 
 def start_worker(args, seat):
-    state_dir = os.path.join(os.environ.get("BUS_DIR", os.path.join(ROOT, ".bus-state")), args.room)
-    os.makedirs(state_dir, exist_ok=True)
-    log = os.path.join(state_dir, f"{args.agent}.log")
+    log = os.path.join(state_dir(args), f"{args.agent}.log")
     argv = [sys.executable, WORKER, args.agent, seat["harness"]]
     for flag, value in (("--model", seat["model"]), ("--effort", seat["effort"]), ("--workspace", args.workspace)):
         if value:
             argv += [flag, value]
     env = dict(os.environ, BUS_URL=args.url, BUS_ROOM=args.room, SWARM_COORDINATOR=args.frm)
+    if args.base:
+        env["SWARM_BASE"] = args.base
     with open(log, "a") as out:
         proc = subprocess.Popen(argv, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                 env=env, start_new_session=True)
@@ -102,7 +132,9 @@ def main():
     p.add_argument("--workspace")
     p.add_argument("--brief", help="file with the member's brief, or - for stdin")
     p.add_argument("--from", dest="frm", type=bus.ident, default="coordinator", help="who posts the brief")
+    p.add_argument("--base", help="ref the member's work starts from; read-only seats see the commits since it")
     args = p.parse_args()
+    refuse_if_running(args)
     cfg = swarm_config.load()
     seat = pick_seat(cfg, args)
     swarm_config.seat(cfg, seat["harness"])

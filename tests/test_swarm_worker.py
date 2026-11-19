@@ -29,6 +29,9 @@ FAKE_SEAT = textwrap.dedent("""\
     log = os.environ["FAKE_LOG"]
     with open(log, "a") as f:
         f.write(json.dumps({"session": os.environ.get("SWARM_SESSION", ""), "prompt": prompt}) + "\\n")
+    if "SLEEP" in prompt:
+        import time
+        time.sleep(30)
     if "CRASH" in prompt:
         sys.stderr.write("boom: seat fell over\\n")
         sys.exit(7)
@@ -163,8 +166,40 @@ class SwarmWorkerE2E(BusE2E):
         self.bus("send", "--from", "coord", "--to", "all", "__SHUTDOWN__")
         self.assertEqual(p.wait(timeout=15), 0)
 
+    def system_post(self):
+        return self.wait_for(lambda: next((p for p in self.posts() if p.get("kind") == "system"), None))
+
+    def test_seat_that_cannot_start_is_reported_and_worker_keeps_running(self):
+        p = self.start_worker(SWARM_COORDINATOR="coord", SWARM_SEAT_CMD="/nonexistent/seat-binary")
+        self.bus("send", "--from", "coord", "--to", "w1", "go")
+        post = self.system_post()
+        self.assertEqual(post["to"], "coord")
+        self.assertIn("FileNotFoundError", post["body"])
+        self.wait_for(lambda: self.member().get("state") == "waiting")
+        self.assertIsNone(p.poll())
+
+    def test_seat_timeout_is_reported(self):
+        self.start_worker(SWARM_COORDINATOR="coord", SWARM_SEAT_TIMEOUT="1")
+        self.bus("send", "--from", "coord", "--to", "w1", "SLEEP now")
+        self.assertIn("timed out", self.system_post()["body"])
+
+    def test_done_from_a_non_coordinator_does_not_retire(self):
+        p = self.start_worker(SWARM_COORDINATOR="coord")
+        self.bus("send", "--from", "w9", "--to", "all", "--kind", "done", "I declare victory")
+        self.wait_for(lambda: self.member().get("turns") == "1")
+        self.assertIsNone(p.poll())
+        self.assertNotEqual(self.member()["state"], "retired")
+
+    def test_replayed_done_from_an_earlier_swarm_is_skipped(self):
+        self.bus("send", "--from", "coord", "--to", "all", "--kind", "done", "old swarm over")
+        self.bus("send", "--from", "coord", "--to", "@w1", "new brief")
+        p = self.start_worker(SWARM_COORDINATOR="coord")
+        self.wait_for(lambda: self.member().get("turns") == "1")
+        self.assertIsNone(p.poll())
+        self.assertIn("new brief", self.seat_calls()[0]["prompt"])
+
     def test_done_post_retires_the_worker(self):
-        p = self.start_worker()
+        p = self.start_worker(SWARM_COORDINATOR="coord")
         self.bus("send", "--from", "coord", "--to", "all", "--kind", "done", "Epic shipped: PR 63")
         self.assertEqual(p.wait(timeout=15), 0)
         self.assertEqual(self.member()["state"], "retired")

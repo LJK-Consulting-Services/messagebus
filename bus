@@ -559,6 +559,10 @@ def addressed_to(to, agent, groups=()):
     return agent in mentions or bool(mentions & set(groups))
 
 
+def is_stop(msg):
+    return msg["body"].strip() == SHUTDOWN or msg.get("kind") == "done"
+
+
 def deliverable(msg, agent, topic=None, reply_to=None, groups=(), replay_floor=None):
     """True if this message should be shown to `agent`.
 
@@ -566,16 +570,18 @@ def deliverable(msg, agent, topic=None, reply_to=None, groups=(), replay_floor=N
     filters the shutdown signal. A scoped listener (one topic, or awaiting one
     reply) must never let its own scoping swallow a `--to all __SHUTDOWN__`
     kill-switch, so __SHUTDOWN__ always passes both filters. The one exception
-    is a shutdown at or before `replay_floor`: it stopped an earlier swarm, not
-    an agent that joined with --replay after it.
+    is a shutdown or `done` at or before `replay_floor`: it ended an earlier
+    swarm, not an agent that joined with --replay after it.
     """
     if not addressed_to(msg["to"], agent, groups):
+        return False
+    if is_stop(msg) and replay_floor and _id_key(msg["id"]) <= _id_key(replay_floor):
         return False
     is_shutdown = msg["body"].strip() == SHUTDOWN
     if msg["from"] == agent and not is_shutdown:
         return False  # suppress self-echo, except a self-addressed shutdown
     if is_shutdown:
-        return not (replay_floor and _id_key(msg["id"]) <= _id_key(replay_floor))
+        return True   # stop signal bypasses every narrowing filter
     if topic and msg["topic"] != topic:
         return False  # topic narrows chatter, never the stop signal
     if reply_to and msg["reply_to"] != reply_to:

@@ -62,6 +62,14 @@ class ChooseTest(unittest.TestCase):
         self.assertIn("roles.monitor", str(caught.exception))
 
 
+class BandValidationTest(unittest.TestCase):
+    def test_band_without_min_is_a_config_error(self):
+        cfg = dict(CFG, roles={"worker": {"max": 58}})
+        with self.assertRaises(SystemExit) as caught:
+            swarm_config.choose(cfg, "worker", {})
+        self.assertIn("numeric min and max", str(caught.exception))
+
+
 def load_worker():
     loader = importlib.machinery.SourceFileLoader("swarm_worker", os.path.join(SCRIPTS, "swarm-worker"))
     spec = importlib.util.spec_from_loader("swarm_worker", loader)
@@ -87,6 +95,32 @@ class SnapshotTest(unittest.TestCase):
             snap = worker.workspace_snapshot(ws)
         self.assertIn("+x = 2", snap)
         self.assertIn("----- new.py -----\nprint('new')", snap)
+
+    def git(self, ws, *args):
+        subprocess.run(["git", "-C", ws, "-c", "user.email=t@t", "-c", "user.name=t", *args], check=True,
+                       capture_output=True)
+
+    def test_snapshot_shows_work_committed_since_the_base(self):
+        worker = load_worker()
+        with tempfile.TemporaryDirectory() as ws:
+            subprocess.run(["git", "init", "-q", "-b", "main", ws], check=True)
+            with open(os.path.join(ws, "a.py"), "w") as f:
+                f.write("x = 1\n")
+            self.git(ws, "add", "a.py")
+            self.git(ws, "commit", "-qm", "base")
+            self.git(ws, "switch", "-qc", "feature")
+            with open(os.path.join(ws, "b.py"), "w") as f:
+                f.write("y = 'committed by the worker'\n")
+            self.git(ws, "add", "b.py")
+            self.git(ws, "commit", "-qm", "work")
+            snap = worker.workspace_snapshot(ws)
+        self.assertIn("commits since", snap)
+        self.assertIn("+y = 'committed by the worker'", snap)
+
+    def test_snapshot_says_when_it_is_truncated(self):
+        worker = load_worker()
+        text = worker.truncate("z" * (worker.SNAPSHOT_LIMIT + 10))
+        self.assertIn("snapshot truncated: 10 more characters", text)
 
 
 if __name__ == "__main__":

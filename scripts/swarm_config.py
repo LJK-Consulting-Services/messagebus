@@ -73,6 +73,8 @@ def choose(cfg, role, scores):
     band = cfg["roles"].get(role)
     if not band:
         raise SystemExit(f"swarm config: no band for role '{role}'; add roles.{role}: {{min, max}}")
+    if not all(isinstance(band.get(k), (int, float)) for k in ("min", "max")):
+        raise SystemExit(f"swarm config: roles.{role} needs numeric min and max, got {band!r}")
     found = candidates(cfg, band, scores)
     if not found:
         raise SystemExit(f"swarm config: no unthrottled seat serves a model with index {band['min']}-{band['max']}")

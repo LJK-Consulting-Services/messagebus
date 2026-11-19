@@ -61,6 +61,29 @@ class SwarmSpawnE2E(BusE2E):
         self.assertEqual((out["harness"], out["model"]), ("cmd", "smart-1"))
         self.wait_for(lambda: self.member("w2").get("state") == "waiting")
 
+    def test_spawn_refuses_a_member_that_is_running(self):
+        self.spawn("--as", "w1", "--harness", "cmd")
+        self.wait_for(lambda: self.member().get("state") == "waiting")
+        cursor = self.r.get(f"bus:cursor:{self.room}:w1")
+        res = subprocess.run([sys.executable, SPAWN, "--url", URL, "--room", self.room, "--as", "w1",
+                              "--harness", "cmd"], capture_output=True, text=True, env=self.env, timeout=30)
+        self.assertEqual(res.returncode, 3)
+        self.assertIn("already running", res.stderr)
+        self.assertEqual(self.r.get(f"bus:cursor:{self.room}:w1"), cursor)
+
+    def test_respawn_after_the_worker_died_keeps_the_cursor(self):
+        out = self.spawn("--as", "w1", "--harness", "cmd")
+        self.bus("send", "--from", "coord", "--to", "w1", "first")
+        self.wait_for(lambda: self.member().get("turns") == "1")
+        os.kill(out["pid"], signal.SIGKILL)
+        self.wait_for(lambda: subprocess.run(["kill", "-0", str(out["pid"])], capture_output=True).returncode)
+        self.spawn("--as", "w1", "--harness", "cmd")
+        self.bus("send", "--from", "coord", "--to", "w1", "second")
+        self.wait_for(lambda: self.member().get("turns") == "2")
+        self.assertEqual(len(self.seat_calls()), 2)
+        self.assertIn("second", self.seat_calls()[1]["prompt"])
+        self.assertNotIn("\nfirst\n", self.seat_calls()[1]["prompt"])
+
     def test_spawn_rejects_unknown_seat(self):
         res = subprocess.run([sys.executable, SPAWN, "--url", URL, "--room", self.room, "--as", "w3",
                               "--harness", "nope"], capture_output=True, text=True, env=self.env)

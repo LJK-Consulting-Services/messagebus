@@ -57,6 +57,7 @@ class Worker:
         self.coordinator = os.environ.get("SWARM_COORDINATOR", "coordinator")
         self.wait_secs = float(os.environ.get("BUS_WAIT_SECS", "60"))
         self.heartbeat_secs = float(os.environ.get("SWARM_HEARTBEAT_SECS", "30"))
+        self.seat_timeout = float(os.environ.get("SWARM_SEAT_TIMEOUT", "3600"))
         os.makedirs(self.state_dir, exist_ok=True)
 
     # ---- files: pid lock, session id, stop sentinels -------------------------
@@ -147,7 +148,13 @@ class Worker:
 
     def invoke(self, prompt, sid):
         argv, stdin, env = SEATS[self.seat["kind"]](self, prompt, sid)
-        return subprocess.run(argv, input=stdin, capture_output=True, text=True, env=env, cwd=self.workspace)
+        try:
+            return subprocess.run(argv, input=stdin, capture_output=True, text=True, env=env, cwd=self.workspace,
+                                  timeout=self.seat_timeout)
+        except subprocess.TimeoutExpired:
+            return failed(argv, 124, f"seat timed out after {self.seat_timeout:.0f}s (SWARM_SEAT_TIMEOUT)")
+        except OSError as e:
+            return failed(argv, 127, f"could not start the seat: {type(e).__name__}: {e}")
 
     def wake(self, msgs):
         self.set_state("working")
@@ -215,13 +222,25 @@ class Worker:
         self.set_state("waiting")
         while not self.should_stop():
             msgs = self.wait()
-            finished = [m for m in msgs if m["kind"] == "done" or m["body"].strip() == bus.SHUTDOWN]
+            finished = [m for m in msgs if self.ends_swarm(m)]
             if finished:
-                self.set_state("retired", doing=finished[-1]["body"].strip().splitlines()[0][:200])
+                self.set_state("retired", doing=(finished[-1]["body"].strip().splitlines() or [""])[0][:200])
                 return 0
             if msgs:
-                self.wake(msgs)
+                self.wake_safely(msgs)
         return 0
+
+    def ends_swarm(self, msg):
+        """__SHUTDOWN__ from anyone (the bus kill switch); `done` only from the coordinator."""
+        if msg["body"].strip() == bus.SHUTDOWN:
+            return True
+        return msg["kind"] == "done" and msg["from"] == self.coordinator
+
+    def wake_safely(self, msgs):
+        try:
+            self.wake(msgs)
+        except Exception as e:  # a worker that dies here leaves the member stuck at `working` with its posts consumed
+            self.report_crash(failed([], 1, f"swarm-worker error: {type(e).__name__}: {e}"))
 
 
 # ---- seats: (worker, prompt, session id) -> (argv, stdin, env) -----------------
@@ -274,23 +293,56 @@ def agy_seat(w, prompt, sid):
     return cmd + model, text, base_env(w, sid)
 
 
+BASE_CANDIDATES = ("@{upstream}", "origin/HEAD", "origin/main", "origin/master", "main", "master")
+
+
 def git(workspace, *args):
-    res = subprocess.run(["git", "-C", workspace, *args], capture_output=True, text=True)
+    try:
+        res = subprocess.run(["git", "-C", workspace, *args], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
     return res.stdout if res.returncode == 0 else None
 
 
+def snapshot_base(workspace):
+    """The commit the member's work starts from: SWARM_BASE, else the merge-base with the first ref that resolves.
+    None when HEAD is the base itself (work committed straight onto it), so the caller shows HEAD's own commit."""
+    head = (git(workspace, "rev-parse", "HEAD") or "").strip()
+    for ref in filter(None, (os.environ.get("SWARM_BASE"),) + BASE_CANDIDATES):
+        base = (git(workspace, "merge-base", "HEAD", ref) or "").strip()
+        if base and base != head:
+            return base
+    return None
+
+
+def committed_work(workspace):
+    base = snapshot_base(workspace)
+    if base:
+        return f"----- commits since {base[:12]} -----\n" + (git(workspace, "log", "-p", "--reverse", f"{base}..HEAD") or "")
+    shown = git(workspace, "show", "HEAD")
+    return f"----- last commit -----\n{shown}" if shown else ""
+
+
 def workspace_snapshot(workspace):
-    """What a tool-less reviewer needs: the diff against HEAD plus every new file, capped at SNAPSHOT_LIMIT."""
+    """What a tool-less reviewer needs: committed work since the base, uncommitted changes, and new files.
+    Capped at SNAPSHOT_LIMIT, and says so when it is cut."""
     if not workspace or not os.path.isdir(workspace):
         return ""
-    parts = [f"===== workspace {workspace} ====="]
+    parts = [f"===== workspace {workspace} =====", committed_work(workspace)]
     diff = git(workspace, "diff", "HEAD")
     if diff:
-        parts.append("----- git diff HEAD -----\n" + diff)
+        parts.append("----- uncommitted (git diff HEAD) -----\n" + diff)
     listed = git(workspace, "ls-files", "--others", "--exclude-standard")
     for name in (listed.split() if listed is not None else sorted(os.listdir(workspace))):
         parts.append(file_block(workspace, name))
-    return "\n".join(parts)[:SNAPSHOT_LIMIT]
+    return truncate("\n".join(p for p in parts if p))
+
+
+def truncate(text):
+    if len(text) <= SNAPSHOT_LIMIT:
+        return text
+    cut = len(text) - SNAPSHOT_LIMIT
+    return text[:SNAPSHOT_LIMIT] + f"\n===== snapshot truncated: {cut} more characters not shown =====\n"
 
 
 def file_block(workspace, name):
@@ -349,6 +401,10 @@ def parse_output(text):
         if obj.get("total_cost_usd") is not None:
             out["cost"] = (out["cost"] or 0) + float(obj["total_cost_usd"])
     return out
+
+
+def failed(argv, code, message):
+    return subprocess.CompletedProcess(argv, code, stdout="", stderr=message)
 
 
 def resume_failed(stderr):

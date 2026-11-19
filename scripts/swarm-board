@@ -25,6 +25,7 @@ from rich.text import Text
 from textual.app import App
 from textual.binding import Binding
 from textual.containers import Vertical
+from textual.css.query import NoMatches
 from textual.widgets import Rule, Static
 
 
@@ -863,6 +864,12 @@ class SwarmBoard(App):
         return size.width or self.size.width or 80, size.height or PAGE_FALLBACK
 
     def render_all(self):
+        try:
+            self.render_panes()
+        except NoMatches:
+            return  # a resize or poll landed while the screen's widgets are not mounted (startup or quit)
+
+    def render_panes(self):
         st, now = self.state, time.time()
         self.apply_layout()
         self.query_one("#header", Static).update(header_text(st))

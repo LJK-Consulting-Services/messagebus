@@ -119,6 +119,11 @@ class SwarmRedisTest(unittest.TestCase):
         bodies = [m["body"] for m in self.poll("w1")]
         self.assertEqual(bodies, ["new brief", "after join"])
 
+    def test_replay_skips_done_sent_before_join(self):
+        self.send("coord", "all", body="old swarm over", kind="done")
+        self.run_cmd(bus.cmd_join, as_agent="w1", replay=True)
+        self.assertEqual(self.poll("w1"), [])
+
     def test_shutdown_after_replay_join_still_stops(self):
         self.run_cmd(bus.cmd_join, as_agent="w1", replay=True)
         self.send("coord", "all", body=bus.SHUTDOWN)
