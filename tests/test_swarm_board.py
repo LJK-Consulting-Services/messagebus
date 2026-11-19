@@ -300,6 +300,22 @@ class SwarmBoardTests(unittest.IsolatedAsyncioTestCase):
             await self.load(app, pilot)
             self.assertNotIn("finished", text_of(app.query_one("#header")))
 
+    async def test_stop_aimed_at_one_member_is_not_finished(self):
+        for index, (to, body, kind) in enumerate((("w1", "you're done", "done"), ("w1", "__SHUTDOWN__", "msg")), 5):
+            with self.subTest(to=to, body=body):
+                self.post(index, "coordinator", to, body, kind=kind)
+                app = self.make_app()
+                async with app.run_test(size=SIZE) as pilot:
+                    await self.load(app, pilot)
+                    self.assertNotIn("finished", text_of(app.query_one("#header")))
+
+    async def test_shutdown_to_all_is_finished(self):
+        self.post(5, "w1", "all", "__SHUTDOWN__")
+        app = self.make_app()
+        async with app.run_test(size=SIZE) as pilot:
+            await self.load(app, pilot)
+            self.assertIn("✓ finished", text_of(app.query_one("#header")))
+
     async def test_done_from_a_non_coordinator_is_not_finished(self):
         self.post(5, "w1", "all", "I declare victory", kind="done")
         app = self.make_app()

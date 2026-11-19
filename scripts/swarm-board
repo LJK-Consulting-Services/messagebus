@@ -365,7 +365,8 @@ class BoardState:
         if not self.posts:
             return False
         last = self.posts[-1]
-        return bus.ends_swarm({"body": last.body, "kind": last.kind}, self.info(last.sender).get("role"))
+        to_everyone = "all" in last.to.split(",")
+        return to_everyone and bus.ends_swarm({"body": last.body, "kind": last.kind}, self.info(last.sender).get("role"))
 
     def status(self, name):
         info = self.info(name)
