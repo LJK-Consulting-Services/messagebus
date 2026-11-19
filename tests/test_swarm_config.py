@@ -65,6 +65,32 @@ class ChooseTest(unittest.TestCase):
         self.assertIn("roles.monitor", str(caught.exception))
 
 
+class SpreadTest(unittest.TestCase):
+    """Quota readings are cached, so every spawn in a swarm sees the same scores; live members dock their pool."""
+
+    def cfg(self, **seats):
+        return dict(CFG, spread_penalty=10.0, seats=dict(CFG["seats"], **seats))
+
+    def test_members_already_on_a_seat_push_the_next_spawn_elsewhere(self):
+        scores = {"claude": 9, "claude-b": 16, "codex": 3}
+        self.assertEqual(swarm_config.choose(self.cfg(), "worker", scores)["harness"], "claude-b")
+        self.assertEqual(swarm_config.choose(self.cfg(), "worker", scores, {"claude-b": 1})["harness"], "claude")
+        self.assertEqual(swarm_config.choose(self.cfg(), "worker", scores, {"claude-b": 2, "claude": 1})["harness"],
+                         "codex")
+
+    def test_seats_sharing_a_pool_share_the_penalty(self):
+        cfg = self.cfg(**{"omp": {"kind": "omp", "pool": "claude-b"}})
+        cfg["models"] = CFG["models"] + [{"model": "omp-sonnet", "index": 55, "seats": ["omp"]}]
+        scores = {"claude": -50, "claude-b": 16, "codex": 0, "omp": 16}
+        chosen = swarm_config.choose(cfg, "worker", scores, {"claude-b": 2})
+        self.assertNotIn(chosen["harness"], ("claude-b", "omp"))
+
+    def test_pool_of_a_seat_defaults_to_its_name(self):
+        self.assertEqual(swarm_config.pool(self.cfg(), "codex"), "codex")
+        cfg = self.cfg(**{"omp": {"kind": "omp", "pool": "claude-b"}})
+        self.assertEqual(swarm_config.pool(cfg, "omp"), "claude-b")
+
+
 class BandValidationTest(unittest.TestCase):
     def test_band_without_min_is_a_config_error(self):
         cfg = dict(CFG, roles={"worker": {"max": 58}})

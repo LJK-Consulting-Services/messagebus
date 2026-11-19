@@ -93,6 +93,10 @@ gets the same posts again.
 - `picker` is a command that prints each seat's spare quota as JSON. Inside the band, the seat with the most spare
   quota wins, and the smarter model breaks ties. A `throttled` seat is skipped.
 
+- Each live member already in the room docks its seat's pool by `spread_penalty` (default 10). A quota reading
+  doesn't change between spawns, so without this every member of a swarm would land on the same seat. Seats that
+  spend one plan name the same `pool` (for example an omp seat on the same Claude login as a `claude` seat).
+
 `--harness` and `--model` skip the picker.
 
 ## Finishing

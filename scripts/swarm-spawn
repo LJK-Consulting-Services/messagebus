@@ -44,10 +44,22 @@ def headroom(cfg):
     return json.loads(out.stdout.strip().splitlines()[-1])
 
 
-def pick_seat(cfg, args):
+def room_load(r, cfg, room):
+    """Live (not retired) members per quota pool in this room."""
+    load = {}
+    for key in r.scan_iter(match=bus.k_member(room, "*")):
+        member = r.hgetall(key)
+        if member.get("state") == "retired" or not member.get("harness"):
+            continue
+        name = swarm_config.pool(cfg, member["harness"])
+        load[name] = load.get(name, 0) + 1
+    return load
+
+
+def pick_seat(cfg, args, r):
     if args.harness:
         return {"harness": args.harness, "model": args.model, "effort": args.effort}
-    chosen = swarm_config.choose(cfg, args.role, headroom(cfg))
+    chosen = swarm_config.choose(cfg, args.role, headroom(cfg), room_load(r, cfg, args.room))
     return {"harness": chosen["harness"], "model": args.model or chosen["model"],
             "effort": args.effort or chosen["effort"]}
 
@@ -136,9 +148,9 @@ def main():
     args = p.parse_args()
     refuse_if_running(args)
     cfg = swarm_config.load()
-    seat = pick_seat(cfg, args)
-    swarm_config.seat(cfg, seat["harness"])
     r = bus.connect(args.url)
+    seat = pick_seat(cfg, args, r)
+    swarm_config.seat(cfg, seat["harness"])
     join(r, args, seat)
     post_brief(r, args)
     pid, log = start_worker(args, seat)

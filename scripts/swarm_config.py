@@ -39,6 +39,7 @@ def load():
             raise SystemExit(f"swarm config: seat '{name}' has kind {seat.get('kind')!r}; use one of {KINDS}")
     return {"seats": seats, "picker": raw.get("picker"), "models": raw.get("models") or [],
             "roles": raw.get("roles") or {}, "unknown_score": float(raw.get("unknown_score", 0)),
+            "spread_penalty": float(raw.get("spread_penalty", 10)),
             "claude_flags": shlex.split(raw.get("claude_flags") or DEFAULT_CLAUDE_FLAGS)}
 
 
@@ -53,8 +54,16 @@ def seat_score(cfg, scores, name):
     return cfg["unknown_score"] if value is None else float(value)
 
 
-def candidates(cfg, band, scores):
-    """(headroom score, model index, seat name, model entry) for every seat that can serve a model in the band."""
+def pool(cfg, name):
+    """The quota a seat spends. Seats on one plan (a CLI and a harness that reuses its login) name the same pool."""
+    return (cfg["seats"].get(name) or {}).get("pool", name)
+
+
+def candidates(cfg, band, scores, load=None):
+    """(headroom score, model index, seat name, model entry) for every seat that can serve a model in the band.
+    `load` counts the swarm's live members per pool; each one docks its pool by spread_penalty, because the quota
+    reading is cached and would otherwise send every spawn in a swarm to the same seat."""
+    load = load or {}
     out = []
     for model in cfg["models"]:
         if not band["min"] <= model["index"] <= band["max"]:
@@ -64,18 +73,19 @@ def candidates(cfg, band, scores):
             score = seat_score(cfg, scores, name) if seat else None
             if score is None or (band.get("writes", True) and not writes(seat)):
                 continue
+            score -= cfg.get("spread_penalty", 0) * load.get(pool(cfg, name), 0)
             out.append((score, model["index"], name, model))
     return out
 
 
-def choose(cfg, role, scores):
+def choose(cfg, role, scores, load=None):
     """The seat with the most headroom among models whose intelligence index is in the role's band."""
     band = cfg["roles"].get(role)
     if not band:
         raise SystemExit(f"swarm config: no band for role '{role}'; add roles.{role}: {{min, max}}")
     if not all(isinstance(band.get(k), (int, float)) for k in ("min", "max")):
         raise SystemExit(f"swarm config: roles.{role} needs numeric min and max, got {band!r}")
-    found = candidates(cfg, band, scores)
+    found = candidates(cfg, band, scores, load)
     if not found:
         raise SystemExit(f"swarm config: no unthrottled seat serves a model with index {band['min']}-{band['max']}")
     _, _, name, model = max(found, key=lambda c: (c[0], c[1]))

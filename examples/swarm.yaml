@@ -21,6 +21,7 @@ seats:
     kind: codex
   omp:
     kind: omp
+    # pool: claude    # when omp's model runs on the same plan as the claude seat
   agy:
     kind: agy
     command: [agy]
@@ -44,6 +45,10 @@ roles:
 # Without a picker every seat scores unknown_score, and the smarter model wins ties.
 # picker: [usage, --scores]
 unknown_score: 0
+
+# Each live member in the room docks its seat's pool by this much, so a swarm spreads across seats
+# instead of piling onto the one the cached quota reading favours.
+spread_penalty: 10
 
 # Extra flags for every claude seat (headless runs cannot answer permission prompts).
 claude_flags: >-

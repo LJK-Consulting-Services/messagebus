@@ -61,6 +61,18 @@ class SwarmSpawnE2E(BusE2E):
         self.assertEqual((out["harness"], out["model"]), ("cmd", "smart-1"))
         self.wait_for(lambda: self.member("w2").get("state") == "waiting")
 
+    def test_spawns_in_one_room_spread_across_seats(self):
+        picker = os.path.join(self.tmp, "picker.py")
+        with open(picker, "w") as f:
+            f.write('import json\nprint(json.dumps({"cmd": 20, "other": 15}))\n')
+        config = (f"seats:\n  cmd:\n    kind: cmd\n  other:\n    kind: cmd\n"
+                  f"models:\n  - {{model: smart-1, index: 55, seats: [cmd, other]}}\n"
+                  f"roles:\n  worker: {{min: 50, max: 60}}\n"
+                  f"spread_penalty: 10\npicker: [{sys.executable}, {picker}]\n")
+        first = self.spawn("--as", "w1", config=config)
+        second = self.spawn("--as", "w2", config=config)
+        self.assertEqual((first["harness"], second["harness"]), ("cmd", "other"))
+
     def test_spawn_refuses_a_member_that_is_running(self):
         self.spawn("--as", "w1", "--harness", "cmd")
         self.wait_for(lambda: self.member().get("state") == "waiting")
