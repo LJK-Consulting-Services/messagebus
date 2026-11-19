@@ -135,6 +135,21 @@ class SwarmSpawnE2E(BusE2E):
         self.wait_for(lambda: len(self.seat_calls()) == 2, timeout=40)
         self.assertIn("SLEEP then work", self.seat_calls()[1]["prompt"])
 
+    def test_slow_picker_fails_cleanly_before_joining(self):
+        picker = os.path.join(self.tmp, "slow_picker.py")
+        with open(picker, "w") as f:
+            f.write("import time\ntime.sleep(60)\n")
+        config = (f"seats:\n  cmd:\n    kind: cmd\nmodels:\n  - {{model: m, index: 55, seats: [cmd]}}\n"
+                  f"roles:\n  worker: {{min: 50, max: 60}}\npicker: [{sys.executable}, {picker}]\n")
+        path = os.path.join(self.tmp, "swarm.yaml")
+        with open(path, "w") as f:
+            f.write(config)
+        res = subprocess.run([sys.executable, SPAWN, "--url", URL, "--room", self.room, "--as", "w1"],
+                             capture_output=True, text=True, env=dict(self.env, SWARM_CONFIG=path), timeout=60)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("took over 20s", res.stderr)
+        self.assertFalse(self.r.exists(f"bus:member:{self.room}:w1"))
+
     def test_spawn_rejects_unknown_seat(self):
         res = subprocess.run([sys.executable, SPAWN, "--url", URL, "--room", self.room, "--as", "w3",
                               "--harness", "nope"], capture_output=True, text=True, env=self.env)
