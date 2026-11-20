@@ -144,7 +144,8 @@ def start_worker(args, seat):
 def main():
     p = argparse.ArgumentParser(prog="swarm-spawn")
     p.add_argument("--url", default=os.environ.get("BUS_URL", bus.DEFAULT_URL))
-    p.add_argument("--room", type=bus.ident, default=os.environ.get("BUS_ROOM", bus.DEFAULT_ROOM))
+    p.add_argument("--room", type=bus.ident, required=True,
+                   help="the swarm's own room; no default, since joining replays the room's broadcasts")
     p.add_argument("--as", dest="agent", type=bus.ident, required=True)
     p.add_argument("--harness", help="seat name from the swarm config; omit to pick by role band")
     p.add_argument("--effort", choices=("low", "medium", "high", "xhigh", "max"))

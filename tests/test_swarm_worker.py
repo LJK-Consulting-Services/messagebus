@@ -52,12 +52,15 @@ FAKE_SEAT = textwrap.dedent("""\
 
 
 def redis_up():
-    if redis is None:
-        return False
+    """True when Redis answers at URL. With BUS_TEST_REQUIRE_REDIS set (CI), a missing Redis fails the run instead of
+    silently skipping every E2E test."""
     try:
-        return redis.Redis.from_url(URL).ping()
+        up = redis is not None and redis.Redis.from_url(URL).ping()
     except redis.RedisError:
-        return False
+        up = False
+    if not up and os.environ.get("BUS_TEST_REQUIRE_REDIS"):
+        raise RuntimeError(f"BUS_TEST_REQUIRE_REDIS is set but Redis is not reachable at {URL}")
+    return up
 
 
 class BusE2E(unittest.TestCase):
