@@ -5,3 +5,5 @@ fakeredis[lua]==2.34.1
 pytest==9.0.3
 pytest-cov==7.1.0
 ruff==0.15.21
+# Terminal swarm board (scripts/swarm-board) and its pilot tests.
+textual>=8

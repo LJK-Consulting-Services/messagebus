@@ -157,7 +157,7 @@ def test_prune_never_uses_maxlen(bus_module, fake_redis, ns, monkeypatch, capsys
 def test_join_and_agents_presence(bus_module, fake_redis, ns, capsys):
     last = xadd(bus_module, fake_redis, "alice", "all", "before join")
 
-    assert bus_module.cmd_join(fake_redis, ns(as_agent="bob", json=True)) == 0
+    assert bus_module.cmd_join(fake_redis, ns(as_agent="bob", json=True, replay=False, group=None)) == 0
     joined = json.loads(capsys.readouterr().out)
     assert joined["cursor"] == last
     assert fake_redis.get(bus_module.k_cursor("main", "bob")) == last

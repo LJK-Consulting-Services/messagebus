@@ -254,11 +254,27 @@ Two things the coordinator relies on (and you can lean on in your prompts):
 
 ---
 
+## Swarms
+
+A swarm is one room with a coordinator, workers on any harness (Claude Code, Codex, OMP, agy) and a verifier, all
+posting to one durable board. Members sleep until a post addresses them, pick up anything posted before they joined,
+and retire when the coordinator posts `--kind done`.
+
+```bash
+scripts/swarm-spawn --room swarm-x --as w1 --role worker --workspace <worktree> --brief brief.md
+scripts/swarm-board --room swarm-x          # live board TUI (needs textual: pip install -r requirements-dev.txt)
+```
+
+Seats are picked from `~/.config/messagebus/swarm.yaml` (see `examples/swarm.yaml`) by intelligence band and spare
+quota. → [docs/swarm.md](docs/swarm.md) for addressing, worker lifecycle and seat choice; `skills/swarm/SKILL.md` is
+the coordinator playbook.
+
 ## Full command reference
 
 ```
 # messaging
 bus send     --from A [--to all] [--topic T] [--reply-to ID] [--kind msg] "text" | -
+             # --to: comma list of ids, @name (agent or group) and all; --kind done ends a swarm
 bus poll     --as A [--topic T]              # new messages for you; advances your cursor
 bus wait     --as A [--timeout 30] [--topic T] [--reply-to ID]   # block until one arrives
 bus tail     [-n 20]                         # recent traffic; cursor untouched
@@ -268,8 +284,14 @@ bus thread   ID                              # print the full reply_to thread of
 bus inbox    --as A                          # peek unread directed msgs / questions (no cursor move)
 bus prune    [--keep 5000] [--force] [--dry-run]  # trim the room to newest N (refuses if it drops unread)
 bus join     --as A                          # register presence; cursor to "now"
+             [--replay] [--group G]... [--role R] [--harness H] [--model M] [--workspace D]
+                                             # --replay: cursor to the start, backlog delivered
 bus agents                                   # who is present
 bus drain    --as A [--force]                # graceful exit: release your pens + presence (claims kept)
+bus roster                                   # members: role, harness, model, state, groups, presence
+bus state    --as A working|waiting|retired [--doing "what I'm on"]
+bus usage    --as A --tokens-in N --tokens-out N [--tokens-cached N] [--cost USD]   # add one turn to A's totals
+bus title    ["Room title"]                  # print or set
 
 # task coordination (needs BUS_GH_REPO + gh)
 bus claim    --as A --issue N [--ttl 28800] [--worktree] [--base dev]
